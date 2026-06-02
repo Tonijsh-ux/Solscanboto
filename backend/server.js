@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3001;
 const MAX_MONITORED = 20;
 const BOLLINGER_PERIOD = 20;
 const BOLLINGER_MULT = 2;
-const MIN_MC_USD = 3000;
+const MIN_MC_USD = 2000;
 const CANDLE_MS = 1000;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
 const BIRDEYE_BASE = "https://public-api.birdeye.so/defi";
@@ -164,18 +164,42 @@ function hasRequiredSocials(t) {
 async function processNewToken(raw) {
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
-  if (!hasRequiredSocials(raw)) { addLog(`⛔ Sin sociales: ${raw.name || shortAddr(raw.mint)}`, "filter"); return; }
+
+  if (!hasRequiredSocials(raw)) {
+    addLog(`⛔ Sin sociales: ${raw.name || shortAddr(raw.mint)}`, "filter");
+    return;
+  }
+
   const mcEstimate = raw.usdMarketCap || (raw.marketCapSol || 0) * 150;
-  if (mcEstimate > 0 && mcEstimate < MIN_MC_USD) { addLog(`⛔ MC bajo (~$${Math.round(mcEstimate)}): ${raw.name}`, "filter"); return; }
+  if (mcEstimate > 0 && mcEstimate < MIN_MC_USD) {
+    addLog(`⛔ MC bajo (~$${Math.round(mcEstimate)}): ${raw.name}`, "filter");
+    return;
+  }
+
   const info = await fetchTokenInfo(raw.mint);
   const mc = info?.mc ?? mcEstimate ?? 0;
-  if (mc < MIN_MC_USD) { addLog(`⛔ MC real bajo ($${Math.round(mc)}): ${raw.name}`, "filter"); return; }
-  const wallets = info?.uniqueWallet24h ?? 0;
-  const trades = info?.trade24h ?? 0;
-  if (info && wallets < 2 && trades < 5) { addLog(`⛔ Sin traders pro (${wallets} wallets): ${raw.name}`, "filter"); return; }
+
+  if (mc < MIN_MC_USD) {
+    addLog(`⛔ MC real bajo ($${Math.round(mc)}): ${raw.name}`, "filter");
+    return;
+  }
+
   state.stats.filtered++;
-  const candidate = { mint: raw.mint, name: raw.name || "Unknown", symbol: raw.symbol || "???", twitter: raw.twitter || null, website: raw.website || null, telegram: raw.telegram || null, mc, traders: wallets, price: info?.price ?? 0, detectedAt: Date.now() };
-  addLog(`✅ ${candidate.symbol} — MC $${Math.round(mc)} — ${wallets} wallets`, "accept");
+  const candidate = {
+    mint: raw.mint,
+    name: raw.name || "Unknown",
+    symbol: raw.symbol || "???",
+    twitter: raw.twitter || null,
+    website: raw.website || null,
+    telegram: raw.telegram || null,
+    mc,
+    traders: 0,
+    price: info?.price ?? 0,
+    detectedAt: Date.now(),
+  };
+
+  addLog(`✅ ${candidate.symbol} — MC $${Math.round(mc)}`, "accept");
+
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
     for (const [mint, t] of state.monitored.entries()) {
@@ -184,6 +208,7 @@ async function processNewToken(raw) {
     if (oldest) stopMonitoring(oldest.mint);
     else { addLog(`⚠️ Cola llena, descartando ${candidate.symbol}`, "warn"); return; }
   }
+
   startMonitoring(candidate);
 }
 
