@@ -21,6 +21,7 @@ const state = {
 
 const frontendClients = new Set();
 const seenMints = new Set();
+const signalCooldown = new Map(); // mint → last signal timestamp
 
 function addLog(msg, type = "info") {
   const entry = { msg, type, time: Date.now() };
@@ -122,7 +123,11 @@ function checkSignal(mint, price, bb, candleCount) {
   if (candleCount < BOLLINGER_PERIOD) return;
   const token = state.monitored.get(mint);
   if (!token) return;
-  if (token.lastSignalTime && Date.now() - token.lastSignalTime < 60_000) return;
+
+  // Cooldown global por mint — 5 minutos entre señales del mismo token
+  const lastSignal = signalCooldown.get(mint) || 0;
+  if (Date.now() - lastSignal < 5 * 60 * 1000) return;
+
   const touchedLower = price <= bb.lower * 1.02;
   const touchedMiddle = !touchedLower && Math.abs(price - bb.middle) / bb.middle < 0.015;
   if (touchedLower || touchedMiddle) {
@@ -133,9 +138,13 @@ function checkSignal(mint, price, bb, candleCount) {
     token.signalPrice = price;
     token.tp = tp;
     token.sl = sl;
-    token.lastSignalTime = Date.now();
+    signalCooldown.set(mint, Date.now());
     state.stats.signals++;
-    const signal = { id: Date.now(), mint, name: token.name, symbol: token.symbol, zone, price, tp, sl, time: Date.now(), status: "OPEN" };
+    const signal = {
+      id: `${mint}-${Date.now()}`, // ID único por mint+tiempo
+      mint, name: token.name, symbol: token.symbol,
+      zone, price, tp, sl, time: Date.now(), status: "OPEN"
+    };
     state.signals.unshift(signal);
     if (state.signals.length > 100) state.signals.pop();
     addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
@@ -277,7 +286,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.get("/api/state", (req, res) => {
-  res.json({ monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats });
+  res.json({
+    monitored: Array.from(state.monitored.values()).map(tokenToJSON),
+    signals: state.signals.slice(0, 50),
+    log: state.log.slice(0, 100),
+    stats: state.stats
+  });
 });
 app.delete("/api/token/:mint", (req, res) => {
   stopMonitoring(req.params.mint);
@@ -288,7 +302,15 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
+  ws.send(JSON.stringify({
+    event: "fullState", data: {
+      monitored: Array.from(state.monitored.values()).map(tokenToJSON),
+      signals: state.signals.slice(0, 50),
+      log: state.log.slice(0, 100),
+      stats: state.stats,
+      wsStatus: "connected"
+    }
+  }));
   ws.on("close", () => frontendClients.delete(ws));
   ws.on("message", (data) => {
     try {
