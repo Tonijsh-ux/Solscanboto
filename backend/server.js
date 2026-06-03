@@ -11,7 +11,6 @@ const BOLLINGER_MULT = 2;
 const MIN_MC_USD = 2000;
 const CANDLE_MS = 1000;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
-const BIRDEYE_BASE = "https://public-api.birdeye.so/defi";
 
 const state = {
   monitored: new Map(),
@@ -54,27 +53,30 @@ function calcBollinger(candles) {
   };
 }
 
-async function fetchPrice(mint) {
+// Obtener metadata real del token desde su URI onchain
+async function fetchTokenMetadata(uri) {
+  if (!uri) return null;
   try {
-    const res = await fetch(`${BIRDEYE_BASE}/price?address=${mint}`, {
-      headers: { "x-chain": "solana" },
-      signal: AbortSignal.timeout(3000),
-    });
+    const res = await fetch(uri, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) return null;
     const data = await res.json();
-    return data?.data?.value ?? null;
+    return {
+      twitter: data.twitter || data.extensions?.twitter || null,
+      website: data.website || data.extensions?.website || null,
+      telegram: data.telegram || data.extensions?.telegram || null,
+    };
   } catch { return null; }
 }
 
-async function fetchTokenInfo(mint) {
+async function fetchPrice(mint) {
   try {
-    const res = await fetch(`${BIRDEYE_BASE}/token_overview?address=${mint}`, {
-      headers: { "x-chain": "solana" },
-      signal: AbortSignal.timeout(5000),
-    });
+    const res = await fetch(
+      `https://price.jup.ag/v6/price?ids=${mint}`,
+      { signal: AbortSignal.timeout(3000) }
+    );
     if (!res.ok) return null;
     const data = await res.json();
-    return data?.data ?? null;
+    return data?.data?.[mint]?.price ?? null;
   } catch { return null; }
 }
 
@@ -157,48 +159,51 @@ function stopMonitoring(mint) {
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-function hasRequiredSocials(t) {
-  return !!(t.twitter || t.website || t.telegram);
-}
-
 async function processNewToken(raw) {
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
 
-  if (!hasRequiredSocials(raw)) {
-    addLog(`⛔ Sin sociales: ${raw.name || shortAddr(raw.mint)}`, "filter");
-    return;
-  }
-
+  // FILTRO 1: MC estimado desde el evento
   const mcEstimate = raw.usdMarketCap || (raw.marketCapSol || 0) * 150;
   if (mcEstimate > 0 && mcEstimate < MIN_MC_USD) {
     addLog(`⛔ MC bajo (~$${Math.round(mcEstimate)}): ${raw.name}`, "filter");
     return;
   }
 
-  const info = await fetchTokenInfo(raw.mint);
-  const mc = info?.mc ?? mcEstimate ?? 0;
+  // FILTRO 2: Metadata real desde URI onchain
+  let twitter = raw.twitter || null;
+  let website = raw.website || null;
+  let telegram = raw.telegram || null;
 
-  if (mc < MIN_MC_USD) {
-    addLog(`⛔ MC real bajo ($${Math.round(mc)}): ${raw.name}`, "filter");
+  if (!twitter && !website && raw.uri) {
+    const meta = await fetchTokenMetadata(raw.uri);
+    if (meta) {
+      twitter = meta.twitter;
+      website = meta.website;
+      telegram = meta.telegram;
+    }
+  }
+
+  if (!twitter && !website && !telegram) {
+    addLog(`⛔ Sin sociales: ${raw.name || shortAddr(raw.mint)}`, "filter");
     return;
   }
 
   state.stats.filtered++;
+
   const candidate = {
     mint: raw.mint,
     name: raw.name || "Unknown",
     symbol: raw.symbol || "???",
-    twitter: raw.twitter || null,
-    website: raw.website || null,
-    telegram: raw.telegram || null,
-    mc,
-    traders: 0,
-    price: info?.price ?? 0,
+    twitter,
+    website,
+    telegram,
+    mc: mcEstimate,
+    price: 0,
     detectedAt: Date.now(),
   };
 
-  addLog(`✅ ${candidate.symbol} — MC $${Math.round(mc)}`, "accept");
+  addLog(`✅ ${candidate.symbol} — MC ~$${Math.round(mcEstimate)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
 
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
