@@ -36,6 +36,17 @@ function broadcast(payload) {
   }
 }
 
+function tokenToJSON(t) {
+  return {
+    mint: t.mint, name: t.name, symbol: t.symbol,
+    twitter: t.twitter, website: t.website, telegram: t.telegram,
+    mc: t.mc, price: t.price, bb: t.bb,
+    candleCount: t.candleCount, candles: t.candles50,
+    signal: t.signal, signalPrice: t.signalPrice,
+    tp: t.tp, sl: t.sl, detectedAt: t.detectedAt, lastUpdate: t.lastUpdate,
+  };
+}
+
 function shortAddr(addr) {
   return addr ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : "—";
 }
@@ -68,14 +79,12 @@ async function fetchTokenMetadata(uri) {
   } catch { return null; }
 }
 
-// Calcular precio desde datos del bonding curve de PumpPortal
 function calcPriceFromTrade(msg) {
   try {
     const vSol = msg.vSolInBondingCurve;
     const vTokens = msg.vTokensInBondingCurve;
     if (vSol && vTokens && vTokens > 0) {
-      const solPrice = 150; // precio SOL en USD aproximado
-      return (vSol / vTokens) * solPrice;
+      return (vSol / vTokens) * 150;
     }
   } catch {}
   return null;
@@ -86,13 +95,11 @@ function updateCandle(mint, price) {
   if (!token) return;
   const now = Date.now();
   const currentSecond = Math.floor(now / CANDLE_MS) * CANDLE_MS;
-
   if (!token.currentCandle || token.currentCandle.time !== currentSecond) {
     if (token.currentCandle) {
       token.candles.push({ ...token.currentCandle });
       if (token.candles.length > 300) token.candles.shift();
     }
-    // Si no hay vela previa, abrir nueva
     const prevClose = token.currentCandle?.close ?? price;
     token.currentCandle = { time: currentSecond, open: prevClose, high: price, low: price, close: price };
   } else {
@@ -100,7 +107,6 @@ function updateCandle(mint, price) {
     token.currentCandle.low = Math.min(token.currentCandle.low, price);
     token.currentCandle.close = price;
   }
-
   const allCandles = [...token.candles, token.currentCandle];
   const bb = calcBollinger(allCandles);
   token.price = price;
@@ -109,7 +115,7 @@ function updateCandle(mint, price) {
   token.lastUpdate = now;
   token.candles50 = allCandles.slice(-50);
   if (bb) checkSignal(mint, price, bb, allCandles.length);
-  broadcast({ event: "tokenUpdate", data: { mint, price, bb, candleCount: allCandles.length, candles: token.candles50, signal: token.signal, signalPrice: token.signalPrice, tp: token.tp, sl: token.sl, lastUpdate: now } });
+  broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
 }
 
 function checkSignal(mint, price, bb, candleCount) {
@@ -140,30 +146,25 @@ function checkSignal(mint, price, bb, candleCount) {
 
 function startMonitoring(token, wsPortal) {
   if (state.monitored.has(token.mint)) return;
-  const entry = { ...token, candles: [], currentCandle: null, bb: null, candleCount: 0, signal: null, lastUpdate: Date.now(), candles50: [] };
+  const entry = {
+    ...token, candles: [], currentCandle: null, bb: null,
+    candleCount: 0, signal: null, lastUpdate: Date.now(), candles50: [],
+    ticker: null,
+  };
   state.monitored.set(token.mint, entry);
 
-  // Suscribirse a trades en tiempo real de este token
   if (wsPortal && wsPortal.readyState === WebSocket.OPEN) {
-    wsPortal.send(JSON.stringify({
-      method: "subscribeTokenTrade",
-      keys: [token.mint]
-    }));
+    wsPortal.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [token.mint] }));
   }
 
-  // Ticker de 1s para cerrar velas aunque no haya trades
-  const ticker = setInterval(() => {
+  entry.ticker = setInterval(() => {
     const t = state.monitored.get(token.mint);
-    if (!t) { clearInterval(ticker); return; }
-    if (t.currentCandle && t.price > 0) {
-      updateCandle(token.mint, t.price); // repite último precio = vela plana
-    }
+    if (!t) { clearInterval(entry.ticker); return; }
+    if (t.price > 0) updateCandle(token.mint, t.price);
   }, CANDLE_MS);
 
-  entry.ticker = ticker;
-
   addLog(`📊 Monitorizando ${token.symbol || shortAddr(token.mint)}`, "monitor");
-  broadcast({ event: "newToken", data: entry });
+  broadcast({ event: "newToken", data: tokenToJSON(entry) });
   broadcast({ event: "stats", data: state.stats });
 }
 
@@ -171,15 +172,9 @@ function stopMonitoring(mint, wsPortal) {
   const token = state.monitored.get(mint);
   if (token?.ticker) clearInterval(token.ticker);
   state.monitored.delete(mint);
-
-  // Desuscribirse de trades
   if (wsPortal && wsPortal.readyState === WebSocket.OPEN) {
-    wsPortal.send(JSON.stringify({
-      method: "unsubscribeTokenTrade",
-      keys: [mint]
-    }));
+    wsPortal.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
   }
-
   addLog(`⏹ Detenido ${shortAddr(mint)}`, "info");
   broadcast({ event: "removeToken", data: { mint } });
 }
@@ -204,11 +199,7 @@ async function processNewToken(raw, wsPortal) {
 
   if (!twitter && !website && raw.uri) {
     const meta = await fetchTokenMetadata(raw.uri);
-    if (meta) {
-      twitter = meta.twitter;
-      website = meta.website;
-      telegram = meta.telegram;
-    }
+    if (meta) { twitter = meta.twitter; website = meta.website; telegram = meta.telegram; }
   }
 
   if (!twitter && !website && !telegram) {
@@ -217,20 +208,11 @@ async function processNewToken(raw, wsPortal) {
   }
 
   state.stats.filtered++;
-
-  // Precio inicial desde el evento de creación
   const initialPrice = calcPriceFromTrade(raw) ?? 0;
 
   const candidate = {
-    mint: raw.mint,
-    name: raw.name || "Unknown",
-    symbol: raw.symbol || "???",
-    twitter,
-    website,
-    telegram,
-    mc: mcEstimate,
-    price: initialPrice,
-    detectedAt: Date.now(),
+    mint: raw.mint, name: raw.name || "Unknown", symbol: raw.symbol || "???",
+    twitter, website, telegram, mc: mcEstimate, price: initialPrice, detectedAt: Date.now(),
   };
 
   addLog(`✅ ${candidate.symbol} — MC ~$${Math.round(mcEstimate)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
@@ -255,24 +237,18 @@ function connectPumpPortal() {
   ws.on("open", () => {
     addLog("✅ PumpPortal conectado", "info");
     broadcast({ event: "wsStatus", data: "connected" });
-    // Suscribirse a nuevos tokens
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
   });
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
-
-      // Nuevo token creado
       if (msg.txType === "create" || (msg.mint && !msg.txType)) {
         processNewToken(msg, ws);
         return;
       }
-
-      // Trade de un token monitorizado
       if (msg.txType === "buy" || msg.txType === "sell") {
-        const token = state.monitored.get(msg.mint);
-        if (token) {
+        if (state.monitored.has(msg.mint)) {
           const price = calcPriceFromTrade(msg);
           if (price && price > 0) updateCandle(msg.mint, price);
         }
@@ -289,8 +265,7 @@ function connectPumpPortal() {
   ws.on("close", () => {
     addLog("🔄 Reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    // Limpiar tickers al reconectar
-    for (const [mint, token] of state.monitored.entries()) {
+    for (const [, token] of state.monitored.entries()) {
       if (token.ticker) clearInterval(token.ticker);
     }
     state.monitored.clear();
@@ -302,7 +277,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.get("/api/state", (req, res) => {
-  res.json({ monitored: Array.from(state.monitored.values()), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats });
+  res.json({ monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats });
 });
 app.delete("/api/token/:mint", (req, res) => {
   stopMonitoring(req.params.mint);
@@ -313,7 +288,7 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
+  ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
   ws.on("close", () => frontendClients.delete(ws));
   ws.on("message", (data) => {
     try {
