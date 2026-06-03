@@ -6,17 +6,13 @@ import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 3001;
 const MAX_MONITORED = 20;
-const CANDLE_MS = 5000; // velas de 5 segundos
+const BOLLINGER_PERIOD = 20;
+const BOLLINGER_MULT = 2;
 const MIN_MC_USD = 2000;
+const CANDLE_MS = 1000;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
-
-// ── Parámetros estrategia ──
-const MOMENTUM_VOLUME_MIN = 300;    // volumen mínimo en 15s para señal momentum
-const MOMENTUM_PRICE_UP = 0.15;     // precio debe subir >15% para momentum
-const MOMENTUM_TRADES_MIN = 5;      // mínimo 5 trades distintos
-const REBOTE_DROP = 0.10;           // caída >10% desde máximo para señal rebote
-const REBOTE_VOLUME_MIN = 500;      // volumen mínimo previo para considerar rebote válido
-const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 min entre señales del mismo token
+const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
+const MIN_MONITOR_MS = 2 * 60 * 1000; // mínimo 2 minutos en monitor
 
 const state = {
   monitored: new Map(),
@@ -47,18 +43,29 @@ function tokenToJSON(t) {
   return {
     mint: t.mint, name: t.name, symbol: t.symbol,
     twitter: t.twitter, website: t.website, telegram: t.telegram,
-    mc: t.mc, price: t.price, bb: null,
+    mc: t.mc, price: t.price, bb: t.bb,
     candleCount: t.candleCount, candles: t.candles50,
-    signal: t.signal, signalType: t.signalType,
-    signalPrice: t.signalPrice, tp: t.tp, sl: t.sl,
-    detectedAt: t.detectedAt, lastUpdate: t.lastUpdate,
-    volumeTotal: t.volumeTotal, tradeCount: t.tradeCount,
-    priceHigh: t.priceHigh, priceLow: t.priceLow,
+    signal: t.signal, signalPrice: t.signalPrice,
+    tp: t.tp, sl: t.sl, detectedAt: t.detectedAt, lastUpdate: t.lastUpdate,
   };
 }
 
 function shortAddr(addr) {
   return addr ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : "—";
+}
+
+function calcBollinger(candles) {
+  if (candles.length < BOLLINGER_PERIOD) return null;
+  const slice = candles.slice(-BOLLINGER_PERIOD);
+  const closes = slice.map((c) => c.close);
+  const mean = closes.reduce((a, b) => a + b, 0) / closes.length;
+  const variance = closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length;
+  const std = Math.sqrt(variance);
+  return {
+    upper: +(mean + BOLLINGER_MULT * std).toFixed(10),
+    middle: +mean.toFixed(10),
+    lower: +(mean - BOLLINGER_MULT * std).toFixed(10),
+  };
 }
 
 async function fetchTokenMetadata(uri) {
@@ -84,125 +91,81 @@ function calcPriceFromTrade(msg) {
   return null;
 }
 
-function calcVolumeUSD(msg) {
-  try {
-    const sol = msg.solAmount || 0;
-    return sol * 150;
-  } catch {}
-  return 0;
-}
-
-function checkSignals(mint) {
-  const token = state.monitored.get(mint);
-  if (!token || token.price <= 0) return;
-
-  const lastSignal = signalCooldown.get(mint) || 0;
-  if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return;
-
-  const now = Date.now();
-  const age = (now - token.detectedAt) / 1000; // segundos de vida
-
-  // ── SEÑAL MOMENTUM ──
-  // Volumen alto + precio subiendo fuerte en primeros 30s
-  if (age <= 30) {
-    const priceChange = token.priceStart > 0 ? (token.price - token.priceStart) / token.priceStart : 0;
-    if (
-      token.volumeTotal >= MOMENTUM_VOLUME_MIN &&
-      token.tradeCount >= MOMENTUM_TRADES_MIN &&
-      priceChange >= MOMENTUM_PRICE_UP
-    ) {
-      emitSignal(mint, "MOMENTUM", token.price, token.price * 1.5, token.price * 0.85);
-      return;
-    }
-  }
-
-  // ── SEÑAL REBOTE ──
-  // Cayó >10% desde máximo y tiene volumen previo suficiente
-  if (token.priceHigh > 0 && token.volumeTotal >= REBOTE_VOLUME_MIN) {
-    const dropFromHigh = (token.priceHigh - token.price) / token.priceHigh;
-    if (dropFromHigh >= REBOTE_DROP && token.price > token.priceStart * 0.8) {
-      emitSignal(mint, "REBOTE", token.price, token.price * 1.3, token.price * 0.85);
-      return;
-    }
-  }
-}
-
-function emitSignal(mint, type, price, tp, sl) {
+function updateCandle(mint, price) {
   const token = state.monitored.get(mint);
   if (!token) return;
-
-  token.signal = type;
-  token.signalType = type;
-  token.signalPrice = price;
-  token.tp = +tp.toFixed(10);
-  token.sl = +sl.toFixed(10);
-  signalCooldown.set(mint, Date.now());
-  state.stats.signals++;
-
-  const signal = {
-    id: `${mint}-${Date.now()}`,
-    mint, name: token.name, symbol: token.symbol,
-    zone: type, price, tp: token.tp, sl: token.sl,
-    time: Date.now(), status: "OPEN",
-    volumeTotal: token.volumeTotal,
-    tradeCount: token.tradeCount,
-  };
-
-  state.signals.unshift(signal);
-  if (state.signals.length > 100) state.signals.pop();
-  addLog(`🎯 ${type} en ${token.symbol} | Vol $${Math.round(token.volumeTotal)} | ${token.tradeCount} trades`, "signal");
-  broadcast({ event: "newSignal", data: signal });
-  broadcast({ event: "stats", data: state.stats });
-}
-
-function processTrade(mint, price, volumeUSD, wsPortal) {
-  const token = state.monitored.get(mint);
-  if (!token) return;
-
   const now = Date.now();
-  const currentCandle = Math.floor(now / CANDLE_MS) * CANDLE_MS;
-
-  // Actualizar precio y estadísticas
-  if (token.priceStart === 0) token.priceStart = price;
-  token.price = price;
-  token.lastUpdate = now;
-  token.volumeTotal = (token.volumeTotal || 0) + volumeUSD;
-  token.tradeCount = (token.tradeCount || 0) + 1;
-  token.priceHigh = Math.max(token.priceHigh || 0, price);
-  token.priceLow = token.priceLow === 0 ? price : Math.min(token.priceLow, price);
-
-  // Velas de 5s
-  if (!token.currentCandle || token.currentCandle.time !== currentCandle) {
+  const currentSecond = Math.floor(now / CANDLE_MS) * CANDLE_MS;
+  if (!token.currentCandle || token.currentCandle.time !== currentSecond) {
     if (token.currentCandle) {
       token.candles.push({ ...token.currentCandle });
-      if (token.candles.length > 200) token.candles.shift();
+      if (token.candles.length > 300) token.candles.shift();
     }
     const prevClose = token.currentCandle?.close ?? price;
-    token.currentCandle = { time: currentCandle, open: prevClose, high: price, low: price, close: price, volume: volumeUSD };
+    token.currentCandle = { time: currentSecond, open: prevClose, high: price, low: price, close: price };
   } else {
     token.currentCandle.high = Math.max(token.currentCandle.high, price);
     token.currentCandle.low = Math.min(token.currentCandle.low, price);
     token.currentCandle.close = price;
-    token.currentCandle.volume = (token.currentCandle.volume || 0) + volumeUSD;
+  }
+  const allCandles = [...token.candles, token.currentCandle];
+  const bb = calcBollinger(allCandles);
+  token.price = price;
+  token.bb = bb;
+  token.candleCount = allCandles.length;
+  token.lastUpdate = now;
+  token.candles50 = allCandles.slice(-50);
+  if (bb) checkSignal(mint, price, bb, allCandles.length);
+  broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
+}
+
+function checkSignal(mint, price, bb, candleCount) {
+  if (candleCount < BOLLINGER_PERIOD) return;
+  const token = state.monitored.get(mint);
+  if (!token) return;
+  const lastSignal = signalCooldown.get(mint) || 0;
+  if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return;
+
+  // Filtro anti señal falsa: precio no debe haber caído >30% desde máximo
+  if (token.priceHigh > 0) {
+    const dropFromHigh = (token.priceHigh - price) / token.priceHigh;
+    if (dropFromHigh > 0.30) {
+      addLog(`⚠️ ${token.symbol} ignorado — caída ${(dropFromHigh*100).toFixed(0)}% desde máximo`, "filter");
+      return;
+    }
   }
 
-  token.candleCount = token.candles.length + 1;
-  token.candles50 = [...token.candles, token.currentCandle].slice(-50);
-
-  broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
-  checkSignals(mint);
+  const touchedLower = price <= bb.lower * 1.02;
+  const touchedMiddle = !touchedLower && Math.abs(price - bb.middle) / bb.middle < 0.015;
+  if (touchedLower || touchedMiddle) {
+    const zone = touchedLower ? "LOWER" : "MIDDLE";
+    const tp = +(price * 1.5).toFixed(10);
+    const sl = +(price * 0.8).toFixed(10);
+    token.signal = zone;
+    token.signalPrice = price;
+    token.tp = tp;
+    token.sl = sl;
+    signalCooldown.set(mint, Date.now());
+    state.stats.signals++;
+    const signal = {
+      id: `${mint}-${Date.now()}`,
+      mint, name: token.name, symbol: token.symbol,
+      zone, price, tp, sl, time: Date.now(), status: "OPEN"
+    };
+    state.signals.unshift(signal);
+    if (state.signals.length > 100) state.signals.pop();
+    addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
+    broadcast({ event: "newSignal", data: signal });
+    broadcast({ event: "stats", data: state.stats });
+  }
 }
 
 function startMonitoring(token, wsPortal) {
   if (state.monitored.has(token.mint)) return;
   const entry = {
-    ...token,
-    candles: [], currentCandle: null,
-    candleCount: 0, signal: null, signalType: null,
-    lastUpdate: Date.now(), candles50: [],
-    volumeTotal: 0, tradeCount: 0,
-    priceHigh: 0, priceLow: 0, priceStart: 0,
-    ticker: null,
+    ...token, candles: [], currentCandle: null, bb: null,
+    candleCount: 0, signal: null, lastUpdate: Date.now(), candles50: [],
+    priceHigh: token.price || 0, ticker: null,
   };
   state.monitored.set(token.mint, entry);
 
@@ -210,21 +173,12 @@ function startMonitoring(token, wsPortal) {
     wsPortal.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [token.mint] }));
   }
 
-  // Ticker para cerrar velas aunque no haya trades
   entry.ticker = setInterval(() => {
     const t = state.monitored.get(token.mint);
     if (!t) { clearInterval(entry.ticker); return; }
-    if (t.price > 0 && t.currentCandle) {
-      const now = Date.now();
-      const currentCandle = Math.floor(now / CANDLE_MS) * CANDLE_MS;
-      if (t.currentCandle.time !== currentCandle) {
-        t.candles.push({ ...t.currentCandle });
-        if (t.candles.length > 200) t.candles.shift();
-        t.currentCandle = { time: currentCandle, open: t.price, high: t.price, low: t.price, close: t.price, volume: 0 };
-        t.candleCount = t.candles.length + 1;
-        t.candles50 = [...t.candles, t.currentCandle].slice(-50);
-        broadcast({ event: "tokenUpdate", data: tokenToJSON(t) });
-      }
+    if (t.price > 0) {
+      t.priceHigh = Math.max(t.priceHigh || 0, t.price);
+      updateCandle(token.mint, t.price);
     }
   }, CANDLE_MS);
 
@@ -284,9 +238,13 @@ async function processNewToken(raw, wsPortal) {
   addLog(`✅ ${candidate.symbol} — MC ~$${Math.round(mcEstimate)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
 
   if (state.monitored.size >= MAX_MONITORED) {
+    // Solo quitar tokens que llevan más de MIN_MONITOR_MS y no tienen señal
     let oldest = null;
     for (const [mint, t] of state.monitored.entries()) {
-      if (!t.signal && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
+      const age = Date.now() - t.detectedAt;
+      if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) {
+        oldest = t;
+      }
     }
     if (oldest) stopMonitoring(oldest.mint, wsPortal);
     else { addLog(`⚠️ Cola llena, descartando ${candidate.symbol}`, "warn"); return; }
@@ -315,8 +273,7 @@ function connectPumpPortal() {
       }
       if ((msg.txType === "buy" || msg.txType === "sell") && state.monitored.has(msg.mint)) {
         const price = calcPriceFromTrade(msg);
-        const volume = calcVolumeUSD(msg);
-        if (price && price > 0) processTrade(msg.mint, price, volume, ws);
+        if (price && price > 0) updateCandle(msg.mint, price);
         return;
       }
     } catch {}
