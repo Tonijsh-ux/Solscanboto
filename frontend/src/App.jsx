@@ -89,7 +89,7 @@ function useBackend() {
  return { monitored, signals, log, stats, wsStatus, removeToken };
 }
 
-function Sparkline({ candles, bb }) {
+function Sparkline({ candles }) {
  if (!candles || candles.length < 3) return <div style={{ fontSize: 10, color: "#334155", fontFamily: "monospace" }}>acumulando…</div>;
  const w = 100, h = 36;
  const prices = candles.map((c) => c.close);
@@ -97,30 +97,30 @@ function Sparkline({ candles, bb }) {
  const max = Math.max(...prices);
  const range = max - min || 1;
  const pts = prices.map((p, i) => `${(i / (prices.length - 1)) * w},${h - ((p - min) / range) * (h - 4) - 2}`).join(" ");
- const bbY = (v) => h - ((v - min) / range) * (h - 4) - 2;
  const isUp = prices[prices.length - 1] >= prices[0];
  return (
    <svg width={w} height={h} style={{ display: "block" }}>
-     {bb && (<>
-       <line x1="0" y1={bbY(bb.upper)} x2={w} y2={bbY(bb.upper)} stroke="#ef4444" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" />
-       <line x1="0" y1={bbY(bb.middle)} x2={w} y2={bbY(bb.middle)} stroke="#facc15" strokeWidth="0.8" opacity="0.8" />
-       <line x1="0" y1={bbY(bb.lower)} x2={w} y2={bbY(bb.lower)} stroke="#22c55e" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" />
-     </>)}
      <polyline points={pts} fill="none" stroke={isUp ? "#22c55e" : "#ef4444"} strokeWidth="1.5" strokeLinejoin="round" />
    </svg>
  );
 }
 
 function TokenCard({ token, onRemove }) {
- const { mint, name, symbol, mc, price, bb, signal, candleCount, candles, detectedAt, tp, sl, twitter, website } = token;
- const hasBB = candleCount >= 20;
- const signalColor = signal === "LOWER" ? "#22c55e" : signal === "MIDDLE" ? "#facc15" : null;
+ const { mint, name, symbol, mc, price, signal, signalType, candleCount, candles, detectedAt, tp, sl, twitter, website, volumeTotal, tradeCount, priceHigh } = token;
+ const signalColor = signal === "MOMENTUM" ? "#38bdf8" : signal === "REBOTE" ? "#22c55e" : null;
+ const priceChange = token.priceStart > 0 ? ((price - token.priceStart) / token.priceStart * 100).toFixed(1) : null;
+
  return (
    <div style={{ background: "#0d1117", border: `1px solid ${signalColor || "#1e2d40"}`, borderRadius: 12, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8, boxShadow: signal ? `0 0 16px ${signalColor}22` : "none" }}>
      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
          <span style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{symbol}</span>
          <span style={{ fontSize: 11, color: "#64748b" }}>{name.length > 16 ? name.slice(0, 14) + "…" : name}</span>
+         {priceChange && (
+           <span style={{ fontSize: 10, fontFamily: "monospace", color: priceChange > 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>
+             {priceChange > 0 ? "+" : ""}{priceChange}%
+           </span>
+         )}
        </div>
        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
          {twitter && <a href={twitter} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "#94a3b8", background: "#1e2d40", padding: "2px 6px", borderRadius: 4, textDecoration: "none" }}>𝕏</a>}
@@ -128,11 +128,12 @@ function TokenCard({ token, onRemove }) {
          <button onClick={() => onRemove(mint)} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14, padding: "0 2px" }}>✕</button>
        </div>
      </div>
+
      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
        {[
          { label: "Precio", value: formatUSD(price) },
-         { label: "MC", value: formatUSD(mc) },
-         { label: "Velas", value: `${candleCount}/20`, color: hasBB ? "#22c55e" : "#facc15" },
+         { label: "Vol", value: formatUSD(volumeTotal || 0) },
+         { label: "Trades", value: tradeCount || 0, color: (tradeCount || 0) >= 5 ? "#22c55e" : "#facc15" },
          { label: "Tiempo", value: elapsed(detectedAt) }
        ].map((m, i) => (
          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
@@ -141,25 +142,28 @@ function TokenCard({ token, onRemove }) {
          </div>
        ))}
      </div>
+
      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-       <Sparkline candles={candles} bb={bb} />
-       {bb && (
-         <div style={{ display: "flex", flexDirection: "column", gap: 1, fontFamily: "monospace", fontSize: 9 }}>
-           <span style={{ color: "#ef4444" }}>↑{formatUSD(bb.upper)}</span>
-           <span style={{ color: "#facc15" }}>—{formatUSD(bb.middle)}</span>
-           <span style={{ color: "#22c55e" }}>↓{formatUSD(bb.lower)}</span>
-         </div>
-       )}
+       <Sparkline candles={candles} />
+       <div style={{ display: "flex", flexDirection: "column", gap: 2, fontFamily: "monospace", fontSize: 9 }}>
+         <span style={{ color: "#ef4444" }}>↑ {formatUSD(priceHigh || price)}</span>
+         <span style={{ color: "#64748b" }}>MC {formatUSD(mc)}</span>
+         <span style={{ color: "#334155" }}>{candleCount} velas×5s</span>
+       </div>
      </div>
+
      {signal && (
        <div style={{ background: `${signalColor}18`, border: `1px solid ${signalColor}`, borderRadius: 8, padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-         <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: signalColor }}>🎯 {signal}</span>
+         <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: signalColor }}>
+           {signal === "MOMENTUM" ? "🚀" : "🔄"} {signal}
+         </span>
          <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 11 }}>
            <span style={{ color: "#22c55e" }}>TP {formatUSD(tp)}</span>
            <span style={{ color: "#ef4444" }}>SL {formatUSD(sl)}</span>
          </div>
        </div>
      )}
+
      <a href={`https://dexscreener.com/solana/${mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>
        📊 {shortAddr(mint)} — Ver en DexScreener
      </a>
@@ -176,6 +180,7 @@ export default function App() {
  return (
    <div style={{ background: "#080c14", minHeight: "100dvh", color: "#e2e8f0", fontFamily: "sans-serif", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto" }}>
      <style>{`* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; } body { overscroll-behavior: none; background: #080c14; } ::-webkit-scrollbar { display: none; }`}</style>
+
      <div style={{ background: "#0d1117", borderBottom: "1px solid #1e2d40", padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50 }}>
        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
          <span style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700, color: "#38bdf8" }}>SOL<span style={{ color: "#facc15" }}>SCAN</span></span>
@@ -193,6 +198,7 @@ export default function App() {
          ))}
        </div>
      </div>
+
      <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40" }}>
        {[
          { id: "monitor", label: "📊 Monitor", badge: monitored.length },
@@ -205,6 +211,7 @@ export default function App() {
          </button>
        ))}
      </div>
+
      <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
        {tab === "monitor" && monitored.length === 0 && (
          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
@@ -213,6 +220,7 @@ export default function App() {
          </div>
        )}
        {tab === "monitor" && monitored.map((t) => <TokenCard key={t.mint} token={t} onRemove={removeToken} />)}
+
        {tab === "signals" && signals.length === 0 && (
          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
            <div style={{ fontSize: 40, opacity: 0.3 }}>🎯</div>
@@ -220,24 +228,31 @@ export default function App() {
          </div>
        )}
        {tab === "signals" && signals.map((s) => (
-         <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "LOWER" ? "#22c55e" : "#facc15"}22`, borderRadius: 10, padding: "10px 14px" }}>
+         <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "MOMENTUM" ? "#38bdf8" : "#22c55e"}22`, borderRadius: 10, padding: "10px 14px" }}>
            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
              <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{s.symbol || shortAddr(s.mint)}</span>
              <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(s.time)}</span>
            </div>
            <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 12, marginBottom: 6 }}>
-             <span style={{ color: s.zone === "LOWER" ? "#22c55e" : "#facc15", fontWeight: 700 }}>BANDA {s.zone}</span>
+             <span style={{ color: s.zone === "MOMENTUM" ? "#38bdf8" : "#22c55e", fontWeight: 700 }}>
+               {s.zone === "MOMENTUM" ? "🚀" : "🔄"} {s.zone}
+             </span>
              <span style={{ color: "#94a3b8" }}>@ {formatUSD(s.price)}</span>
            </div>
-           <div style={{ display: "flex", gap: 14, fontFamily: "monospace", fontSize: 11, marginBottom: 8 }}>
+           <div style={{ display: "flex", gap: 14, fontFamily: "monospace", fontSize: 11, marginBottom: 4 }}>
              <span style={{ color: "#22c55e" }}>TP {formatUSD(s.tp)}</span>
              <span style={{ color: "#ef4444" }}>SL {formatUSD(s.sl)}</span>
+           </div>
+           <div style={{ display: "flex", gap: 14, fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 8 }}>
+             <span>Vol {formatUSD(s.volumeTotal)}</span>
+             <span>{s.tradeCount} trades</span>
            </div>
            <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>
              📊 Ver en DexScreener →
            </a>
          </div>
        ))}
+
        {tab === "log" && log.map((entry, i) => (
          <div key={i} style={{ display: "flex", gap: 8, padding: "3px 0", borderBottom: "1px solid #0d1117" }}>
            <span style={{ fontFamily: "monospace", fontSize: 10, color: "#334155", flexShrink: 0 }}>{formatTime(entry.time)}</span>
