@@ -14,8 +14,7 @@ const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
 
 const HELIUS_API_KEY = "7c210bdf-079b-4a47-aed8-57ddb7354971";
-const HELIUS_WS = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const HELIUS_REST = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 const state = {
@@ -73,71 +72,37 @@ function calcBollinger(candles) {
   };
 }
 
-// Obtener precio SOL en USD
 let solPriceUSD = 150;
 async function updateSolPrice() {
   try {
     const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
     const data = await res.json();
     solPriceUSD = data?.solana?.usd ?? 150;
+    addLog(`💲 SOL = $${solPriceUSD}`, "info");
   } catch {}
 }
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
 
-// Parsear precio desde bonding curve de Pump.fun
-function parsePriceFromPumpTx(tx) {
-  try {
-    // Pump.fun bonding curve: precio = vSOL / vTokens
-    const preBalances = tx.meta?.preTokenBalances || [];
-    const postBalances = tx.meta?.postTokenBalances || [];
-
-    // Buscar el cambio de SOL para calcular precio
-    const preSOL = tx.meta?.preBalances?.[0] || 0;
-    const postSOL = tx.meta?.postBalances?.[0] || 0;
-    const solDiff = Math.abs(postSOL - preSOL) / 1e9; // lamports a SOL
-
-    // Buscar cambio de tokens
-    let tokenDiff = 0;
-    for (const post of postBalances) {
-      const pre = preBalances.find(p => p.accountIndex === post.accountIndex);
-      const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
-      const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
-      if (Math.abs(postAmt - preAmt) > 0) {
-        tokenDiff = Math.abs(postAmt - preAmt);
-        break;
-      }
-    }
-
-    if (solDiff > 0 && tokenDiff > 0) {
-      const priceInSOL = solDiff / tokenDiff;
-      return {
-        price: priceInSOL * solPriceUSD,
-        volumeUSD: solDiff * solPriceUSD,
-      };
-    }
-  } catch {}
-  return null;
-}
-
-// Obtener metadata del token
 async function fetchTokenMetadata(mint) {
   try {
-    const res = await fetch(HELIUS_REST, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: "1", method: "getAsset",
-        params: { id: mint }
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
+    const res = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "1", method: "getAsset",
+          params: { id: mint }
+        }),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
     const data = await res.json();
     const meta = data?.result;
     if (!meta) return null;
 
     const links = meta.content?.links || {};
-    const files = meta.content?.files || [];
     const jsonUri = meta.content?.json_uri;
 
     let twitter = links.twitter || null;
@@ -146,13 +111,12 @@ async function fetchTokenMetadata(mint) {
     let name = meta.content?.metadata?.name || null;
     let symbol = meta.content?.metadata?.symbol || null;
 
-    // Si no hay sociales en el asset, buscar en la URI
-    if (!twitter && !website && jsonUri) {
+    if ((!twitter && !website) && jsonUri) {
       try {
         const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
         const j = await r.json();
-        twitter = j.twitter || j.extensions?.twitter || null;
-        website = j.website || j.extensions?.website || null;
+        twitter = twitter || j.twitter || j.extensions?.twitter || null;
+        website = website || j.website || j.extensions?.website || null;
         telegram = j.telegram || j.extensions?.telegram || null;
         if (!name) name = j.name;
         if (!symbol) symbol = j.symbol;
@@ -206,11 +170,9 @@ function checkSignal(mint, price, bb, candleCount) {
   const lastSignal = signalCooldown.get(mint) || 0;
   if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return;
 
-  // Filtro: mínimo 5 trades reales y $10 de volumen
   if ((token.tradeCount || 0) < 5) return;
   if ((token.volumeUSD || 0) < 10) return;
 
-  // Filtro anti caída libre
   if (token.priceHigh > 0) {
     const dropFromHigh = (token.priceHigh - price) / token.priceHigh;
     if (dropFromHigh > 0.30) return;
@@ -254,7 +216,6 @@ function startMonitoring(token) {
   };
   state.monitored.set(token.mint, entry);
 
-  // Ticker para cerrar velas
   entry.ticker = setInterval(() => {
     const t = state.monitored.get(token.mint);
     if (!t) { clearInterval(entry.ticker); return; }
@@ -274,101 +235,7 @@ function stopMonitoring(mint) {
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-// Conectar a Helius WebSocket para transacciones de Pump.fun
-function connectHelius() {
-  addLog("🔌 Conectando a Helius RPC...", "info");
-  broadcast({ event: "wsStatus", data: "connecting" });
-
-  const ws = new WebSocket(HELIUS_WS);
-  let pingInterval;
-
-  ws.on("open", () => {
-    addLog("✅ Helius conectado — escuchando Pump.fun", "info");
-    broadcast({ event: "wsStatus", data: "connected" });
-
-    // Suscribirse a logs del programa Pump.fun
-    ws.send(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [
-        { mentions: [PUMP_PROGRAM] },
-        { commitment: "processed" }
-      ]
-    }));
-
-    // Ping cada 30s para mantener conexión
-    pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
-      }
-    }, 30_000);
-  });
-
-  ws.on("message", async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      const logs = msg?.params?.result?.value?.logs;
-      const signature = msg?.params?.result?.value?.signature;
-
-      if (!logs || !signature) return;
-
-      // Detectar si es creación o trade
-      const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("create"));
-      const isTrade = logs.some(l => l.includes("buy") || l.includes("sell"));
-
-      if (!isCreate && !isTrade) return;
-
-      // Obtener detalles de la transacción
-      const txRes = await fetch(HELIUS_REST, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: "tx", method: "getTransaction",
-          params: [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }]
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
-
-      const txData = await txRes.json();
-      const tx = txData?.result;
-      if (!tx) return;
-
-      // Extraer mint del token
-      const tokenBalances = tx.meta?.postTokenBalances || [];
-      if (tokenBalances.length === 0) return;
-      const mint = tokenBalances[0]?.mint;
-      if (!mint) return;
-
-      if (isCreate) {
-        await processNewToken(mint, tx);
-      } else if (isTrade && state.monitored.has(mint)) {
-        const parsed = parsePriceFromPumpTx(tx);
-        if (parsed && parsed.price > 0) {
-          updateCandle(mint, parsed.price, parsed.volumeUSD);
-        }
-      }
-    } catch {}
-  });
-
-  ws.on("error", (err) => {
-    addLog(`❌ Error Helius: ${err.message}`, "error");
-    broadcast({ event: "wsStatus", data: "error" });
-  });
-
-  ws.on("close", () => {
-    clearInterval(pingInterval);
-    addLog("🔄 Helius desconectado — reconectando en 5s...", "warn");
-    broadcast({ event: "wsStatus", data: "disconnected" });
-    for (const [, token] of state.monitored.entries()) {
-      if (token.ticker) clearInterval(token.ticker);
-    }
-    state.monitored.clear();
-    setTimeout(connectHelius, 5000);
-  });
-}
-
-async function processNewToken(mint, tx) {
+async function processNewToken(mint, solAmount, tokenAmount) {
   if (seenMints.has(mint)) return;
   seenMints.add(mint);
   if (seenMints.size > 5000) seenMints.clear();
@@ -376,7 +243,16 @@ async function processNewToken(mint, tx) {
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
 
-  // Obtener metadata via Helius getAsset
+  const price = solAmount > 0 && tokenAmount > 0
+    ? (solAmount / tokenAmount) * solPriceUSD
+    : 0;
+
+  const mc = price * 1_000_000_000;
+  if (mc > 0 && mc < MIN_MC_USD) {
+    addLog(`⛔ MC bajo: ${shortAddr(mint)}`, "filter");
+    return;
+  }
+
   const meta = await fetchTokenMetadata(mint);
   if (!meta) {
     addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter");
@@ -390,17 +266,8 @@ async function processNewToken(mint, tx) {
     return;
   }
 
-  // MC estimado desde la tx
-  const parsed = parsePriceFromPumpTx(tx);
-  const price = parsed?.price ?? 0;
-  const mc = price * 1_000_000_000; // supply inicial pump.fun
-  if (mc > 0 && mc < MIN_MC_USD) {
-    addLog(`⛔ MC bajo (~$${Math.round(mc)}): ${name}`, "filter");
-    return;
-  }
-
   state.stats.filtered++;
-  addLog(`✅ ${symbol} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
+  addLog(`✅ ${symbol} — MC ~$${Math.round(mc)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
 
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
@@ -417,6 +284,116 @@ async function processNewToken(mint, tx) {
   startMonitoring({
     mint, name: name || "Unknown", symbol: symbol || "???",
     twitter, website, telegram, mc, price, detectedAt: Date.now(),
+  });
+}
+
+function connectHelius() {
+  addLog("🔌 Conectando a Helius...", "info");
+  broadcast({ event: "wsStatus", data: "connecting" });
+
+  const ws = new WebSocket(HELIUS_WS);
+  let pingInterval;
+
+  ws.on("open", () => {
+    addLog("✅ Helius conectado — escuchando Pump.fun", "info");
+    broadcast({ event: "wsStatus", data: "connected" });
+
+    // Usar transactionSubscribe — viene todo parseado
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 420,
+      method: "transactionSubscribe",
+      params: [
+        {
+          accountInclude: [PUMP_PROGRAM],
+          failed: false,
+        },
+        {
+          commitment: "processed",
+          encoding: "jsonParsed",
+          transactionDetails: "full",
+          maxSupportedTransactionVersion: 0,
+        }
+      ]
+    }));
+
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
+      }
+    }, 20_000);
+  });
+
+  ws.on("message", async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      const tx = msg?.params?.result?.transaction;
+      if (!tx) return;
+
+      const meta = tx.meta;
+      const message = tx.transaction?.message;
+      if (!meta || !message) return;
+
+      // Extraer mint del token
+      const tokenBalances = meta.postTokenBalances || [];
+      if (tokenBalances.length === 0) return;
+      const mint = tokenBalances[0]?.mint;
+      if (!mint) return;
+
+      // Calcular SOL movido y tokens movidos
+      const preSOL = meta.preBalances?.[0] || 0;
+      const postSOL = meta.postBalances?.[0] || 0;
+      const solDiff = Math.abs(postSOL - preSOL) / 1e9;
+
+      let tokenDiff = 0;
+      const preTokenBalances = meta.preTokenBalances || [];
+      for (const post of tokenBalances) {
+        const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
+        const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
+        const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
+        if (Math.abs(postAmt - preAmt) > 0) {
+          tokenDiff = Math.abs(postAmt - preAmt);
+          break;
+        }
+      }
+
+      if (solDiff === 0) return;
+
+      const price = tokenDiff > 0 ? (solDiff / tokenDiff) * solPriceUSD : 0;
+      const volumeUSD = solDiff * solPriceUSD;
+
+      // Detectar si es creación (InitializeMint en logs)
+      const logs = meta.logMessages || [];
+      const isCreate = logs.some(l =>
+        l.includes("InitializeMint") ||
+        l.includes("initialize_mint") ||
+        l.includes("create\n") ||
+        l.includes("Instruction: Create")
+      );
+
+      if (isCreate) {
+        await processNewToken(mint, solDiff, tokenDiff);
+      } else if (state.monitored.has(mint) && price > 0) {
+        updateCandle(mint, price, volumeUSD);
+      }
+
+    } catch {}
+  });
+
+  ws.on("error", (err) => {
+    addLog(`❌ Error: ${err.message}`, "error");
+    broadcast({ event: "wsStatus", data: "error" });
+  });
+
+  ws.on("close", () => {
+    clearInterval(pingInterval);
+    addLog("🔄 Reconectando en 5s...", "warn");
+    broadcast({ event: "wsStatus", data: "disconnected" });
+    for (const [, token] of state.monitored.entries()) {
+      if (token.ticker) clearInterval(token.ticker);
+    }
+    state.monitored.clear();
+    setTimeout(connectHelius, 5000);
   });
 }
 
@@ -458,6 +435,6 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot con Helius RPC corriendo en puerto ${PORT}`);
+  console.log(`🚀 SolScanBot Helius corriendo en puerto ${PORT}`);
   connectHelius();
 });
