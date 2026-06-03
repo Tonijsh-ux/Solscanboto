@@ -46,14 +46,37 @@ function useBackend() {
      ws.onmessage = (evt) => {
        try {
          const { event, data } = JSON.parse(evt.data);
-         if (event === "fullState") { setMonitored(data.monitored || []); setSignals(data.signals || []); setLog(data.log || []); setStats(data.stats || {}); setWsStatus(data.wsStatus || "connected"); return; }
+         if (event === "fullState") {
+           setMonitored(data.monitored || []);
+           setSignals(data.signals || []);
+           setLog(data.log || []);
+           setStats(data.stats || {});
+           setWsStatus(data.wsStatus || "connected");
+           return;
+         }
          if (event === "wsStatus") { setWsStatus(data); return; }
          if (event === "stats") { setStats(data); return; }
-         if (event === "newToken") { setMonitored((prev) => prev.find((t) => t.mint === data.mint) ? prev : [data, ...prev]); return; }
-         if (event === "removeToken") { setMonitored((prev) => prev.filter((t) => t.mint !== data.mint)); return; }
-         if (event === "tokenUpdate") { setMonitored((prev) => prev.map((t) => t.mint === data.mint ? { ...t, ...data } : t)); return; }
-         if (event === "newSignal") { setSignals((prev) => [data, ...prev].slice(0, 100)); if (navigator.vibrate) navigator.vibrate([200, 100, 200]); return; }
-         if (event === "log") { setLog((prev) => [data, ...prev].slice(0, 200)); return; }
+         if (event === "newToken") {
+           setMonitored((prev) => prev.find((t) => t.mint === data.mint) ? prev : [data, ...prev]);
+           return;
+         }
+         if (event === "removeToken") {
+           setMonitored((prev) => prev.filter((t) => t.mint !== data.mint));
+           return;
+         }
+         if (event === "tokenUpdate") {
+           setMonitored((prev) => prev.map((t) => t.mint === data.mint ? { ...t, ...data } : t));
+           return;
+         }
+         if (event === "newSignal") {
+           setSignals((prev) => prev.find(s => s.id === data.id) ? prev : [data, ...prev].slice(0, 100));
+           if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+           return;
+         }
+         if (event === "log") {
+           setLog((prev) => [data, ...prev].slice(0, 200));
+           return;
+         }
        } catch {}
      };
      ws.onerror = () => setWsStatus("error");
@@ -106,7 +129,12 @@ function TokenCard({ token, onRemove }) {
        </div>
      </div>
      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
-       {[{ label: "Precio", value: formatUSD(price) }, { label: "MC", value: formatUSD(mc) }, { label: "Velas", value: `${candleCount}/20`, color: hasBB ? "#22c55e" : "#facc15" }, { label: "Tiempo", value: elapsed(detectedAt) }].map((m, i) => (
+       {[
+         { label: "Precio", value: formatUSD(price) },
+         { label: "MC", value: formatUSD(mc) },
+         { label: "Velas", value: `${candleCount}/20`, color: hasBB ? "#22c55e" : "#facc15" },
+         { label: "Tiempo", value: elapsed(detectedAt) }
+       ].map((m, i) => (
          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 2 }}>{m.label}</div>
            <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
@@ -166,7 +194,11 @@ export default function App() {
        </div>
      </div>
      <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40" }}>
-       {[{ id: "monitor", label: "📊 Monitor", badge: monitored.length }, { id: "signals", label: "🎯 Señales", badge: signals.length, accent: "#facc15" }, { id: "log", label: "📋 Log", badge: null }].map((t) => (
+       {[
+         { id: "monitor", label: "📊 Monitor", badge: monitored.length },
+         { id: "signals", label: "🎯 Señales", badge: signals.length, accent: "#facc15" },
+         { id: "log", label: "📋 Log", badge: null }
+       ].map((t) => (
          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 4px", border: "none", background: "none", fontFamily: "sans-serif", fontSize: 12, fontWeight: 600, color: tab === t.id ? (t.accent || "#38bdf8") : "#64748b", borderBottom: tab === t.id ? `2px solid ${t.accent || "#38bdf8"}` : "2px solid transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
            {t.label}
            {t.badge !== null && t.badge > 0 && <span style={{ background: t.accent ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 5px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>}
@@ -174,9 +206,19 @@ export default function App() {
        ))}
      </div>
      <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-       {tab === "monitor" && monitored.length === 0 && <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}><div style={{ fontSize: 40, opacity: 0.3 }}>🔍</div><p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Escaneando la blockchain...<br/>Los tokens aparecerán aquí.</p></div>}
+       {tab === "monitor" && monitored.length === 0 && (
+         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
+           <div style={{ fontSize: 40, opacity: 0.3 }}>🔍</div>
+           <p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Escaneando la blockchain...<br />Los tokens aparecerán aquí.</p>
+         </div>
+       )}
        {tab === "monitor" && monitored.map((t) => <TokenCard key={t.mint} token={t} onRemove={removeToken} />)}
-       {tab === "signals" && signals.length === 0 && <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}><div style={{ fontSize: 40, opacity: 0.3 }}>🎯</div><p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Esperando señales...<br/>El móvil vibrará cuando detecte una.</p></div>}
+       {tab === "signals" && signals.length === 0 && (
+         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
+           <div style={{ fontSize: 40, opacity: 0.3 }}>🎯</div>
+           <p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Esperando señales...<br />El móvil vibrará cuando detecte una.</p>
+         </div>
+       )}
        {tab === "signals" && signals.map((s) => (
          <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "LOWER" ? "#22c55e" : "#facc15"}22`, borderRadius: 10, padding: "10px 14px" }}>
            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
