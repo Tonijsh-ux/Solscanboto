@@ -53,7 +53,6 @@ function calcBollinger(candles) {
   };
 }
 
-// Obtener metadata real del token desde su URI onchain
 async function fetchTokenMetadata(uri) {
   if (!uri) return null;
   try {
@@ -69,14 +68,29 @@ async function fetchTokenMetadata(uri) {
 }
 
 async function fetchPrice(mint) {
+  // Intentar Jupiter primero
   try {
     const res = await fetch(
       `https://price.jup.ag/v6/price?ids=${mint}`,
       { signal: AbortSignal.timeout(3000) }
     );
+    if (res.ok) {
+      const data = await res.json();
+      const price = data?.data?.[mint]?.price;
+      if (price && price > 0) return price;
+    }
+  } catch {}
+
+  // Fallback: DexScreener
+  try {
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { signal: AbortSignal.timeout(4000) }
+    );
     if (!res.ok) return null;
     const data = await res.json();
-    return data?.data?.[mint]?.price ?? null;
+    const pair = data?.pairs?.[0];
+    return pair?.priceUsd ? parseFloat(pair.priceUsd) : null;
   } catch { return null; }
 }
 
@@ -163,14 +177,12 @@ async function processNewToken(raw) {
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
 
-  // FILTRO 1: MC estimado desde el evento
   const mcEstimate = raw.usdMarketCap || (raw.marketCapSol || 0) * 150;
   if (mcEstimate > 0 && mcEstimate < MIN_MC_USD) {
     addLog(`⛔ MC bajo (~$${Math.round(mcEstimate)}): ${raw.name}`, "filter");
     return;
   }
 
-  // FILTRO 2: Metadata real desde URI onchain
   let twitter = raw.twitter || null;
   let website = raw.website || null;
   let telegram = raw.telegram || null;
