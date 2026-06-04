@@ -12,8 +12,8 @@ const MIN_MC_USD = 2500;
 const CANDLE_MS = 1000;
 const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
-const TP_PCT = 1.5;
-const SL_PCT = 0.8;
+const TP_PCT = 1.9;
+const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000; // cierre automático a 15 minutos
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
