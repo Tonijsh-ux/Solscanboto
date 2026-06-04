@@ -8,19 +8,27 @@ const PORT = process.env.PORT || 3001;
 const MAX_MONITORED = 20;
 const BOLLINGER_PERIOD = 20;
 const BOLLINGER_MULT = 2;
-const MIN_MC_USD = 15000;
-const MAX_MC_USD = 500000;
-const CANDLE_MS = 10000; // velas de 10s para tokens con menos actividad
-const SIGNAL_COOLDOWN_MS = 10 * 60 * 1000;
-const SCAN_INTERVAL_MS = 30000; // escanear cada 30s
+const MIN_MC_USD = 2000;
+const CANDLE_MS = 1000;
+const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
+const MIN_MONITOR_MS = 2 * 60 * 1000;
+const TP_PCT = 1.5;   // +50%
+const SL_PCT = 0.8;   // -20%
 
-const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
+const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
+const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 const state = {
   monitored: new Map(),
   signals: [],
+  demoTrades: [],  // posiciones demo abiertas y cerradas
   log: [],
-  stats: { seen: 0, filtered: 0, signals: 0, uptime: Date.now() },
+  stats: {
+    seen: 0, filtered: 0, signals: 0,
+    demoOpen: 0, demoWins: 0, demoLosses: 0,
+    demoPnL: 0, uptime: Date.now()
+  },
 };
 
 const frontendClients = new Set();
@@ -50,7 +58,7 @@ function tokenToJSON(t) {
     signal: t.signal, signalPrice: t.signalPrice,
     tp: t.tp, sl: t.sl, detectedAt: t.detectedAt, lastUpdate: t.lastUpdate,
     tradeCount: t.tradeCount, volumeUSD: t.volumeUSD,
-    priceChange5m: t.priceChange5m, priceChange1h: t.priceChange1h,
+    priceHigh: t.priceHigh, priceLow: t.priceLow,
   };
 }
 
@@ -72,125 +80,123 @@ function calcBollinger(candles) {
   };
 }
 
-// Escanear tokens activos de DexScreener
-async function scanDexScreener() {
+let solPriceUSD = 150;
+async function updateSolPrice() {
   try {
-    // Buscar tokens de Solana recientes con buena actividad
-    const urls = [
-      "https://api.dexscreener.com/latest/dex/search?q=solana&rankBy=trendingScoreH1&order=desc",
-      "https://api.dexscreener.com/token-boosts/top/v1",
-    ];
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const data = await res.json();
+    solPriceUSD = data?.solana?.usd ?? 150;
+  } catch {}
+}
+setInterval(updateSolPrice, 60_000);
+updateSolPrice();
 
-    for (const url of urls) {
+async function fetchTokenMetadata(mint) {
+  try {
+    const res = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "1", method: "getAsset",
+          params: { id: mint }
+        }),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    const data = await res.json();
+    const meta = data?.result;
+    if (!meta) return null;
+
+    const links = meta.content?.links || {};
+    const jsonUri = meta.content?.json_uri;
+    let twitter = links.twitter || null;
+    let website = links.external_url || null;
+    let telegram = null;
+    let name = meta.content?.metadata?.name || null;
+    let symbol = meta.content?.metadata?.symbol || null;
+
+    if ((!twitter && !website) && jsonUri) {
       try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-        if (!res.ok) continue;
-        const data = await res.json();
-
-        const pairs = data.pairs || data || [];
-        if (!Array.isArray(pairs)) continue;
-
-        for (const pair of pairs) {
-          if (pair.chainId !== "solana") continue;
-
-          const mint = pair.baseToken?.address;
-          if (!mint) continue;
-          if (seenMints.has(mint)) continue;
-
-          const mc = pair.fdv || pair.marketCap || 0;
-          if (mc < MIN_MC_USD || mc > MAX_MC_USD) continue;
-
-          const volume5m = pair.volume?.m5 || 0;
-          const volume1h = pair.volume?.h1 || 0;
-          if (volume5m < 100 && volume1h < 500) continue; // necesita actividad real
-
-          const price = parseFloat(pair.priceUsd || 0);
-          if (price <= 0) continue;
-
-          const twitter = pair.info?.socials?.find(s => s.type === "twitter")?.url || null;
-          const website = pair.info?.websites?.[0]?.url || null;
-          if (!twitter && !website) continue;
-
-          state.stats.seen++;
-          broadcast({ event: "stats", data: state.stats });
-
-          seenMints.add(mint);
-          if (seenMints.size > 5000) seenMints.clear();
-
-          state.stats.filtered++;
-          addLog(`✅ ${pair.baseToken?.symbol} — MC $${Math.round(mc/1000)}K — Vol5m $${Math.round(volume5m)}`, "accept");
-
-          if (state.monitored.size >= MAX_MONITORED) {
-            let oldest = null;
-            for (const [m, t] of state.monitored.entries()) {
-              if (!t.signal && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
-            }
-            if (oldest) stopMonitoring(oldest.mint);
-            else continue;
-          }
-
-          startMonitoring({
-            mint,
-            name: pair.baseToken?.name || "Unknown",
-            symbol: pair.baseToken?.symbol || "???",
-            twitter, website, telegram: null,
-            mc, price,
-            priceChange5m: pair.priceChange?.m5 || 0,
-            priceChange1h: pair.priceChange?.h1 || 0,
-            volumeUSD: volume5m,
-            tradeCount: pair.txns?.m5?.buys + pair.txns?.m5?.sells || 0,
-            detectedAt: Date.now(),
-          });
-        }
+        const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
+        const j = await r.json();
+        twitter = twitter || j.twitter || j.extensions?.twitter || null;
+        website = website || j.website || j.extensions?.website || null;
+        telegram = j.telegram || j.extensions?.telegram || null;
+        if (!name) name = j.name;
+        if (!symbol) symbol = j.symbol;
       } catch {}
     }
-  } catch (e) {
-    addLog(`⚠️ Error scan: ${e.message}`, "warn");
-  }
+
+    return { twitter, website, telegram, name, symbol };
+  } catch { return null; }
 }
 
-// Actualizar precios de tokens monitorizados
-async function updatePrices() {
-  const mints = Array.from(state.monitored.keys());
-  if (mints.length === 0) return;
+// ── DEMO TRADING ──
+function openDemoTrade(signal) {
+  const trade = {
+    id: `demo-${Date.now()}`,
+    mint: signal.mint,
+    symbol: signal.symbol,
+    name: signal.name,
+    zone: signal.zone,
+    entryPrice: signal.price,
+    tp: signal.tp,
+    sl: signal.sl,
+    openTime: Date.now(),
+    closeTime: null,
+    closePrice: null,
+    result: null, // "WIN" | "LOSS"
+    pnlPct: null,
+    status: "OPEN",
+  };
 
-  // DexScreener permite hasta 30 tokens por llamada
-  const chunks = [];
-  for (let i = 0; i < mints.length; i += 30) {
-    chunks.push(mints.slice(i, i + 30));
-  }
+  state.demoTrades.unshift(trade);
+  if (state.demoTrades.length > 200) state.demoTrades.pop();
+  state.stats.demoOpen++;
+  broadcast({ event: "newDemoTrade", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+  addLog(`📝 DEMO abierta: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP ${signal.tp.toExponential(3)} | SL ${signal.sl.toExponential(3)}`, "demo");
+  return trade;
+}
 
-  for (const chunk of chunks) {
-    try {
-      const res = await fetch(
-        `https://api.dexscreener.com/latest/dex/tokens/${chunk.join(",")}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
-      if (!res.ok) continue;
-      const data = await res.json();
-      const pairs = data.pairs || [];
+function checkDemoTrades(mint, price) {
+  for (const trade of state.demoTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN") continue;
 
-      for (const pair of pairs) {
-        if (pair.chainId !== "solana") continue;
-        const mint = pair.baseToken?.address;
-        if (!mint || !state.monitored.has(mint)) continue;
+    let closed = false;
+    let result = null;
 
-        const price = parseFloat(pair.priceUsd || 0);
-        const volume = pair.volume?.m5 || 0;
-        const mc = pair.fdv || pair.marketCap || 0;
-        const txns = (pair.txns?.m5?.buys || 0) + (pair.txns?.m5?.sells || 0);
+    if (price >= trade.tp) {
+      result = "WIN";
+      closed = true;
+    } else if (price <= trade.sl) {
+      result = "LOSS";
+      closed = true;
+    }
 
-        if (price > 0) {
-          const token = state.monitored.get(mint);
-          token.mc = mc;
-          token.tradeCount = (token.tradeCount || 0) + txns;
-          token.volumeUSD = (token.volumeUSD || 0) + volume;
-          token.priceChange5m = pair.priceChange?.m5 || 0;
-          token.priceChange1h = pair.priceChange?.h1 || 0;
-          updateCandle(mint, price, volume);
-        }
+    if (closed) {
+      trade.closePrice = price;
+      trade.closeTime = Date.now();
+      trade.status = "CLOSED";
+      trade.result = result;
+      trade.pnlPct = +((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2);
+
+      state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
+      if (result === "WIN") {
+        state.stats.demoWins++;
+        state.stats.demoPnL += 50; // +50% simulado
+        addLog(`✅ DEMO WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s`, "win");
+      } else {
+        state.stats.demoLosses++;
+        state.stats.demoPnL -= 20; // -20% simulado
+        addLog(`❌ DEMO LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s`, "loss");
       }
-    } catch {}
+
+      broadcast({ event: "demoTradeClosed", data: trade });
+      broadcast({ event: "stats", data: state.stats });
+    }
   }
 }
 
@@ -198,15 +204,15 @@ function updateCandle(mint, price, volumeUSD = 0) {
   const token = state.monitored.get(mint);
   if (!token) return;
   const now = Date.now();
-  const currentCandle = Math.floor(now / CANDLE_MS) * CANDLE_MS;
+  const currentSecond = Math.floor(now / CANDLE_MS) * CANDLE_MS;
 
-  if (!token.currentCandle || token.currentCandle.time !== currentCandle) {
+  if (!token.currentCandle || token.currentCandle.time !== currentSecond) {
     if (token.currentCandle) {
       token.candles.push({ ...token.currentCandle });
       if (token.candles.length > 300) token.candles.shift();
     }
     const prevClose = token.currentCandle?.close ?? price;
-    token.currentCandle = { time: currentCandle, open: prevClose, high: price, low: price, close: price };
+    token.currentCandle = { time: currentSecond, open: prevClose, high: price, low: price, close: price };
   } else {
     token.currentCandle.high = Math.max(token.currentCandle.high, price);
     token.currentCandle.low = Math.min(token.currentCandle.low, price);
@@ -215,13 +221,27 @@ function updateCandle(mint, price, volumeUSD = 0) {
 
   token.price = price;
   token.priceHigh = Math.max(token.priceHigh || 0, price);
+  token.priceLow = token.priceLow === 0 ? price : Math.min(token.priceLow, price);
+  token.tradeCount = (token.tradeCount || 0) + 1;
+  token.volumeUSD = (token.volumeUSD || 0) + volumeUSD;
   token.lastUpdate = now;
+  token.mc = price * 1_000_000_000;
+
+  // Auto-eliminar si MC cae por debajo del mínimo
+  if (token.mc < MIN_MC_USD * 0.5) {
+    addLog(`🗑️ ${token.symbol} eliminado — MC cayó a $${Math.round(token.mc)}`, "filter");
+    stopMonitoring(mint);
+    return;
+  }
 
   const allCandles = [...token.candles, token.currentCandle];
   const bb = calcBollinger(allCandles);
   token.bb = bb;
   token.candleCount = allCandles.length;
   token.candles50 = allCandles.slice(-50);
+
+  // Comprobar demo trades abiertos
+  checkDemoTrades(mint, price);
 
   if (bb) checkSignal(mint, price, bb, allCandles.length);
   broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
@@ -234,21 +254,21 @@ function checkSignal(mint, price, bb, candleCount) {
 
   const lastSignal = signalCooldown.get(mint) || 0;
   if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return;
-  if ((token.tradeCount || 0) < 5) return;
-  if ((token.volumeUSD || 0) < 50) return;
+  if ((token.tradeCount || 0) < 3) return;
+  if ((token.volumeUSD || 0) < 5) return;
 
   if (token.priceHigh > 0) {
     const dropFromHigh = (token.priceHigh - price) / token.priceHigh;
-    if (dropFromHigh > 0.40) return;
+    if (dropFromHigh > 0.35) return;
   }
 
   const touchedLower = price <= bb.lower * 1.02;
-  const touchedMiddle = !touchedLower && Math.abs(price - bb.middle) / bb.middle < 0.02;
+  const touchedMiddle = !touchedLower && Math.abs(price - bb.middle) / bb.middle < 0.015;
 
   if (touchedLower || touchedMiddle) {
     const zone = touchedLower ? "LOWER" : "MIDDLE";
-    const tp = +(price * 1.5).toFixed(10);
-    const sl = +(price * 0.8).toFixed(10);
+    const tp = +(price * TP_PCT).toFixed(10);
+    const sl = +(price * SL_PCT).toFixed(10);
     token.signal = zone;
     token.signalPrice = price;
     token.tp = tp;
@@ -265,9 +285,12 @@ function checkSignal(mint, price, bb, candleCount) {
 
     state.signals.unshift(signal);
     if (state.signals.length > 100) state.signals.pop();
-    addLog(`🎯 SEÑAL ${zone} en ${token.symbol} | Vol $${Math.round(token.volumeUSD)} | MC $${Math.round(token.mc/1000)}K`, "signal");
+    addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
     broadcast({ event: "newSignal", data: signal });
     broadcast({ event: "stats", data: state.stats });
+
+    // Abrir trade demo automáticamente
+    openDemoTrade(signal);
   }
 }
 
@@ -276,11 +299,18 @@ function startMonitoring(token) {
   const entry = {
     ...token, candles: [], currentCandle: null, bb: null,
     candleCount: 0, signal: null, lastUpdate: Date.now(), candles50: [],
-    priceHigh: token.price || 0, ticker: null,
+    priceHigh: token.price || 0, priceLow: token.price || 0,
+    tradeCount: 0, volumeUSD: 0, ticker: null,
   };
   state.monitored.set(token.mint, entry);
 
-  addLog(`📊 Monitorizando ${token.symbol} — MC $${Math.round(token.mc/1000)}K`, "monitor");
+  entry.ticker = setInterval(() => {
+    const t = state.monitored.get(token.mint);
+    if (!t) { clearInterval(entry.ticker); return; }
+    if (t.price > 0) updateCandle(token.mint, t.price, 0);
+  }, CANDLE_MS);
+
+  addLog(`📊 Monitorizando ${token.symbol || shortAddr(token.mint)}`, "monitor");
   broadcast({ event: "newToken", data: tokenToJSON(entry) });
   broadcast({ event: "stats", data: state.stats });
 }
@@ -289,54 +319,175 @@ function stopMonitoring(mint) {
   const token = state.monitored.get(mint);
   if (token?.ticker) clearInterval(token.ticker);
   state.monitored.delete(mint);
-  addLog(`⏹ Detenido ${shortAddr(mint)}`, "info");
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-// PumpPortal para tokens nuevos que pasan de $15K
-function connectPumpPortal() {
-  addLog("🔌 Conectando a PumpPortal...", "info");
+async function processNewToken(mint, price, volumeUSD) {
+  if (seenMints.has(mint)) return;
+  seenMints.add(mint);
+  if (seenMints.size > 5000) seenMints.clear();
+
+  state.stats.seen++;
+  broadcast({ event: "stats", data: state.stats });
+
+  const mc = price * 1_000_000_000;
+  if (mc > 0 && mc < MIN_MC_USD) {
+    addLog(`⛔ MC bajo ($${Math.round(mc)}): ${shortAddr(mint)}`, "filter");
+    return;
+  }
+
+  const meta = await fetchTokenMetadata(mint);
+  if (!meta) {
+    addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter");
+    return;
+  }
+
+  const { twitter, website, telegram, name, symbol } = meta;
+  if (!twitter && !website && !telegram) {
+    addLog(`⛔ Sin sociales: ${name || shortAddr(mint)}`, "filter");
+    return;
+  }
+
+  state.stats.filtered++;
+  addLog(`✅ ${symbol} — MC ~$${Math.round(mc)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
+
+  if (state.monitored.size >= MAX_MONITORED) {
+    let oldest = null;
+    for (const [m, t] of state.monitored.entries()) {
+      const age = Date.now() - t.detectedAt;
+      if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
+    }
+    if (oldest) stopMonitoring(oldest.mint);
+    else { addLog(`⚠️ Cola llena, descartando ${symbol}`, "warn"); return; }
+  }
+
+  startMonitoring({
+    mint, name: name || "Unknown", symbol: symbol || "???",
+    twitter, website, telegram, mc, price, detectedAt: Date.now(),
+  });
+}
+
+function connectHelius() {
+  addLog("🔌 Conectando a Helius...", "info");
   broadcast({ event: "wsStatus", data: "connecting" });
 
-  const ws = new WebSocket(PUMPPORTAL_WS);
+  const ws = new WebSocket(HELIUS_WS);
+  let pingInterval;
 
   ws.on("open", () => {
-    addLog("✅ PumpPortal conectado", "info");
+    addLog("✅ Helius Developer conectado 🚀", "info");
     broadcast({ event: "wsStatus", data: "connected" });
-    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
+
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 420,
+      method: "transactionSubscribe",
+      params: [
+        {
+          accountInclude: [PUMP_PROGRAM],
+          failed: false,
+        },
+        {
+          commitment: "processed",
+          encoding: "jsonParsed",
+          transactionDetails: "full",
+          maxSupportedTransactionVersion: 0,
+        }
+      ]
+    }));
+
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
+      }
+    }, 20_000);
   });
 
-  ws.on("message", async (data) => {
+  ws.on("message", async (raw) => {
     try {
-      const msg = JSON.parse(data.toString());
-      if (msg.mint && (msg.txType === "create" || !msg.txType)) {
-        const mc = msg.usdMarketCap || (msg.marketCapSol || 0) * 150;
-        if (mc >= MIN_MC_USD) {
-          // Token nuevo que ya cumple MC — raro pero posible
-          addLog(`🆕 Token nuevo con MC alto: ${msg.name} $${Math.round(mc/1000)}K`, "info");
+      const msg = JSON.parse(raw.toString());
+      const tx = msg?.params?.result?.transaction;
+      if (!tx) return;
+
+      const meta = tx.meta;
+      if (!meta || meta.err) return;
+
+      const tokenBalances = meta.postTokenBalances || [];
+      if (tokenBalances.length === 0) return;
+      const mint = tokenBalances[0]?.mint;
+      if (!mint) return;
+
+      // Calcular precio desde balances
+      const preSOL = meta.preBalances?.[0] || 0;
+      const postSOL = meta.postBalances?.[0] || 0;
+      const solDiff = Math.abs(postSOL - preSOL) / 1e9;
+
+      let tokenDiff = 0;
+      const preTokenBalances = meta.preTokenBalances || [];
+      for (const post of tokenBalances) {
+        const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
+        const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
+        const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
+        if (Math.abs(postAmt - preAmt) > 0) {
+          tokenDiff = Math.abs(postAmt - preAmt);
+          break;
         }
       }
+
+      if (solDiff === 0 || tokenDiff === 0) return;
+
+      const price = (solDiff / tokenDiff) * solPriceUSD;
+      const volumeUSD = solDiff * solPriceUSD;
+
+      if (price <= 0) return;
+
+      const logs = meta.logMessages || [];
+      const isCreate = logs.some(l =>
+        l.includes("InitializeMint") ||
+        l.includes("initialize_mint") ||
+        l.includes("Instruction: Create")
+      );
+
+      if (isCreate) {
+        await processNewToken(mint, price, volumeUSD);
+      } else if (state.monitored.has(mint)) {
+        updateCandle(mint, price, volumeUSD);
+      }
+
     } catch {}
   });
 
-  ws.on("error", () => broadcast({ event: "wsStatus", data: "error" }));
+  ws.on("error", (err) => {
+    addLog(`❌ Error Helius: ${err.message}`, "error");
+    broadcast({ event: "wsStatus", data: "error" });
+  });
+
   ws.on("close", () => {
+    clearInterval(pingInterval);
+    addLog("🔄 Helius reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    setTimeout(connectPumpPortal, 5000);
+    for (const [, token] of state.monitored.entries()) {
+      if (token.ticker) clearInterval(token.ticker);
+    }
+    state.monitored.clear();
+    setTimeout(connectHelius, 5000);
   });
 }
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 app.get("/api/state", (req, res) => {
   res.json({
     monitored: Array.from(state.monitored.values()).map(tokenToJSON),
     signals: state.signals.slice(0, 50),
+    demoTrades: state.demoTrades.slice(0, 100),
     log: state.log.slice(0, 100),
     stats: state.stats
   });
 });
+
 app.delete("/api/token/:mint", (req, res) => {
   stopMonitoring(req.params.mint);
   res.json({ ok: true });
@@ -344,14 +495,17 @@ app.delete("/api/token/:mint", (req, res) => {
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
   ws.send(JSON.stringify({
     event: "fullState", data: {
       monitored: Array.from(state.monitored.values()).map(tokenToJSON),
       signals: state.signals.slice(0, 50),
+      demoTrades: state.demoTrades.slice(0, 100),
       log: state.log.slice(0, 100),
-      stats: state.stats, wsStatus: "connected"
+      stats: state.stats,
+      wsStatus: "connected"
     }
   }));
   ws.on("close", () => frontendClients.delete(ws));
@@ -364,15 +518,6 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot corriendo en puerto ${PORT}`);
-
-  // Escanear tokens activos cada 30s
-  scanDexScreener();
-  setInterval(scanDexScreener, SCAN_INTERVAL_MS);
-
-  // Actualizar precios cada 10s
-  setInterval(updatePrices, 10_000);
-
-  // Conectar PumpPortal
-  connectPumpPortal();
+  console.log(`🚀 SolScanBot Helius Developer corriendo en puerto ${PORT}`);
+  connectHelius();
 });
