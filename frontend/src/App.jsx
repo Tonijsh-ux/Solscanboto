@@ -24,8 +24,9 @@ function elapsed(ts) {
 function useBackend() {
   const [monitored, setMonitored] = useState([]);
   const [signals, setSignals] = useState([]);
+  const [demoTrades, setDemoTrades] = useState([]);
   const [log, setLog] = useState([]);
-  const [stats, setStats] = useState({ seen: 0, filtered: 0, signals: 0 });
+  const [stats, setStats] = useState({ seen: 0, filtered: 0, signals: 0, demoOpen: 0, demoWins: 0, demoLosses: 0, demoPnL: 0 });
   const [wsStatus, setWsStatus] = useState("connecting");
   const wsRef = useRef(null);
 
@@ -49,6 +50,7 @@ function useBackend() {
           if (event === "fullState") {
             setMonitored(data.monitored || []);
             setSignals(data.signals || []);
+            setDemoTrades(data.demoTrades || []);
             setLog(data.log || []);
             setStats(data.stats || {});
             setWsStatus(data.wsStatus || "connected");
@@ -56,27 +58,24 @@ function useBackend() {
           }
           if (event === "wsStatus") { setWsStatus(data); return; }
           if (event === "stats") { setStats(data); return; }
-          if (event === "newToken") {
-            setMonitored((prev) => prev.find((t) => t.mint === data.mint) ? prev : [data, ...prev]);
-            return;
-          }
-          if (event === "removeToken") {
-            setMonitored((prev) => prev.filter((t) => t.mint !== data.mint));
-            return;
-          }
-          if (event === "tokenUpdate") {
-            setMonitored((prev) => prev.map((t) => t.mint === data.mint ? { ...t, ...data } : t));
-            return;
-          }
+          if (event === "newToken") { setMonitored((prev) => prev.find((t) => t.mint === data.mint) ? prev : [data, ...prev]); return; }
+          if (event === "removeToken") { setMonitored((prev) => prev.filter((t) => t.mint !== data.mint)); return; }
+          if (event === "tokenUpdate") { setMonitored((prev) => prev.map((t) => t.mint === data.mint ? { ...t, ...data } : t)); return; }
           if (event === "newSignal") {
             setSignals((prev) => prev.find(s => s.id === data.id) ? prev : [data, ...prev].slice(0, 100));
             if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
             return;
           }
-          if (event === "log") {
-            setLog((prev) => [data, ...prev].slice(0, 200));
+          if (event === "newDemoTrade") {
+            setDemoTrades((prev) => [data, ...prev].slice(0, 100));
             return;
           }
+          if (event === "demoTradeClosed") {
+            setDemoTrades((prev) => prev.map(t => t.id === data.id ? data : t));
+            if (navigator.vibrate) navigator.vibrate(data.result === "WIN" ? [100, 50, 100, 50, 300] : [500]);
+            return;
+          }
+          if (event === "log") { setLog((prev) => [data, ...prev].slice(0, 200)); return; }
         } catch {}
       };
       ws.onerror = () => setWsStatus("error");
@@ -86,7 +85,7 @@ function useBackend() {
     return () => { ws?.close(); clearTimeout(reconnectTimer); };
   }, []);
 
-  return { monitored, signals, log, stats, wsStatus, removeToken };
+  return { monitored, signals, demoTrades, log, stats, wsStatus, removeToken };
 }
 
 function Sparkline({ candles, bb }) {
@@ -120,7 +119,7 @@ function TokenCard({ token, onRemove }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{symbol}</span>
-          <span style={{ fontSize: 11, color: "#64748b" }}>{name.length > 16 ? name.slice(0, 14) + "…" : name}</span>
+          <span style={{ fontSize: 11, color: "#64748b" }}>{name?.length > 16 ? name.slice(0, 14) + "…" : name}</span>
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           {twitter && <a href={twitter} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "#94a3b8", background: "#1e2d40", padding: "2px 6px", borderRadius: 4, textDecoration: "none" }}>𝕏</a>}
@@ -167,15 +166,62 @@ function TokenCard({ token, onRemove }) {
   );
 }
 
+function DemoTradeCard({ trade }) {
+  const isOpen = trade.status === "OPEN";
+  const isWin = trade.result === "WIN";
+  const color = isOpen ? "#38bdf8" : isWin ? "#22c55e" : "#ef4444";
+
+  return (
+    <div style={{ background: "#0d1117", border: `1px solid ${color}33`, borderRadius: 10, padding: "10px 14px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
+          <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>
+            {isOpen ? "🔵 ABIERTA" : isWin ? "✅ WIN" : "❌ LOSS"}
+          </span>
+        </div>
+        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}</span>
+      </div>
+      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
+        {[
+          { label: "Entrada", value: formatUSD(trade.entryPrice) },
+          { label: "TP", value: formatUSD(trade.tp), color: "#22c55e" },
+          { label: "SL", value: formatUSD(trade.sl), color: "#ef4444" },
+          { label: isOpen ? "Duración" : "P&L", value: isOpen ? elapsed(trade.openTime) : `${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}%`, color: isOpen ? "#64748b" : trade.pnlPct > 0 ? "#22c55e" : "#ef4444" },
+        ].map((m, i) => (
+          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
+            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 2 }}>{m.label}</div>
+            <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+      {!isOpen && (
+        <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b" }}>
+          Cerrada @ {formatUSD(trade.closePrice)} — {Math.round((trade.closeTime - trade.openTime) / 1000)}s
+        </div>
+      )}
+      <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>
+        📊 Ver en DexScreener
+      </a>
+    </div>
+  );
+}
+
 export default function App() {
-  const { monitored, signals, log, stats, wsStatus, removeToken } = useBackend();
+  const { monitored, signals, demoTrades, log, stats, wsStatus, removeToken } = useBackend();
   const [tab, setTab] = useState("monitor");
   const statusColor = { connected: "#22c55e", connecting: "#facc15", disconnected: "#6b7280", error: "#ef4444" }[wsStatus] || "#6b7280";
   const statusLabel = { connected: "LIVE", connecting: "...", disconnected: "OFF", error: "ERR" }[wsStatus] || "—";
 
+  const winRate = stats.demoWins + stats.demoLosses > 0
+    ? Math.round(stats.demoWins / (stats.demoWins + stats.demoLosses) * 100)
+    : 0;
+
   return (
     <div style={{ background: "#080c14", minHeight: "100dvh", color: "#e2e8f0", fontFamily: "sans-serif", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto" }}>
       <style>{`* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; } body { overscroll-behavior: none; background: #080c14; } ::-webkit-scrollbar { display: none; }`}</style>
+
+      {/* HEADER */}
       <div style={{ background: "#0d1117", borderBottom: "1px solid #1e2d40", padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700, color: "#38bdf8" }}>SOL<span style={{ color: "#facc15" }}>SCAN</span></span>
@@ -184,41 +230,61 @@ export default function App() {
             <span style={{ fontFamily: "monospace", fontSize: 10, color: statusColor }}>{statusLabel}</span>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 14 }}>
-          {[{ label: "VISTOS", val: stats.seen }, { label: "OK", val: stats.filtered }, { label: "🎯", val: stats.signals, color: "#facc15" }].map((s) => (
+        <div style={{ display: "flex", gap: 12 }}>
+          {[
+            { label: "VISTOS", val: stats.seen },
+            { label: "OK", val: stats.filtered },
+            { label: "🎯", val: stats.signals, color: "#facc15" },
+            { label: "W%", val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
+          ].map((s) => (
             <div key={s.label} style={{ textAlign: "center" }}>
-              <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: s.color || "#38bdf8" }}>{s.val ?? 0}</div>
+              <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: s.color || "#38bdf8" }}>{s.val ?? 0}</div>
               <div style={{ fontSize: 8, color: "#64748b", letterSpacing: "0.5px" }}>{s.label}</div>
             </div>
           ))}
         </div>
       </div>
+
+      {/* TABS */}
       <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40" }}>
         {[
           { id: "monitor", label: "📊 Monitor", badge: monitored.length },
           { id: "signals", label: "🎯 Señales", badge: signals.length, accent: "#facc15" },
-          { id: "log", label: "📋 Log", badge: null }
+          { id: "demo", label: "💰 Demo", badge: demoTrades.filter(t => t.status === "OPEN").length, accent: "#38bdf8" },
+          { id: "log", label: "📋 Log", badge: null },
         ].map((t) => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 4px", border: "none", background: "none", fontFamily: "sans-serif", fontSize: 12, fontWeight: 600, color: tab === t.id ? (t.accent || "#38bdf8") : "#64748b", borderBottom: tab === t.id ? `2px solid ${t.accent || "#38bdf8"}` : "2px solid transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 2px", border: "none", background: "none", fontFamily: "sans-serif", fontSize: 11, fontWeight: 600, color: tab === t.id ? (t.accent || "#38bdf8") : "#64748b", borderBottom: tab === t.id ? `2px solid ${t.accent || "#38bdf8"}` : "2px solid transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
             {t.label}
-            {t.badge !== null && t.badge > 0 && <span style={{ background: t.accent ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 5px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>}
+            {t.badge !== null && t.badge > 0 && <span style={{ background: t.accent === "#facc15" ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 5px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>}
           </button>
         ))}
       </div>
+
+      {/* CONTENT */}
       <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-        {tab === "monitor" && monitored.length === 0 && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
-            <div style={{ fontSize: 40, opacity: 0.3 }}>🔍</div>
-            <p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Escaneando la blockchain...<br />Los tokens aparecerán aquí.</p>
+
+        {/* DEMO STATS BAR */}
+        {tab === "demo" && (
+          <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 12, display: "flex", justifyContent: "space-around" }}>
+            {[
+              { label: "Abiertas", val: stats.demoOpen, color: "#38bdf8" },
+              { label: "Wins", val: stats.demoWins, color: "#22c55e" },
+              { label: "Losses", val: stats.demoLosses, color: "#ef4444" },
+              { label: "P&L %", val: `${stats.demoPnL > 0 ? "+" : ""}${stats.demoPnL}%`, color: stats.demoPnL >= 0 ? "#22c55e" : "#ef4444" },
+              { label: "Win%", val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
+            ].map((s) => (
+              <div key={s.label} style={{ textAlign: "center" }}>
+                <div style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700, color: s.color }}>{s.val}</div>
+                <div style={{ fontSize: 9, color: "#64748b" }}>{s.label}</div>
+              </div>
+            ))}
           </div>
         )}
+
+        {tab === "monitor" && monitored.length === 0 && <EmptyState icon="🔍" text="Escaneando la blockchain...\nLos tokens aparecerán aquí." />}
         {tab === "monitor" && monitored.map((t) => <TokenCard key={t.mint} token={t} onRemove={removeToken} />)}
-        {tab === "signals" && signals.length === 0 && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
-            <div style={{ fontSize: 40, opacity: 0.3 }}>🎯</div>
-            <p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>Esperando señales...<br />El móvil vibrará cuando detecte una.</p>
-          </div>
-        )}
+
+        {tab === "signals" && signals.length === 0 && <EmptyState icon="🎯" text="Esperando señales...\nEl móvil vibrará cuando detecte una." />}
         {tab === "signals" && signals.map((s) => (
           <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "LOWER" ? "#22c55e" : "#facc15"}22`, borderRadius: 10, padding: "10px 14px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
@@ -233,19 +299,31 @@ export default function App() {
               <span style={{ color: "#22c55e" }}>TP {formatUSD(s.tp)}</span>
               <span style={{ color: "#ef4444" }}>SL {formatUSD(s.sl)}</span>
             </div>
-            <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>
-              📊 Ver en DexScreener →
-            </a>
+            <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>📊 Ver en DexScreener →</a>
           </div>
         ))}
+
+        {tab === "demo" && demoTrades.length === 0 && <EmptyState icon="💰" text="Las operaciones demo aparecerán aquí\nautomáticamente con cada señal." />}
+        {tab === "demo" && demoTrades.map((t) => <DemoTradeCard key={t.id} trade={t} />)}
+
+        {tab === "log" && log.length === 0 && <EmptyState icon="📋" text="El log aparecerá aquí." />}
         {tab === "log" && log.map((entry, i) => (
           <div key={i} style={{ display: "flex", gap: 8, padding: "3px 0", borderBottom: "1px solid #0d1117" }}>
             <span style={{ fontFamily: "monospace", fontSize: 10, color: "#334155", flexShrink: 0 }}>{formatTime(entry.time)}</span>
-            <span style={{ fontFamily: "monospace", fontSize: 10, color: { info: "#64748b", filter: "#475569", accept: "#22c55e", signal: "#facc15", monitor: "#38bdf8", warn: "#f97316", error: "#ef4444" }[entry.type] || "#64748b" }}>{entry.msg}</span>
+            <span style={{ fontFamily: "monospace", fontSize: 10, color: { info: "#64748b", filter: "#475569", accept: "#22c55e", signal: "#facc15", monitor: "#38bdf8", warn: "#f97316", error: "#ef4444", demo: "#a78bfa", win: "#22c55e", loss: "#ef4444" }[entry.type] || "#64748b" }}>{entry.msg}</span>
           </div>
         ))}
       </div>
       <div style={{ height: "env(safe-area-inset-bottom, 16px)" }} />
+    </div>
+  );
+}
+
+function EmptyState({ icon, text }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#334155" }}>
+      <div style={{ fontSize: 40, opacity: 0.3 }}>{icon}</div>
+      <p style={{ fontSize: 13, textAlign: "center", lineHeight: 1.6, whiteSpace: "pre-line" }}>{text}</p>
     </div>
   );
 }
