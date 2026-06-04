@@ -14,7 +14,7 @@ const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
 const TP_PCT = 1.5;
 const SL_PCT = 0.8;
-const MAX_TRADE_DURATION_MS = 15 * 60 * 1000; // cierre automático a 15 minutos
+const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -28,9 +28,7 @@ const state = {
   stats: {
     seen: 0, filtered: 0, signals: 0,
     demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0,
-    demoPnL: 0,
-    // Tracking avanzado
-    avgMaxGain: 0, avgMaxLoss: 0,
+    demoPnL: 0, avgMaxGain: 0, avgMaxLoss: 0,
     maxGainSum: 0, maxLossSum: 0, closedCount: 0,
   },
 };
@@ -84,16 +82,26 @@ function calcBollinger(candles) {
   };
 }
 
-let solPriceUSD = 150;
-async function updateSolPrice() {
+// ── Precio real desde DexScreener ──
+async function fetchRealPrice(mint) {
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (!res.ok) return null;
     const data = await res.json();
-    solPriceUSD = data?.solana?.usd ?? 150;
-  } catch {}
+    const pair = data?.pairs?.[0];
+    if (!pair) return null;
+    return {
+      price: parseFloat(pair.priceUsd || 0),
+      mc: pair.fdv || pair.marketCap || 0,
+      volume5m: pair.volume?.m5 || 0,
+      txns5m: (pair.txns?.m5?.buys || 0) + (pair.txns?.m5?.sells || 0),
+      priceChange5m: pair.priceChange?.m5 || 0,
+    };
+  } catch { return null; }
 }
-setInterval(updateSolPrice, 60_000);
-updateSolPrice();
 
 async function fetchTokenMetadata(mint) {
   try {
@@ -134,35 +142,24 @@ async function fetchTokenMetadata(mint) {
   } catch { return null; }
 }
 
-// ── DEMO TRADING ──
+// ── Demo Trading ──
 function openDemoTrade(signal) {
   const trade = {
-    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
-    mint: signal.mint,
-    symbol: signal.symbol,
-    name: signal.name,
-    zone: signal.zone,
-    entryPrice: signal.price,
-    tp: signal.tp,
-    sl: signal.sl,
-    openTime: Date.now(),
-    closeTime: null,
-    closePrice: null,
-    result: null,
-    pnlPct: null,
-    maxGainPct: 0,   // máximo % que llegó a subir
-    maxLossPct: 0,   // máximo % que llegó a bajar
-    currentPct: 0,   // % actual respecto a entrada
-    status: "OPEN",
-    expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
+    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    mint: signal.mint, symbol: signal.symbol, name: signal.name,
+    zone: signal.zone, entryPrice: signal.price,
+    tp: signal.tp, sl: signal.sl,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null,
+    maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    status: "OPEN", expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
   };
-
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +50% | SL -20% | Expira en 15min`, "demo");
+  addLog(`📝 DEMO: ${signal.symbol} @ MC $${Math.round(signal.price * 1e9 / 1000)}K | TP +50% | SL -20%`, "demo");
   return trade;
 }
 
@@ -171,35 +168,28 @@ function closeDemoTrade(trade, price, reason) {
   trade.closeTime = Date.now();
   trade.status = "CLOSED";
   trade.pnlPct = +((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2);
-
   if (reason === "TP") {
     trade.result = "WIN";
     state.stats.demoWins++;
     state.stats.demoPnL += 50;
-    addLog(`✅ WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
+    addLog(`✅ WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
   } else if (reason === "SL") {
     trade.result = "LOSS";
     state.stats.demoLosses++;
     state.stats.demoPnL -= 20;
-    addLog(`❌ LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain fue: +${trade.maxGainPct.toFixed(1)}%`, "loss");
+    addLog(`❌ LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s | MaxGain fue: +${trade.maxGainPct.toFixed(1)}%`, "loss");
   } else {
-    // Expiró por tiempo
     trade.result = trade.pnlPct >= 0 ? "EXPIRED_WIN" : "EXPIRED_LOSS";
     state.stats.demoExpired++;
-    if (trade.pnlPct >= 0) state.stats.demoPnL += trade.pnlPct;
-    else state.stats.demoPnL += trade.pnlPct;
-    addLog(`⏱️ EXPIRADA: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% | MaxGain: +${trade.maxGainPct.toFixed(1)}% | MaxLoss: ${trade.maxLossPct.toFixed(1)}%`, "expire");
+    state.stats.demoPnL += trade.pnlPct;
+    addLog(`⏱️ EXP: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "expire");
   }
-
   state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
-
-  // Actualizar promedios
   state.stats.maxGainSum += trade.maxGainPct;
   state.stats.maxLossSum += Math.abs(trade.maxLossPct);
   state.stats.closedCount++;
   state.stats.avgMaxGain = +(state.stats.maxGainSum / state.stats.closedCount).toFixed(1);
   state.stats.avgMaxLoss = +(state.stats.maxLossSum / state.stats.closedCount).toFixed(1);
-
   broadcast({ event: "demoTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
 }
@@ -208,28 +198,17 @@ function updateDemoTrades(mint, price) {
   const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN") continue;
-
-    // Actualizar % actual y máximos
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-
-    // Comprobar TP / SL
-    if (price >= trade.tp) {
-      closeDemoTrade(trade, price, "TP");
-    } else if (price <= trade.sl) {
-      closeDemoTrade(trade, price, "SL");
-    } else if (now >= trade.expiresAt) {
-      closeDemoTrade(trade, price, "EXPIRED");
-    } else {
-      // Actualizar en tiempo real
-      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct } });
-    }
+    if (price >= trade.tp) closeDemoTrade(trade, price, "TP");
+    else if (price <= trade.sl) closeDemoTrade(trade, price, "SL");
+    else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED");
+    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct } });
   }
 }
 
-// Comprobar expiración de todas las operaciones cada 30s
 setInterval(() => {
   const now = Date.now();
   for (const trade of state.demoTrades) {
@@ -282,7 +261,6 @@ function updateCandle(mint, price, volumeUSD = 0) {
   token.candles50 = allCandles.slice(-50);
 
   updateDemoTrades(mint, price);
-
   if (bb) checkSignal(mint, price, bb, allCandles.length);
   broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
 }
@@ -305,28 +283,51 @@ function checkSignal(mint, price, bb, candleCount) {
 
   if (touchedLower || touchedMiddle) {
     const zone = touchedLower ? "LOWER" : "MIDDLE";
-    const tp = +(price * TP_PCT).toFixed(10);
-    const sl = +(price * SL_PCT).toFixed(10);
-    token.signal = zone;
-    token.signalPrice = price;
-    token.tp = tp;
-    token.sl = sl;
-    signalCooldown.set(mint, Date.now());
-    state.stats.signals++;
 
-    const signal = {
-      id: `${mint}-${Date.now()}`,
-      mint, name: token.name, symbol: token.symbol,
-      zone, price, tp, sl, time: Date.now(), status: "OPEN",
-      tradeCount: token.tradeCount, volumeUSD: token.volumeUSD,
-    };
+    // ── Verificar precio real con DexScreener antes de señal ──
+    fetchRealPrice(mint).then(realData => {
+      if (!realData || realData.price <= 0) {
+        addLog(`⚠️ No se pudo verificar precio real de ${token.symbol}`, "warn");
+        return;
+      }
 
-    state.signals.unshift(signal);
-    if (state.signals.length > 100) state.signals.pop();
-    addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
-    broadcast({ event: "newSignal", data: signal });
-    broadcast({ event: "stats", data: state.stats });
-    openDemoTrade(signal);
+      const realPrice = realData.price;
+      const realMC = realData.mc;
+
+      // Si el MC real es muy diferente al calculado, usar el real
+      const priceDiff = Math.abs(realPrice - price) / price;
+      if (priceDiff > 0.3) {
+        addLog(`⚠️ ${token.symbol} precio calculado $${price.toExponential(2)} vs real $${realPrice.toExponential(2)} — usando real`, "warn");
+      }
+
+      const finalPrice = realPrice > 0 ? realPrice : price;
+      const tp = +(finalPrice * TP_PCT).toFixed(10);
+      const sl = +(finalPrice * SL_PCT).toFixed(10);
+
+      token.signal = zone;
+      token.signalPrice = finalPrice;
+      token.tp = tp;
+      token.sl = sl;
+      token.mc = realMC || token.mc;
+      signalCooldown.set(mint, Date.now());
+      state.stats.signals++;
+
+      const signal = {
+        id: `${mint}-${Date.now()}`,
+        mint, name: token.name, symbol: token.symbol,
+        zone, price: finalPrice, tp, sl,
+        time: Date.now(), status: "OPEN",
+        tradeCount: token.tradeCount, volumeUSD: token.volumeUSD,
+        mc: realMC,
+      };
+
+      state.signals.unshift(signal);
+      if (state.signals.length > 100) state.signals.pop();
+      addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ MC $${Math.round(realMC / 1000)}K`, "signal");
+      broadcast({ event: "newSignal", data: signal });
+      broadcast({ event: "stats", data: state.stats });
+      openDemoTrade(signal);
+    }).catch(() => {});
   }
 }
 
@@ -340,11 +341,17 @@ function startMonitoring(token) {
   };
   state.monitored.set(token.mint, entry);
 
-  entry.ticker = setInterval(() => {
+  // Actualizar precio real cada 5s desde DexScreener
+  entry.ticker = setInterval(async () => {
     const t = state.monitored.get(token.mint);
     if (!t) { clearInterval(entry.ticker); return; }
-    if (t.price > 0) updateCandle(token.mint, t.price, 0);
-  }, CANDLE_MS);
+
+    const realData = await fetchRealPrice(token.mint);
+    if (realData && realData.price > 0) {
+      updateCandle(token.mint, realData.price, realData.volume5m || 0);
+      if (realData.mc > 0) t.mc = realData.mc;
+    }
+  }, 5000);
 
   addLog(`📊 Monitorizando ${token.symbol || shortAddr(token.mint)}`, "monitor");
   broadcast({ event: "newToken", data: tokenToJSON(entry) });
@@ -358,7 +365,7 @@ function stopMonitoring(mint) {
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-async function processNewToken(mint, price, volumeUSD) {
+async function processNewToken(mint) {
   if (seenMints.has(mint)) return;
   seenMints.add(mint);
   if (seenMints.size > 5000) seenMints.clear();
@@ -366,7 +373,11 @@ async function processNewToken(mint, price, volumeUSD) {
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
 
-  const mc = price * 1_000_000_000;
+  // Obtener precio real inmediatamente
+  const realData = await fetchRealPrice(mint);
+  const price = realData?.price || 0;
+  const mc = realData?.mc || (price * 1_000_000_000);
+
   if (mc > 0 && mc < MIN_MC_USD) {
     addLog(`⛔ MC bajo ($${Math.round(mc)}): ${shortAddr(mint)}`, "filter");
     return;
@@ -382,7 +393,7 @@ async function processNewToken(mint, price, volumeUSD) {
   }
 
   state.stats.filtered++;
-  addLog(`✅ ${symbol} — MC ~$${Math.round(mc)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
+  addLog(`✅ ${symbol} — MC $${Math.round(mc / 1000)}K — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
 
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
@@ -405,9 +416,8 @@ function connectHelius() {
   let pingInterval;
 
   ws.on("open", () => {
-    addLog("✅ Helius Developer conectado 🚀", "info");
+    addLog("✅ Helius conectado — precio real via DexScreener 🚀", "info");
     broadcast({ event: "wsStatus", data: "connected" });
-
     ws.send(JSON.stringify({
       jsonrpc: "2.0", id: 420,
       method: "transactionSubscribe",
@@ -416,11 +426,8 @@ function connectHelius() {
         { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
       ]
     }));
-
     pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
     }, 20_000);
   });
 
@@ -437,29 +444,20 @@ function connectHelius() {
       const mint = tokenBalances[0]?.mint;
       if (!mint) return;
 
-      const preSOL = meta.preBalances?.[0] || 0;
-      const postSOL = meta.postBalances?.[0] || 0;
-      const solDiff = Math.abs(postSOL - preSOL) / 1e9;
-
-      let tokenDiff = 0;
-      const preTokenBalances = meta.preTokenBalances || [];
-      for (const post of tokenBalances) {
-        const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
-        const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
-        const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
-        if (Math.abs(postAmt - preAmt) > 0) { tokenDiff = Math.abs(postAmt - preAmt); break; }
-      }
-
-      if (solDiff === 0 || tokenDiff === 0) return;
-      const price = (solDiff / tokenDiff) * solPriceUSD;
-      const volumeUSD = solDiff * solPriceUSD;
-      if (price <= 0) return;
-
       const logs = meta.logMessages || [];
       const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
+      const isBuy = logs.some(l => l.includes("Instruction: Buy"));
 
-      if (isCreate) await processNewToken(mint, price, volumeUSD);
-      else if (state.monitored.has(mint)) updateCandle(mint, price, volumeUSD);
+      if (isCreate) {
+        // Nuevo token — esperar 2s para que DexScreener lo indexe
+        setTimeout(() => processNewToken(mint), 2000);
+      } else if (isBuy && state.monitored.has(mint)) {
+        // Solo en compras — trigger para actualizar precio real
+        const realData = await fetchRealPrice(mint);
+        if (realData && realData.price > 0) {
+          updateCandle(mint, realData.price, realData.volume5m || 0);
+        }
+      }
     } catch {}
   });
 
@@ -494,7 +492,7 @@ wss.on("connection", (ws) => {
   frontendClients.add(ws);
   ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), demoTrades: state.demoTrades.slice(0, 200), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
   ws.on("close", () => frontendClients.delete(ws));
-  ws.on("message", (data) => { try { const msg = JSON.parse(data.toString()); if (msg.action === "removeToken") stopMonitoring(msg.mint); } catch {} });
+  ws.on("message", (data) => { try { const msg = JSON.parse(data.toString()); if (msg.action === "removeToken") stopMonitoring(msg.mint); } catch {}; });
 });
 
-server.listen(PORT, () => { console.log(`🚀 SolScanBot corriendo en puerto ${PORT}`); connectHelius(); });
+server.listen(PORT, () => { console.log(`🚀 SolScanBot — Helius + DexScreener precio real`); connectHelius(); });
