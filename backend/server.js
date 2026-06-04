@@ -16,9 +16,25 @@ const TP_PCT = 1.5;
 const SL_PCT = 0.8;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
 
+// Pump.fun constants
+const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMP_FEE_ACCOUNT = "CebN5WGQ4jvEPvsVU4EoHEpgznyQHeEPRsrGABNfhFmz";
+const TOTAL_SUPPLY = 1_000_000_000; // 1B tokens supply fijo en pump.fun
+
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
+let solPriceUSD = 150;
+async function updateSolPrice() {
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const data = await res.json();
+    solPriceUSD = data?.solana?.usd ?? 150;
+    addLog(`💲 SOL = $${solPriceUSD}`, "info");
+  } catch {}
+}
+setInterval(updateSolPrice, 60_000);
+updateSolPrice();
 
 const state = {
   monitored: new Map(),
@@ -82,63 +98,98 @@ function calcBollinger(candles) {
   };
 }
 
-// ── Precio real desde DexScreener ──
-async function fetchRealPrice(mint) {
+// ── Parser del bonding curve de Pump.fun ──
+// Fórmula: precio = vSOL_en_curva / vTokens_en_curva * solPriceUSD
+// MC = precio * TOTAL_SUPPLY
+function parsePumpTx(tx) {
   try {
-    const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-      { signal: AbortSignal.timeout(4000) }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    const pair = data?.pairs?.[0];
-    if (!pair) return null;
-    return {
-      price: parseFloat(pair.priceUsd || 0),
-      mc: pair.fdv || pair.marketCap || 0,
-      volume5m: pair.volume?.m5 || 0,
-      txns5m: (pair.txns?.m5?.buys || 0) + (pair.txns?.m5?.sells || 0),
-      priceChange5m: pair.priceChange?.m5 || 0,
-    };
-  } catch { return null; }
-}
+    const meta = tx.meta;
+    const message = tx.transaction?.message;
+    if (!meta || !message) return null;
 
-async function fetchTokenMetadata(mint) {
-  try {
-    const res = await fetch(
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: "1", method: "getAsset",
-          params: { id: mint }
-        }),
-        signal: AbortSignal.timeout(5000),
-      }
+    const accountKeys = message.accountKeys?.map(k =>
+      typeof k === "string" ? k : k.pubkey
+    ) || [];
+
+    const logs = meta.logMessages || [];
+    const isCreate = logs.some(l =>
+      l.includes("InitializeMint") ||
+      l.includes("Instruction: Create")
     );
-    const data = await res.json();
-    const meta = data?.result;
-    if (!meta) return null;
-    const links = meta.content?.links || {};
-    const jsonUri = meta.content?.json_uri;
-    let twitter = links.twitter || null;
-    let website = links.external_url || null;
-    let telegram = null;
-    let name = meta.content?.metadata?.name || null;
-    let symbol = meta.content?.metadata?.symbol || null;
-    if ((!twitter && !website) && jsonUri) {
-      try {
-        const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
-        const j = await r.json();
-        twitter = twitter || j.twitter || j.extensions?.twitter || null;
-        website = website || j.website || j.extensions?.website || null;
-        telegram = j.telegram || j.extensions?.telegram || null;
-        if (!name) name = j.name;
-        if (!symbol) symbol = j.symbol;
-      } catch {}
+    const isBuy = logs.some(l => l.includes("Instruction: Buy"));
+    const isSell = logs.some(l => l.includes("Instruction: Sell"));
+
+    if (!isCreate && !isBuy && !isSell) return null;
+
+    // Encontrar mint del token
+    const tokenBalances = meta.postTokenBalances || [];
+    if (tokenBalances.length === 0) return null;
+    const mint = tokenBalances[0]?.mint;
+    if (!mint) return null;
+
+    // ── Precio desde bonding curve ──
+    // En Pump.fun el bonding curve account es el que tiene el balance de SOL
+    // y es diferente al fee account y al programa
+    // Buscamos la cuenta que NO es el usuario, NO es el programa, NO es el fee
+    const preBalances = meta.preBalances || [];
+    const postBalances = meta.postBalances || [];
+
+    // El bonding curve es típicamente accountKeys[3] en buy/sell
+    // y accountKeys[2] en create
+    let vSolAfter = 0;
+    let vSolBefore = 0;
+
+    // Buscar la cuenta del bonding curve — tiene el mayor balance de SOL
+    // que no sea el programa ni el fee account
+    const skipAccounts = new Set([PUMP_PROGRAM, PUMP_FEE_ACCOUNT]);
+    let bondingCurveIdx = -1;
+    let maxBalance = 0;
+
+    for (let i = 0; i < accountKeys.length; i++) {
+      if (skipAccounts.has(accountKeys[i])) continue;
+      const balance = postBalances[i] || 0;
+      if (balance > maxBalance && balance > 10_000_000) { // > 0.01 SOL
+        maxBalance = balance;
+        bondingCurveIdx = i;
+      }
     }
-    return { twitter, website, telegram, name, symbol };
+
+    if (bondingCurveIdx === -1) return null;
+
+    vSolAfter = (postBalances[bondingCurveIdx] || 0) / 1e9;
+    vSolBefore = (preBalances[bondingCurveIdx] || 0) / 1e9;
+
+    // Tokens en el bonding curve (post-tx)
+    let vTokensAfter = 0;
+    for (const tb of tokenBalances) {
+      if (accountKeys[tb.accountIndex] !== mint) {
+        vTokensAfter = parseFloat(tb.uiTokenAmount?.uiAmount || 0);
+        if (vTokensAfter > 0) break;
+      }
+    }
+
+    if (vSolAfter <= 0 || vTokensAfter <= 0) return null;
+
+    // Precio real del bonding curve
+    const priceInSOL = vSolAfter / vTokensAfter;
+    const priceUSD = priceInSOL * solPriceUSD;
+    const mcUSD = priceUSD * TOTAL_SUPPLY;
+
+    // Volumen de esta tx
+    const solMoved = Math.abs(vSolAfter - vSolBefore);
+    const volumeUSD = solMoved * solPriceUSD;
+
+    return {
+      mint,
+      price: priceUSD,
+      mc: mcUSD,
+      volumeUSD,
+      isCreate,
+      isBuy,
+      isSell,
+      vSol: vSolAfter,
+      vTokens: vTokensAfter,
+    };
   } catch { return null; }
 }
 
@@ -159,7 +210,7 @@ function openDemoTrade(signal) {
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`📝 DEMO: ${signal.symbol} @ MC $${Math.round(signal.price * 1e9 / 1000)}K | TP +50% | SL -20%`, "demo");
+  addLog(`📝 DEMO: ${signal.symbol} @ MC $${Math.round(signal.price * TOTAL_SUPPLY / 1000)}K | TP +50% | SL -20%`, "demo");
   return trade;
 }
 
@@ -241,15 +292,15 @@ function updateCandle(mint, price, volumeUSD = 0) {
   }
 
   token.price = price;
+  token.mc = price * TOTAL_SUPPLY;
   token.priceHigh = Math.max(token.priceHigh || 0, price);
   token.priceLow = token.priceLow === 0 ? price : Math.min(token.priceLow, price);
   token.tradeCount = (token.tradeCount || 0) + 1;
   token.volumeUSD = (token.volumeUSD || 0) + volumeUSD;
   token.lastUpdate = now;
-  token.mc = price * 1_000_000_000;
 
   if (token.mc < MIN_MC_USD * 0.5) {
-    addLog(`🗑️ ${token.symbol} eliminado — MC cayó a $${Math.round(token.mc)}`, "filter");
+    addLog(`🗑️ ${token.symbol} eliminado — MC $${Math.round(token.mc)}`, "filter");
     stopMonitoring(mint);
     return;
   }
@@ -283,52 +334,71 @@ function checkSignal(mint, price, bb, candleCount) {
 
   if (touchedLower || touchedMiddle) {
     const zone = touchedLower ? "LOWER" : "MIDDLE";
+    const tp = +(price * TP_PCT).toFixed(10);
+    const sl = +(price * SL_PCT).toFixed(10);
+    token.signal = zone;
+    token.signalPrice = price;
+    token.tp = tp;
+    token.sl = sl;
+    signalCooldown.set(mint, Date.now());
+    state.stats.signals++;
 
-    // ── Verificar precio real con DexScreener antes de señal ──
-    fetchRealPrice(mint).then(realData => {
-      if (!realData || realData.price <= 0) {
-        addLog(`⚠️ No se pudo verificar precio real de ${token.symbol}`, "warn");
-        return;
-      }
+    const signal = {
+      id: `${mint}-${Date.now()}`,
+      mint, name: token.name, symbol: token.symbol,
+      zone, price, tp, sl,
+      time: Date.now(), status: "OPEN",
+      tradeCount: token.tradeCount,
+      volumeUSD: token.volumeUSD,
+      mc: token.mc,
+    };
 
-      const realPrice = realData.price;
-      const realMC = realData.mc;
-
-      // Si el MC real es muy diferente al calculado, usar el real
-      const priceDiff = Math.abs(realPrice - price) / price;
-      if (priceDiff > 0.3) {
-        addLog(`⚠️ ${token.symbol} precio calculado $${price.toExponential(2)} vs real $${realPrice.toExponential(2)} — usando real`, "warn");
-      }
-
-      const finalPrice = realPrice > 0 ? realPrice : price;
-      const tp = +(finalPrice * TP_PCT).toFixed(10);
-      const sl = +(finalPrice * SL_PCT).toFixed(10);
-
-      token.signal = zone;
-      token.signalPrice = finalPrice;
-      token.tp = tp;
-      token.sl = sl;
-      token.mc = realMC || token.mc;
-      signalCooldown.set(mint, Date.now());
-      state.stats.signals++;
-
-      const signal = {
-        id: `${mint}-${Date.now()}`,
-        mint, name: token.name, symbol: token.symbol,
-        zone, price: finalPrice, tp, sl,
-        time: Date.now(), status: "OPEN",
-        tradeCount: token.tradeCount, volumeUSD: token.volumeUSD,
-        mc: realMC,
-      };
-
-      state.signals.unshift(signal);
-      if (state.signals.length > 100) state.signals.pop();
-      addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ MC $${Math.round(realMC / 1000)}K`, "signal");
-      broadcast({ event: "newSignal", data: signal });
-      broadcast({ event: "stats", data: state.stats });
-      openDemoTrade(signal);
-    }).catch(() => {});
+    state.signals.unshift(signal);
+    if (state.signals.length > 100) state.signals.pop();
+    addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ MC $${Math.round(token.mc / 1000)}K`, "signal");
+    broadcast({ event: "newSignal", data: signal });
+    broadcast({ event: "stats", data: state.stats });
+    openDemoTrade(signal);
   }
+}
+
+async function fetchTokenMetadata(mint) {
+  try {
+    const res = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "1", method: "getAsset",
+          params: { id: mint }
+        }),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    const data = await res.json();
+    const meta = data?.result;
+    if (!meta) return null;
+    const links = meta.content?.links || {};
+    const jsonUri = meta.content?.json_uri;
+    let twitter = links.twitter || null;
+    let website = links.external_url || null;
+    let telegram = null;
+    let name = meta.content?.metadata?.name || null;
+    let symbol = meta.content?.metadata?.symbol || null;
+    if ((!twitter && !website) && jsonUri) {
+      try {
+        const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
+        const j = await r.json();
+        twitter = twitter || j.twitter || j.extensions?.twitter || null;
+        website = website || j.website || j.extensions?.website || null;
+        telegram = j.telegram || j.extensions?.telegram || null;
+        if (!name) name = j.name;
+        if (!symbol) symbol = j.symbol;
+      } catch {}
+    }
+    return { twitter, website, telegram, name, symbol };
+  } catch { return null; }
 }
 
 function startMonitoring(token) {
@@ -337,46 +407,26 @@ function startMonitoring(token) {
     ...token, candles: [], currentCandle: null, bb: null,
     candleCount: 0, signal: null, lastUpdate: Date.now(), candles50: [],
     priceHigh: token.price || 0, priceLow: token.price || 0,
-    tradeCount: 0, volumeUSD: 0, ticker: null,
+    tradeCount: 0, volumeUSD: 0,
   };
   state.monitored.set(token.mint, entry);
-
-  // Actualizar precio real cada 5s desde DexScreener
-  entry.ticker = setInterval(async () => {
-    const t = state.monitored.get(token.mint);
-    if (!t) { clearInterval(entry.ticker); return; }
-
-    const realData = await fetchRealPrice(token.mint);
-    if (realData && realData.price > 0) {
-      updateCandle(token.mint, realData.price, realData.volume5m || 0);
-      if (realData.mc > 0) t.mc = realData.mc;
-    }
-  }, 5000);
-
-  addLog(`📊 Monitorizando ${token.symbol || shortAddr(token.mint)}`, "monitor");
+  addLog(`📊 Monitorizando ${token.symbol} — MC $${Math.round(token.mc / 1000)}K`, "monitor");
   broadcast({ event: "newToken", data: tokenToJSON(entry) });
   broadcast({ event: "stats", data: state.stats });
 }
 
 function stopMonitoring(mint) {
-  const token = state.monitored.get(mint);
-  if (token?.ticker) clearInterval(token.ticker);
   state.monitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-async function processNewToken(mint) {
+async function processNewToken(mint, price, mc, volumeUSD) {
   if (seenMints.has(mint)) return;
   seenMints.add(mint);
   if (seenMints.size > 5000) seenMints.clear();
 
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
-
-  // Obtener precio real inmediatamente
-  const realData = await fetchRealPrice(mint);
-  const price = realData?.price || 0;
-  const mc = realData?.mc || (price * 1_000_000_000);
 
   if (mc > 0 && mc < MIN_MC_USD) {
     addLog(`⛔ MC bajo ($${Math.round(mc)}): ${shortAddr(mint)}`, "filter");
@@ -416,7 +466,7 @@ function connectHelius() {
   let pingInterval;
 
   ws.on("open", () => {
-    addLog("✅ Helius conectado — precio real via DexScreener 🚀", "info");
+    addLog("✅ Helius conectado — bonding curve parser activo 🚀", "info");
     broadcast({ event: "wsStatus", data: "connected" });
     ws.send(JSON.stringify({
       jsonrpc: "2.0", id: 420,
@@ -436,37 +486,40 @@ function connectHelius() {
       const msg = JSON.parse(raw.toString());
       const tx = msg?.params?.result?.transaction;
       if (!tx) return;
-      const meta = tx.meta;
-      if (!meta || meta.err) return;
+      if (tx.meta?.err) return;
 
-      const tokenBalances = meta.postTokenBalances || [];
-      if (tokenBalances.length === 0) return;
-      const mint = tokenBalances[0]?.mint;
-      if (!mint) return;
+      const parsed = parsePumpTx(tx);
+      if (!parsed || parsed.price <= 0) return;
 
-      const logs = meta.logMessages || [];
-      const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
-      const isBuy = logs.some(l => l.includes("Instruction: Buy"));
+      const { mint, price, mc, volumeUSD, isCreate, isBuy } = parsed;
 
       if (isCreate) {
-        // Nuevo token — esperar 2s para que DexScreener lo indexe
-        setTimeout(() => processNewToken(mint), 2000);
+        await processNewToken(mint, price, mc, volumeUSD);
       } else if (isBuy && state.monitored.has(mint)) {
-        // Solo en compras — trigger para actualizar precio real
-        const realData = await fetchRealPrice(mint);
-        if (realData && realData.price > 0) {
-          updateCandle(mint, realData.price, realData.volume5m || 0);
+        // Solo actualizamos en compras — precio sube = señal válida
+        updateCandle(mint, price, volumeUSD);
+      } else if (!isBuy && state.monitored.has(mint)) {
+        // En ventas actualizamos precio pero no generamos señal
+        const token = state.monitored.get(mint);
+        if (token) {
+          token.price = price;
+          token.mc = mc;
+          updateDemoTrades(mint, price);
+          broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
         }
       }
     } catch {}
   });
 
-  ws.on("error", (err) => { addLog(`❌ Error: ${err.message}`, "error"); broadcast({ event: "wsStatus", data: "error" }); });
+  ws.on("error", (err) => {
+    addLog(`❌ Error: ${err.message}`, "error");
+    broadcast({ event: "wsStatus", data: "error" });
+  });
+
   ws.on("close", () => {
     clearInterval(pingInterval);
     addLog("🔄 Reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    for (const [, token] of state.monitored.entries()) { if (token.ticker) clearInterval(token.ticker); }
     state.monitored.clear();
     setTimeout(connectHelius, 5000);
   });
@@ -495,4 +548,7 @@ wss.on("connection", (ws) => {
   ws.on("message", (data) => { try { const msg = JSON.parse(data.toString()); if (msg.action === "removeToken") stopMonitoring(msg.mint); } catch {}; });
 });
 
-server.listen(PORT, () => { console.log(`🚀 SolScanBot — Helius + DexScreener precio real`); connectHelius(); });
+server.listen(PORT, () => {
+  console.log(`🚀 SolScanBot — Helius bonding curve parser`);
+  connectHelius();
+});
