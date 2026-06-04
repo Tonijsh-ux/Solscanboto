@@ -12,8 +12,9 @@ const MIN_MC_USD = 2000;
 const CANDLE_MS = 1000;
 const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
-const TP_PCT = 1.5;   // +50%
-const SL_PCT = 0.8;   // -20%
+const TP_PCT = 1.5;
+const SL_PCT = 0.8;
+const MAX_TRADE_DURATION_MS = 15 * 60 * 1000; // cierre automático a 15 minutos
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -22,12 +23,15 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const state = {
   monitored: new Map(),
   signals: [],
-  demoTrades: [],  // posiciones demo abiertas y cerradas
+  demoTrades: [],
   log: [],
   stats: {
     seen: 0, filtered: 0, signals: 0,
-    demoOpen: 0, demoWins: 0, demoLosses: 0,
-    demoPnL: 0, uptime: Date.now()
+    demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0,
+    demoPnL: 0,
+    // Tracking avanzado
+    avgMaxGain: 0, avgMaxLoss: 0,
+    maxGainSum: 0, maxLossSum: 0, closedCount: 0,
   },
 };
 
@@ -108,7 +112,6 @@ async function fetchTokenMetadata(mint) {
     const data = await res.json();
     const meta = data?.result;
     if (!meta) return null;
-
     const links = meta.content?.links || {};
     const jsonUri = meta.content?.json_uri;
     let twitter = links.twitter || null;
@@ -116,7 +119,6 @@ async function fetchTokenMetadata(mint) {
     let telegram = null;
     let name = meta.content?.metadata?.name || null;
     let symbol = meta.content?.metadata?.symbol || null;
-
     if ((!twitter && !website) && jsonUri) {
       try {
         const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
@@ -128,7 +130,6 @@ async function fetchTokenMetadata(mint) {
         if (!symbol) symbol = j.symbol;
       } catch {}
     }
-
     return { twitter, website, telegram, name, symbol };
   } catch { return null; }
 }
@@ -136,7 +137,7 @@ async function fetchTokenMetadata(mint) {
 // ── DEMO TRADING ──
 function openDemoTrade(signal) {
   const trade = {
-    id: `demo-${Date.now()}`,
+    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     mint: signal.mint,
     symbol: signal.symbol,
     name: signal.name,
@@ -147,58 +148,99 @@ function openDemoTrade(signal) {
     openTime: Date.now(),
     closeTime: null,
     closePrice: null,
-    result: null, // "WIN" | "LOSS"
+    result: null,
     pnlPct: null,
+    maxGainPct: 0,   // máximo % que llegó a subir
+    maxLossPct: 0,   // máximo % que llegó a bajar
+    currentPct: 0,   // % actual respecto a entrada
     status: "OPEN",
+    expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
   };
 
   state.demoTrades.unshift(trade);
-  if (state.demoTrades.length > 200) state.demoTrades.pop();
+  if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`📝 DEMO abierta: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP ${signal.tp.toExponential(3)} | SL ${signal.sl.toExponential(3)}`, "demo");
+  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +50% | SL -20% | Expira en 15min`, "demo");
   return trade;
 }
 
-function checkDemoTrades(mint, price) {
+function closeDemoTrade(trade, price, reason) {
+  trade.closePrice = price;
+  trade.closeTime = Date.now();
+  trade.status = "CLOSED";
+  trade.pnlPct = +((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2);
+
+  if (reason === "TP") {
+    trade.result = "WIN";
+    state.stats.demoWins++;
+    state.stats.demoPnL += 50;
+    addLog(`✅ WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
+  } else if (reason === "SL") {
+    trade.result = "LOSS";
+    state.stats.demoLosses++;
+    state.stats.demoPnL -= 20;
+    addLog(`❌ LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain fue: +${trade.maxGainPct.toFixed(1)}%`, "loss");
+  } else {
+    // Expiró por tiempo
+    trade.result = trade.pnlPct >= 0 ? "EXPIRED_WIN" : "EXPIRED_LOSS";
+    state.stats.demoExpired++;
+    if (trade.pnlPct >= 0) state.stats.demoPnL += trade.pnlPct;
+    else state.stats.demoPnL += trade.pnlPct;
+    addLog(`⏱️ EXPIRADA: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% | MaxGain: +${trade.maxGainPct.toFixed(1)}% | MaxLoss: ${trade.maxLossPct.toFixed(1)}%`, "expire");
+  }
+
+  state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
+
+  // Actualizar promedios
+  state.stats.maxGainSum += trade.maxGainPct;
+  state.stats.maxLossSum += Math.abs(trade.maxLossPct);
+  state.stats.closedCount++;
+  state.stats.avgMaxGain = +(state.stats.maxGainSum / state.stats.closedCount).toFixed(1);
+  state.stats.avgMaxLoss = +(state.stats.maxLossSum / state.stats.closedCount).toFixed(1);
+
+  broadcast({ event: "demoTradeClosed", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+}
+
+function updateDemoTrades(mint, price) {
+  const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN") continue;
 
-    let closed = false;
-    let result = null;
+    // Actualizar % actual y máximos
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
 
+    // Comprobar TP / SL
     if (price >= trade.tp) {
-      result = "WIN";
-      closed = true;
+      closeDemoTrade(trade, price, "TP");
     } else if (price <= trade.sl) {
-      result = "LOSS";
-      closed = true;
-    }
-
-    if (closed) {
-      trade.closePrice = price;
-      trade.closeTime = Date.now();
-      trade.status = "CLOSED";
-      trade.result = result;
-      trade.pnlPct = +((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2);
-
-      state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
-      if (result === "WIN") {
-        state.stats.demoWins++;
-        state.stats.demoPnL += 50; // +50% simulado
-        addLog(`✅ DEMO WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s`, "win");
-      } else {
-        state.stats.demoLosses++;
-        state.stats.demoPnL -= 20; // -20% simulado
-        addLog(`❌ DEMO LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime) / 1000)}s`, "loss");
-      }
-
-      broadcast({ event: "demoTradeClosed", data: trade });
-      broadcast({ event: "stats", data: state.stats });
+      closeDemoTrade(trade, price, "SL");
+    } else if (now >= trade.expiresAt) {
+      closeDemoTrade(trade, price, "EXPIRED");
+    } else {
+      // Actualizar en tiempo real
+      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct } });
     }
   }
 }
+
+// Comprobar expiración de todas las operaciones cada 30s
+setInterval(() => {
+  const now = Date.now();
+  for (const trade of state.demoTrades) {
+    if (trade.status !== "OPEN") continue;
+    if (now >= trade.expiresAt) {
+      const token = state.monitored.get(trade.mint);
+      const price = token?.price || trade.entryPrice;
+      closeDemoTrade(trade, price, "EXPIRED");
+    }
+  }
+}, 30_000);
 
 function updateCandle(mint, price, volumeUSD = 0) {
   const token = state.monitored.get(mint);
@@ -227,7 +269,6 @@ function updateCandle(mint, price, volumeUSD = 0) {
   token.lastUpdate = now;
   token.mc = price * 1_000_000_000;
 
-  // Auto-eliminar si MC cae por debajo del mínimo
   if (token.mc < MIN_MC_USD * 0.5) {
     addLog(`🗑️ ${token.symbol} eliminado — MC cayó a $${Math.round(token.mc)}`, "filter");
     stopMonitoring(mint);
@@ -240,8 +281,7 @@ function updateCandle(mint, price, volumeUSD = 0) {
   token.candleCount = allCandles.length;
   token.candles50 = allCandles.slice(-50);
 
-  // Comprobar demo trades abiertos
-  checkDemoTrades(mint, price);
+  updateDemoTrades(mint, price);
 
   if (bb) checkSignal(mint, price, bb, allCandles.length);
   broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
@@ -251,12 +291,10 @@ function checkSignal(mint, price, bb, candleCount) {
   if (candleCount < BOLLINGER_PERIOD) return;
   const token = state.monitored.get(mint);
   if (!token) return;
-
   const lastSignal = signalCooldown.get(mint) || 0;
   if (Date.now() - lastSignal < SIGNAL_COOLDOWN_MS) return;
   if ((token.tradeCount || 0) < 3) return;
   if ((token.volumeUSD || 0) < 5) return;
-
   if (token.priceHigh > 0) {
     const dropFromHigh = (token.priceHigh - price) / token.priceHigh;
     if (dropFromHigh > 0.35) return;
@@ -288,8 +326,6 @@ function checkSignal(mint, price, bb, candleCount) {
     addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
     broadcast({ event: "newSignal", data: signal });
     broadcast({ event: "stats", data: state.stats });
-
-    // Abrir trade demo automáticamente
     openDemoTrade(signal);
   }
 }
@@ -337,10 +373,7 @@ async function processNewToken(mint, price, volumeUSD) {
   }
 
   const meta = await fetchTokenMetadata(mint);
-  if (!meta) {
-    addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter");
-    return;
-  }
+  if (!meta) { addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter"); return; }
 
   const { twitter, website, telegram, name, symbol } = meta;
   if (!twitter && !website && !telegram) {
@@ -361,10 +394,7 @@ async function processNewToken(mint, price, volumeUSD) {
     else { addLog(`⚠️ Cola llena, descartando ${symbol}`, "warn"); return; }
   }
 
-  startMonitoring({
-    mint, name: name || "Unknown", symbol: symbol || "???",
-    twitter, website, telegram, mc, price, detectedAt: Date.now(),
-  });
+  startMonitoring({ mint, name: name || "Unknown", symbol: symbol || "???", twitter, website, telegram, mc, price, detectedAt: Date.now() });
 }
 
 function connectHelius() {
@@ -379,20 +409,11 @@ function connectHelius() {
     broadcast({ event: "wsStatus", data: "connected" });
 
     ws.send(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 420,
+      jsonrpc: "2.0", id: 420,
       method: "transactionSubscribe",
       params: [
-        {
-          accountInclude: [PUMP_PROGRAM],
-          failed: false,
-        },
-        {
-          commitment: "processed",
-          encoding: "jsonParsed",
-          transactionDetails: "full",
-          maxSupportedTransactionVersion: 0,
-        }
+        { accountInclude: [PUMP_PROGRAM], failed: false },
+        { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
       ]
     }));
 
@@ -408,7 +429,6 @@ function connectHelius() {
       const msg = JSON.parse(raw.toString());
       const tx = msg?.params?.result?.transaction;
       if (!tx) return;
-
       const meta = tx.meta;
       if (!meta || meta.err) return;
 
@@ -417,7 +437,6 @@ function connectHelius() {
       const mint = tokenBalances[0]?.mint;
       if (!mint) return;
 
-      // Calcular precio desde balances
       const preSOL = meta.preBalances?.[0] || 0;
       const postSOL = meta.postBalances?.[0] || 0;
       const solDiff = Math.abs(postSOL - preSOL) / 1e9;
@@ -428,47 +447,28 @@ function connectHelius() {
         const pre = preTokenBalances.find(p => p.accountIndex === post.accountIndex);
         const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
         const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
-        if (Math.abs(postAmt - preAmt) > 0) {
-          tokenDiff = Math.abs(postAmt - preAmt);
-          break;
-        }
+        if (Math.abs(postAmt - preAmt) > 0) { tokenDiff = Math.abs(postAmt - preAmt); break; }
       }
 
       if (solDiff === 0 || tokenDiff === 0) return;
-
       const price = (solDiff / tokenDiff) * solPriceUSD;
       const volumeUSD = solDiff * solPriceUSD;
-
       if (price <= 0) return;
 
       const logs = meta.logMessages || [];
-      const isCreate = logs.some(l =>
-        l.includes("InitializeMint") ||
-        l.includes("initialize_mint") ||
-        l.includes("Instruction: Create")
-      );
+      const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
 
-      if (isCreate) {
-        await processNewToken(mint, price, volumeUSD);
-      } else if (state.monitored.has(mint)) {
-        updateCandle(mint, price, volumeUSD);
-      }
-
+      if (isCreate) await processNewToken(mint, price, volumeUSD);
+      else if (state.monitored.has(mint)) updateCandle(mint, price, volumeUSD);
     } catch {}
   });
 
-  ws.on("error", (err) => {
-    addLog(`❌ Error Helius: ${err.message}`, "error");
-    broadcast({ event: "wsStatus", data: "error" });
-  });
-
+  ws.on("error", (err) => { addLog(`❌ Error: ${err.message}`, "error"); broadcast({ event: "wsStatus", data: "error" }); });
   ws.on("close", () => {
     clearInterval(pingInterval);
-    addLog("🔄 Helius reconectando en 5s...", "warn");
+    addLog("🔄 Reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    for (const [, token] of state.monitored.entries()) {
-      if (token.ticker) clearInterval(token.ticker);
-    }
+    for (const [, token] of state.monitored.entries()) { if (token.ticker) clearInterval(token.ticker); }
     state.monitored.clear();
     setTimeout(connectHelius, 5000);
   });
@@ -477,47 +477,24 @@ function connectHelius() {
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 app.get("/api/state", (req, res) => {
   res.json({
     monitored: Array.from(state.monitored.values()).map(tokenToJSON),
     signals: state.signals.slice(0, 50),
-    demoTrades: state.demoTrades.slice(0, 100),
+    demoTrades: state.demoTrades.slice(0, 200),
     log: state.log.slice(0, 100),
     stats: state.stats
   });
 });
-
-app.delete("/api/token/:mint", (req, res) => {
-  stopMonitoring(req.params.mint);
-  res.json({ ok: true });
-});
+app.delete("/api/token/:mint", (req, res) => { stopMonitoring(req.params.mint); res.json({ ok: true }); });
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
-
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({
-    event: "fullState", data: {
-      monitored: Array.from(state.monitored.values()).map(tokenToJSON),
-      signals: state.signals.slice(0, 50),
-      demoTrades: state.demoTrades.slice(0, 100),
-      log: state.log.slice(0, 100),
-      stats: state.stats,
-      wsStatus: "connected"
-    }
-  }));
+  ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), demoTrades: state.demoTrades.slice(0, 200), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
   ws.on("close", () => frontendClients.delete(ws));
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.action === "removeToken") stopMonitoring(msg.mint);
-    } catch {}
-  });
+  ws.on("message", (data) => { try { const msg = JSON.parse(data.toString()); if (msg.action === "removeToken") stopMonitoring(msg.mint); } catch {} });
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot Helius Developer corriendo en puerto ${PORT}`);
-  connectHelius();
-});
+server.listen(PORT, () => { console.log(`🚀 SolScanBot corriendo en puerto ${PORT}`); connectHelius(); });
