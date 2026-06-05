@@ -23,16 +23,44 @@ function elapsed(ts) {
   return `${Math.floor(s / 60)}m${s % 60}s`;
 }
 function pctColor(pct) { return pct >= 0 ? "#22c55e" : "#ef4444"; }
-
-// MC desde precio (supply pump.fun = 1B tokens)
 function priceToMC(price) { return price * 1_000_000_000; }
+
+const TRAIL_PHASE = {
+  INITIAL:   { label: "SL -12%",      color: "#ef4444", icon: "🔴" },
+  BREAKEVEN: { label: "SL Breakeven", color: "#facc15", icon: "⚖️" },
+  LOCKED:    { label: "SL +40% Lock", color: "#f97316", icon: "🔒" },
+  FOLLOWING: { label: "SL Following", color: "#22c55e", icon: "🔄" },
+};
+
+function getTrailPhaseInfo(phase) {
+  return TRAIL_PHASE[phase] || TRAIL_PHASE.INITIAL;
+}
+
+const LOG_COLORS = {
+  info:    "#64748b",
+  filter:  "#475569",
+  accept:  "#22c55e",
+  signal:  "#facc15",
+  monitor: "#38bdf8",
+  warn:    "#f97316",
+  error:   "#ef4444",
+  demo:    "#a78bfa",
+  win:     "#22c55e",
+  loss:    "#ef4444",
+  expire:  "#f97316",
+  trail:   "#38bdf8",
+};
 
 function useBackend() {
   const [monitored, setMonitored] = useState([]);
   const [signals, setSignals] = useState([]);
   const [demoTrades, setDemoTrades] = useState([]);
   const [log, setLog] = useState([]);
-  const [stats, setStats] = useState({ seen: 0, filtered: 0, signals: 0, demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0, demoPnL: 0, avgMaxGain: 0, avgMaxLoss: 0, closedCount: 0 });
+  const [stats, setStats] = useState({
+    seen: 0, filtered: 0, signals: 0,
+    demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0,
+    demoPnL: 0, avgMaxGain: 0, avgMaxLoss: 0, closedCount: 0,
+  });
   const [wsStatus, setWsStatus] = useState("connecting");
   const wsRef = useRef(null);
 
@@ -52,17 +80,33 @@ function useBackend() {
       ws.onmessage = (evt) => {
         try {
           const { event, data } = JSON.parse(evt.data);
-          if (event === "fullState") { setMonitored(data.monitored || []); setSignals(data.signals || []); setDemoTrades(data.demoTrades || []); setLog(data.log || []); setStats(data.stats || {}); setWsStatus(data.wsStatus || "connected"); return; }
-          if (event === "wsStatus") { setWsStatus(data); return; }
-          if (event === "stats") { setStats(data); return; }
-          if (event === "newToken") { setMonitored((prev) => prev.find((t) => t.mint === data.mint) ? prev : [data, ...prev]); return; }
-          if (event === "removeToken") { setMonitored((prev) => prev.filter((t) => t.mint !== data.mint)); return; }
-          if (event === "tokenUpdate") { setMonitored((prev) => prev.map((t) => t.mint === data.mint ? { ...t, ...data } : t)); return; }
-          if (event === "newSignal") { setSignals((prev) => prev.find(s => s.id === data.id) ? prev : [data, ...prev].slice(0, 100)); if (navigator.vibrate) navigator.vibrate([200, 100, 200]); return; }
-          if (event === "newDemoTrade") { setDemoTrades((prev) => [data, ...prev].slice(0, 200)); return; }
-          if (event === "demoTradeUpdate") { setDemoTrades((prev) => prev.map(t => t.id === data.id ? { ...t, ...data } : t)); return; }
-          if (event === "demoTradeClosed") { setDemoTrades((prev) => prev.map(t => t.id === data.id ? data : t)); if (navigator.vibrate) navigator.vibrate(data.result === "WIN" ? [100, 50, 100, 50, 300] : [500]); return; }
-          if (event === "log") { setLog((prev) => [data, ...prev].slice(0, 200)); return; }
+          if (event === "fullState") {
+            setMonitored(data.monitored || []);
+            setSignals(data.signals || []);
+            setDemoTrades(data.demoTrades || []);
+            setLog(data.log || []);
+            setStats(data.stats || {});
+            setWsStatus(data.wsStatus || "connected");
+            return;
+          }
+          if (event === "wsStatus")    { setWsStatus(data); return; }
+          if (event === "stats")       { setStats(data); return; }
+          if (event === "newToken")    { setMonitored(prev => prev.find(t => t.mint === data.mint) ? prev : [data, ...prev]); return; }
+          if (event === "removeToken") { setMonitored(prev => prev.filter(t => t.mint !== data.mint)); return; }
+          if (event === "tokenUpdate") { setMonitored(prev => prev.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
+          if (event === "newSignal") {
+            setSignals(prev => prev.find(s => s.id === data.id) ? prev : [data, ...prev].slice(0, 100));
+            if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+            return;
+          }
+          if (event === "newDemoTrade")    { setDemoTrades(prev => [data, ...prev].slice(0, 200)); return; }
+          if (event === "demoTradeUpdate") { setDemoTrades(prev => prev.map(t => t.id === data.id ? { ...t, ...data } : t)); return; }
+          if (event === "demoTradeClosed") {
+            setDemoTrades(prev => prev.map(t => t.id === data.id ? data : t));
+            if (navigator.vibrate) navigator.vibrate(data.result === "WIN" ? [100, 50, 100, 50, 300] : [500]);
+            return;
+          }
+          if (event === "log") { setLog(prev => [data, ...prev].slice(0, 200)); return; }
         } catch {}
       };
       ws.onerror = () => setWsStatus("error");
@@ -76,16 +120,21 @@ function useBackend() {
 }
 
 function Sparkline({ candles, bb }) {
-  if (!candles || candles.length < 3) return <div style={{ fontSize: 10, color: "#334155", fontFamily: "monospace" }}>acumulando…</div>;
+  if (!candles || candles.length < 3)
+    return <div style={{ fontSize: 10, color: "#334155", fontFamily: "monospace" }}>acumulando…</div>;
   const w = 100, h = 36;
-  const prices = candles.map((c) => c.close);
-  const min = Math.min(...prices); const max = Math.max(...prices); const range = max - min || 1;
+  const prices = candles.map(c => c.close);
+  const min = Math.min(...prices), max = Math.max(...prices), range = max - min || 1;
   const pts = prices.map((p, i) => `${(i / (prices.length - 1)) * w},${h - ((p - min) / range) * (h - 4) - 2}`).join(" ");
-  const bbY = (v) => h - ((v - min) / range) * (h - 4) - 2;
+  const bbY = v => h - ((v - min) / range) * (h - 4) - 2;
   const isUp = prices[prices.length - 1] >= prices[0];
   return (
     <svg width={w} height={h} style={{ display: "block" }}>
-      {bb && (<><line x1="0" y1={bbY(bb.upper)} x2={w} y2={bbY(bb.upper)} stroke="#ef4444" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" /><line x1="0" y1={bbY(bb.middle)} x2={w} y2={bbY(bb.middle)} stroke="#facc15" strokeWidth="0.8" opacity="0.8" /><line x1="0" y1={bbY(bb.lower)} x2={w} y2={bbY(bb.lower)} stroke="#22c55e" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" /></>)}
+      {bb && (<>
+        <line x1="0" y1={bbY(bb.upper)} x2={w} y2={bbY(bb.upper)} stroke="#ef4444" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" />
+        <line x1="0" y1={bbY(bb.middle)} x2={w} y2={bbY(bb.middle)} stroke="#facc15" strokeWidth="0.8" opacity="0.8" />
+        <line x1="0" y1={bbY(bb.lower)} x2={w} y2={bbY(bb.lower)} stroke="#22c55e" strokeWidth="0.6" strokeDasharray="2,2" opacity="0.6" />
+      </>)}
       <polyline points={pts} fill="none" stroke={isUp ? "#22c55e" : "#ef4444"} strokeWidth="1.5" strokeLinejoin="round" />
     </svg>
   );
@@ -123,7 +172,13 @@ function TokenCard({ token, onRemove }) {
       </div>
       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
         <Sparkline candles={candles} bb={bb} />
-        {bb && (<div style={{ display: "flex", flexDirection: "column", gap: 1, fontFamily: "monospace", fontSize: 9 }}><span style={{ color: "#ef4444" }}>↑{formatUSD(bb.upper)}</span><span style={{ color: "#facc15" }}>—{formatUSD(bb.middle)}</span><span style={{ color: "#22c55e" }}>↓{formatUSD(bb.lower)}</span></div>)}
+        {bb && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 1, fontFamily: "monospace", fontSize: 9 }}>
+            <span style={{ color: "#ef4444" }}>↑{formatUSD(bb.upper)}</span>
+            <span style={{ color: "#facc15" }}>—{formatUSD(bb.middle)}</span>
+            <span style={{ color: "#22c55e" }}>↓{formatUSD(bb.lower)}</span>
+          </div>
+        )}
       </div>
       {signal && (
         <div style={{ background: `${signalColor}18`, border: `1px solid ${signalColor}`, borderRadius: 8, padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -143,17 +198,28 @@ function DemoTradeCard({ trade }) {
   const isOpen = trade.status === "OPEN";
   const isWin = trade.result === "WIN" || trade.result === "EXPIRED_WIN";
   const color = isOpen ? "#38bdf8" : isWin ? "#22c55e" : "#ef4444";
-  const statusLabel = isOpen ? "🔵 ABIERTA" : trade.result === "WIN" ? "✅ WIN" : trade.result === "LOSS" ? "❌ LOSS" : trade.result === "EXPIRED_WIN" ? "⏱️ +EXP" : "⏱️ -EXP";
 
-  // MC de entrada, TP y SL
+  const statusLabel = isOpen
+    ? "🔵 ABIERTA"
+    : trade.result === "WIN"         ? "✅ WIN"
+    : trade.result === "LOSS"        ? "❌ LOSS"
+    : trade.result === "EXPIRED_WIN" ? "⏱️ +EXP"
+    : "⏱️ -EXP";
+
   const entryMC = formatMC(priceToMC(trade.entryPrice));
-  const tpMC = formatMC(priceToMC(trade.tp));
-  const slMC = formatMC(priceToMC(trade.sl));
+  const tpMC    = formatMC(priceToMC(trade.tp));
+  const slMC    = formatMC(priceToMC(trade.sl));
   const closeMC = trade.closePrice ? formatMC(priceToMC(trade.closePrice)) : null;
 
+  const tpPct = trade.entryPrice > 0 ? ((trade.tp / trade.entryPrice - 1) * 100).toFixed(0) : "90";
+  const slPct = trade.entryPrice > 0 ? ((1 - trade.sl / trade.entryPrice) * 100).toFixed(0) : "12";
+
+  const phase = trade.trailingPhase || "INITIAL";
+  const phaseInfo = getTrailPhaseInfo(phase);
+
   return (
-    <div style={{ background: "#0d1117", border: `1px solid ${color}33`, borderRadius: 10, padding: "10px 14px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+    <div style={{ background: "#0d1117", border: `1px solid ${color}33`, borderRadius: 10, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
           <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>{statusLabel}</span>
@@ -161,12 +227,11 @@ function DemoTradeCard({ trade }) {
         <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}</span>
       </div>
 
-      {/* MC de entrada, TP y SL */}
-      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
+      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
         {[
-          { label: "MC Entrada", value: entryMC },
-          { label: "MC TP (+50%)", value: tpMC, color: "#22c55e" },
-          { label: "MC SL (-20%)", value: slMC, color: "#ef4444" },
+          { label: "MC Entrada",    value: entryMC },
+          { label: `TP +${tpPct}%`, value: tpMC, color: "#22c55e" },
+          { label: `SL -${slPct}%`, value: slMC, color: phaseInfo.color },
         ].map((m, i) => (
           <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 2 ? "1px solid #1e2d40" : "none" }}>
             <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 2 }}>{m.label}</div>
@@ -175,12 +240,20 @@ function DemoTradeCard({ trade }) {
         ))}
       </div>
 
-      {/* Tracking máximos */}
-      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
+      {isOpen && phase !== "INITIAL" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, background: `${phaseInfo.color}18`, border: `1px solid ${phaseInfo.color}44`, borderRadius: 6, padding: "4px 8px" }}>
+          <span style={{ fontSize: 12 }}>{phaseInfo.icon}</span>
+          <span style={{ fontFamily: "monospace", fontSize: 10, color: phaseInfo.color, fontWeight: 700 }}>
+            {phaseInfo.label}{trade.trailingLevel !== null && phase === "FOLLOWING" ? ` @ +${trade.trailingLevel}%` : ""}
+          </span>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
         {[
           { label: "Actual %", value: `${(trade.currentPct || 0) > 0 ? "+" : ""}${(trade.currentPct || 0).toFixed(1)}%`, color: pctColor(trade.currentPct || 0) },
-          { label: "Max ↑", value: `+${(trade.maxGainPct || 0).toFixed(1)}%`, color: "#22c55e" },
-          { label: "Max ↓", value: `${(trade.maxLossPct || 0).toFixed(1)}%`, color: "#ef4444" },
+          { label: "Max ↑",   value: `+${(trade.maxGainPct || 0).toFixed(1)}%`, color: "#22c55e" },
+          { label: "Max ↓",   value: `${(trade.maxLossPct || 0).toFixed(1)}%`,  color: "#ef4444" },
           { label: isOpen ? "⏱️" : "Duración", value: isOpen ? elapsed(trade.openTime) : `${Math.round((trade.closeTime - trade.openTime) / 1000)}s` },
         ].map((m, i) => (
           <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
@@ -190,10 +263,12 @@ function DemoTradeCard({ trade }) {
         ))}
       </div>
 
-      {/* Cierre */}
       {!isOpen && closeMC && (
-        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 6 }}>
+        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>
           Cerrada @ MC {closeMC} — P&L: <span style={{ color: pctColor(trade.pnlPct) }}>{trade.pnlPct > 0 ? "+" : ""}{trade.pnlPct}%</span>
+          {trade.trailingPhase && trade.trailingPhase !== "INITIAL" && (
+            <span style={{ color: phaseInfo.color }}> [{phaseInfo.icon} {trade.trailingPhase}]</span>
+          )}
         </div>
       )}
 
@@ -209,8 +284,15 @@ export default function App() {
 
   const statusColor = { connected: "#22c55e", connecting: "#facc15", disconnected: "#6b7280", error: "#ef4444" }[wsStatus] || "#6b7280";
   const statusLabel = { connected: "LIVE", connecting: "...", disconnected: "OFF", error: "ERR" }[wsStatus] || "—";
-  const winRate = stats.demoWins + stats.demoLosses > 0 ? Math.round(stats.demoWins / (stats.demoWins + stats.demoLosses) * 100) : 0;
-  const filteredTrades = demoTrades.filter(t => demoFilter === "all" ? true : demoFilter === "open" ? t.status === "OPEN" : t.status === "CLOSED");
+
+  const winRate = stats.demoWins + stats.demoLosses > 0
+    ? Math.round(stats.demoWins / (stats.demoWins + stats.demoLosses) * 100) : 0;
+
+  const filteredTrades = demoTrades.filter(t =>
+    demoFilter === "all" ? true : demoFilter === "open" ? t.status === "OPEN" : t.status === "CLOSED"
+  );
+
+  const pnlStr = `${stats.demoPnL > 0 ? "+" : ""}${Number.isInteger(stats.demoPnL) ? stats.demoPnL : stats.demoPnL.toFixed(1)}%`;
 
   return (
     <div style={{ background: "#080c14", minHeight: "100dvh", color: "#e2e8f0", fontFamily: "sans-serif", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto" }}>
@@ -226,11 +308,11 @@ export default function App() {
         </div>
         <div style={{ display: "flex", gap: 10 }}>
           {[
-            { label: "OK", val: stats.filtered },
-            { label: "🎯", val: stats.signals, color: "#facc15" },
-            { label: "W%", val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
-            { label: "P&L", val: `${stats.demoPnL > 0 ? "+" : ""}${stats.demoPnL}%`, color: stats.demoPnL >= 0 ? "#22c55e" : "#ef4444" }
-          ].map((s) => (
+            { label: "OK",  val: stats.filtered },
+            { label: "🎯",  val: stats.signals, color: "#facc15" },
+            { label: "W%",  val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
+            { label: "P&L", val: pnlStr, color: stats.demoPnL >= 0 ? "#22c55e" : "#ef4444" }
+          ].map(s => (
             <div key={s.label} style={{ textAlign: "center" }}>
               <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: s.color || "#38bdf8" }}>{s.val ?? 0}</div>
               <div style={{ fontSize: 8, color: "#64748b" }}>{s.label}</div>
@@ -241,15 +323,17 @@ export default function App() {
 
       <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40" }}>
         {[
-          { id: "monitor", label: "📊", badge: monitored.length },
-          { id: "signals", label: "🎯", badge: signals.length, accent: "#facc15" },
-          { id: "demo", label: "💰 Demo", badge: stats.demoOpen, accent: "#38bdf8" },
-          { id: "stats", label: "📈 Stats", badge: null },
-          { id: "log", label: "📋", badge: null },
-        ].map((t) => (
+          { id: "monitor", label: "📊",      badge: monitored.length },
+          { id: "signals", label: "🎯",      badge: signals.length,  accent: "#facc15" },
+          { id: "demo",    label: "💰 Demo", badge: stats.demoOpen,  accent: "#38bdf8" },
+          { id: "stats",   label: "📈 Stats", badge: null },
+          { id: "log",     label: "📋",      badge: null },
+        ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 2px", border: "none", background: "none", fontFamily: "sans-serif", fontSize: 11, fontWeight: 600, color: tab === t.id ? (t.accent || "#38bdf8") : "#64748b", borderBottom: tab === t.id ? `2px solid ${t.accent || "#38bdf8"}` : "2px solid transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}>
             {t.label}
-            {t.badge !== null && t.badge > 0 && <span style={{ background: t.accent === "#facc15" ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 4px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>}
+            {t.badge !== null && t.badge > 0 && (
+              <span style={{ background: t.accent === "#facc15" ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 4px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>
+            )}
           </button>
         ))}
       </div>
@@ -257,10 +341,10 @@ export default function App() {
       <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
 
         {tab === "monitor" && monitored.length === 0 && <EmptyState icon="🔍" text="Escaneando la blockchain..." />}
-        {tab === "monitor" && monitored.map((t) => <TokenCard key={t.mint} token={t} onRemove={removeToken} />)}
+        {tab === "monitor" && monitored.map(t => <TokenCard key={t.mint} token={t} onRemove={removeToken} />)}
 
         {tab === "signals" && signals.length === 0 && <EmptyState icon="🎯" text="Esperando señales..." />}
-        {tab === "signals" && signals.map((s) => (
+        {tab === "signals" && signals.map(s => (
           <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "LOWER" ? "#22c55e" : "#facc15"}22`, borderRadius: 10, padding: "10px 14px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
               <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{s.symbol || shortAddr(s.mint)}</span>
@@ -288,7 +372,7 @@ export default function App() {
               ))}
             </div>
             {filteredTrades.length === 0 && <EmptyState icon="💰" text="Las operaciones demo aparecerán aquí." />}
-            {filteredTrades.map((t) => <DemoTradeCard key={t.id} trade={t} />)}
+            {filteredTrades.map(t => <DemoTradeCard key={t.id} trade={t} />)}
           </>
         )}
 
@@ -298,12 +382,12 @@ export default function App() {
               <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>RESUMEN DEMO</div>
               {[
                 { label: "Operaciones cerradas", val: stats.closedCount },
-                { label: "Wins", val: stats.demoWins, color: "#22c55e" },
-                { label: "Losses", val: stats.demoLosses, color: "#ef4444" },
-                { label: "Expiradas", val: stats.demoExpired || 0, color: "#f97316" },
-                { label: "Win Rate", val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
-                { label: "P&L Total", val: `${stats.demoPnL > 0 ? "+" : ""}${stats.demoPnL}%`, color: stats.demoPnL >= 0 ? "#22c55e" : "#ef4444" },
-              ].map((s) => (
+                { label: "Wins",                 val: stats.demoWins,         color: "#22c55e" },
+                { label: "Losses",               val: stats.demoLosses,       color: "#ef4444" },
+                { label: "Expiradas",            val: stats.demoExpired || 0, color: "#f97316" },
+                { label: "Win Rate",             val: `${winRate}%`,          color: winRate >= 50 ? "#22c55e" : "#ef4444" },
+                { label: "P&L Total",            val: pnlStr,                 color: stats.demoPnL >= 0 ? "#22c55e" : "#ef4444" },
+              ].map(s => (
                 <div key={s.label} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d40" }}>
                   <span style={{ fontSize: 12, color: "#94a3b8" }}>{s.label}</span>
                   <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: s.color || "#f1f5f9" }}>{s.val}</span>
@@ -314,10 +398,10 @@ export default function App() {
             <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
               <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>ANÁLISIS DE PRECIO</div>
               {[
-                { label: "Ganancia máx media", val: `+${stats.avgMaxGain}%`, color: "#22c55e", desc: "Media del máximo que suben antes de cerrar" },
-                { label: "Pérdida máx media", val: `-${stats.avgMaxLoss}%`, color: "#ef4444", desc: "Media del máximo que bajan antes de cerrar" },
+                { label: "Ganancia máx media",   val: `+${stats.avgMaxGain}%`, color: "#22c55e", desc: "Media del máximo que suben antes de cerrar" },
+                { label: "Pérdida máx media",    val: `-${stats.avgMaxLoss}%`, color: "#ef4444", desc: "Media del máximo que bajan antes de cerrar" },
                 { label: "Trailing stop óptimo", val: stats.avgMaxGain > 0 ? `+${Math.max(5, Math.round(stats.avgMaxGain * 0.6))}%` : "—", color: "#facc15", desc: "60% del máximo de ganancia media" },
-              ].map((s) => (
+              ].map(s => (
                 <div key={s.label} style={{ padding: "8px 0", borderBottom: "1px solid #1e2d40" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                     <span style={{ fontSize: 12, color: "#94a3b8" }}>{s.label}</span>
@@ -328,13 +412,34 @@ export default function App() {
               ))}
             </div>
 
+            <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
+              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>FASES TRAILING STOP</div>
+              {Object.entries(TRAIL_PHASE).map(([key, info]) => {
+                const desc = {
+                  INITIAL:   "SL inicial -12% del precio de entrada",
+                  BREAKEVEN: "A +30% → SL sube a precio de entrada (0%)",
+                  LOCKED:    "A +63% → SL bloqueado en +40%",
+                  FOLLOWING: "Sobre +63% → SL sigue precio con -20%",
+                }[key];
+                return (
+                  <div key={key} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "6px 0", borderBottom: "1px solid #1e2d40" }}>
+                    <span style={{ fontSize: 14, flexShrink: 0 }}>{info.icon}</span>
+                    <div>
+                      <div style={{ fontFamily: "monospace", fontSize: 11, color: info.color, fontWeight: 700 }}>{info.label}</div>
+                      <div style={{ fontSize: 10, color: "#475569", marginTop: 2 }}>{desc}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
             <div style={{ background: "#0d1117", border: "1px solid #facc1533", borderRadius: 10, padding: 14 }}>
               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#facc15", marginBottom: 6 }}>💡 RECOMENDACIÓN</div>
               <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.6 }}>
                 {stats.closedCount < 20
                   ? "Necesitas más operaciones cerradas para tener datos fiables. Sigue corriendo el bot."
                   : stats.avgMaxGain > 15
-                  ? `Las operaciones suben de media +${stats.avgMaxGain}% antes de cerrar. Un trailing stop al +${Math.round(stats.avgMaxGain * 0.6)}% podría mejorar los resultados.`
+                  ? `Las operaciones suben de media +${stats.avgMaxGain}% antes de cerrar. El trailing stop activo debería capturar estas ganancias automáticamente.`
                   : "Las operaciones tienen poco recorrido. Considera ajustar los filtros de entrada."}
               </div>
             </div>
@@ -344,9 +449,10 @@ export default function App() {
         {tab === "log" && log.map((entry, i) => (
           <div key={i} style={{ display: "flex", gap: 8, padding: "3px 0", borderBottom: "1px solid #0d1117" }}>
             <span style={{ fontFamily: "monospace", fontSize: 10, color: "#334155", flexShrink: 0 }}>{formatTime(entry.time)}</span>
-            <span style={{ fontFamily: "monospace", fontSize: 10, color: { info: "#64748b", filter: "#475569", accept: "#22c55e", signal: "#facc15", monitor: "#38bdf8", warn: "#f97316", error: "#ef4444", demo: "#a78bfa", win: "#22c55e", loss: "#ef4444", expire: "#f97316" }[entry.type] || "#64748b" }}>{entry.msg}</span>
+            <span style={{ fontFamily: "monospace", fontSize: 10, color: LOG_COLORS[entry.type] || "#64748b" }}>{entry.msg}</span>
           </div>
         ))}
+
       </div>
       <div style={{ height: "env(safe-area-inset-bottom, 16px)" }} />
     </div>
