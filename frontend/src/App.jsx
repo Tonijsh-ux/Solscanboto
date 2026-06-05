@@ -277,10 +277,69 @@ function DemoTradeCard({ trade }) {
   );
 }
 
+function HistorialCard({ trade, validation, onValidate }) {
+  const pnlColor = pctColor(trade.pnlPct || 0);
+  const durSec = trade.closeTime ? Math.round((trade.closeTime - trade.openTime) / 1000) : null;
+
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
+          <span style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: pnlColor }}>
+            {trade.pnlPct > 0 ? "+" : ""}{trade.pnlPct}%
+          </span>
+          {trade.trailingPhase && trade.trailingPhase !== "INITIAL" && (
+            <span style={{ fontSize: 9, color: "#64748b" }}>{getTrailPhaseInfo(trade.trailingPhase).icon}</span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button
+            onClick={() => onValidate(trade.id, validation === "ok" ? null : "ok")}
+            style={{ width: 28, height: 28, borderRadius: 6, border: `1.5px solid ${validation === "ok" ? "#22c55e" : "#1e2d40"}`, background: validation === "ok" ? "#052e16" : "none", color: validation === "ok" ? "#22c55e" : "#475569", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >✓</button>
+          <button
+            onClick={() => onValidate(trade.id, validation === "ko" ? null : "ko")}
+            style={{ width: 28, height: 28, borderRadius: 6, border: `1.5px solid ${validation === "ko" ? "#ef4444" : "#1e2d40"}`, background: validation === "ko" ? "#2d0a0a" : "none", color: validation === "ko" ? "#ef4444" : "#475569", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >✗</button>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
+        {[
+          { label: "Entrada",  value: formatTime(trade.openTime) },
+          { label: "Salida",   value: trade.closeTime ? formatTime(trade.closeTime) : "—" },
+          { label: "Duración", value: durSec !== null ? (durSec < 60 ? `${durSec}s` : `${Math.floor(durSec/60)}m${durSec%60}s`) : "—" },
+          { label: "Zona",     value: trade.zone || "—", color: trade.zone === "LOWER" ? "#22c55e" : "#facc15" },
+        ].map((m, i) => (
+          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
+            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 2 }}>{m.label}</div>
+            <div style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 10, color: "#64748b", alignItems: "center" }}>
+        <span>MC {formatMC(priceToMC(trade.entryPrice))}</span>
+        <span style={{ color: "#334155" }}>→</span>
+        <span style={{ color: pnlColor }}>{trade.closePrice ? formatMC(priceToMC(trade.closePrice)) : "—"}</span>
+        <span style={{ marginLeft: "auto", color: "#22c55e" }}>Max↑ +{(trade.maxGainPct || 0).toFixed(1)}%</span>
+      </div>
+
+      <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>
+        📊 Ver en DexScreener →
+      </a>
+    </div>
+  );
+}
+
 export default function App() {
   const { monitored, signals, demoTrades, log, stats, wsStatus, removeToken } = useBackend();
   const [tab, setTab] = useState("monitor");
   const [demoFilter, setDemoFilter] = useState("all");
+  const [validations, setValidations] = useState({});
+  const toggleValidation = (id, val) => setValidations(prev => ({ ...prev, [id]: val }));
 
   const statusColor = { connected: "#22c55e", connecting: "#facc15", disconnected: "#6b7280", error: "#ef4444" }[wsStatus] || "#6b7280";
   const statusLabel = { connected: "LIVE", connecting: "...", disconnected: "OFF", error: "ERR" }[wsStatus] || "—";
@@ -323,16 +382,17 @@ export default function App() {
 
       <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40" }}>
         {[
-          { id: "monitor", label: "📊",      badge: monitored.length },
-          { id: "signals", label: "🎯",      badge: signals.length,  accent: "#facc15" },
-          { id: "demo",    label: "💰 Demo", badge: stats.demoOpen,  accent: "#38bdf8" },
-          { id: "stats",   label: "📈 Stats", badge: null },
-          { id: "log",     label: "📋",      badge: null },
+          { id: "monitor",   label: "📊", badge: monitored.length },
+          { id: "signals",   label: "🎯", badge: signals.length, accent: "#facc15" },
+          { id: "demo",      label: "💰", badge: stats.demoOpen, accent: "#38bdf8" },
+          { id: "stats",     label: "📈", badge: null },
+          { id: "historial", label: "📒", badge: demoTrades.filter(t => t.status === "CLOSED").length || null, accent: "#a78bfa" },
+          { id: "log",       label: "📋", badge: null },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "10px 2px", border: "none", background: "none", fontFamily: "sans-serif", fontSize: 11, fontWeight: 600, color: tab === t.id ? (t.accent || "#38bdf8") : "#64748b", borderBottom: tab === t.id ? `2px solid ${t.accent || "#38bdf8"}` : "2px solid transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}>
             {t.label}
             {t.badge !== null && t.badge > 0 && (
-              <span style={{ background: t.accent === "#facc15" ? "#3b2f00" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 4px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>
+              <span style={{ background: t.accent === "#facc15" ? "#3b2f00" : t.accent === "#a78bfa" ? "#1e1030" : "#1e3a5f", color: t.accent || "#38bdf8", fontSize: 9, padding: "1px 4px", borderRadius: 10, fontFamily: "monospace" }}>{t.badge}</span>
             )}
           </button>
         ))}
@@ -394,7 +454,6 @@ export default function App() {
                 </div>
               ))}
             </div>
-
             <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
               <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>ANÁLISIS DE PRECIO</div>
               {[
@@ -411,7 +470,6 @@ export default function App() {
                 </div>
               ))}
             </div>
-
             <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
               <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>FASES TRAILING STOP</div>
               {Object.entries(TRAIL_PHASE).map(([key, info]) => {
@@ -432,7 +490,6 @@ export default function App() {
                 );
               })}
             </div>
-
             <div style={{ background: "#0d1117", border: "1px solid #facc1533", borderRadius: 10, padding: 14 }}>
               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#facc15", marginBottom: 6 }}>💡 RECOMENDACIÓN</div>
               <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.6 }}>
@@ -445,6 +502,36 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {tab === "historial" && (() => {
+          const closed = demoTrades.filter(t => t.status === "CLOSED");
+          const validated = Object.values(validations).filter(Boolean);
+          const okCount = Object.values(validations).filter(v => v === "ok").length;
+          const koCount = Object.values(validations).filter(v => v === "ko").length;
+          return (
+            <>
+              {validated.length > 0 && (
+                <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
+                  {[
+                    { label: "Revisadas",    value: validated.length, color: "#94a3b8" },
+                    { label: "✓ Correctas",  value: okCount,          color: "#22c55e" },
+                    { label: "✗ Incorrectas",value: koCount,          color: "#ef4444" },
+                    { label: "Precisión",    value: validated.length > 0 ? `${Math.round(okCount / validated.length * 100)}%` : "—", color: okCount / (validated.length || 1) >= 0.7 ? "#22c55e" : "#ef4444" },
+                  ].map((m, i) => (
+                    <div key={i} style={{ flex: 1, padding: "7px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
+                      <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 2 }}>{m.label}</div>
+                      <div style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: m.color }}>{m.value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {closed.length === 0 && <EmptyState icon="📒" text="Las operaciones cerradas aparecerán aquí." />}
+              {closed.map(t => (
+                <HistorialCard key={t.id} trade={t} validation={validations[t.id] || null} onValidate={toggleValidation} />
+              ))}
+            </>
+          );
+        })()}
 
         {tab === "log" && log.map((entry, i) => (
           <div key={i} style={{ display: "flex", gap: 8, padding: "3px 0", borderBottom: "1px solid #0d1117" }}>
