@@ -12,9 +12,16 @@ const MIN_MC_USD = 2500;
 const CANDLE_MS = 1000;
 const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
-const TP_PCT = 1.9;
-const SL_PCT = 0.88;
-const MAX_TRADE_DURATION_MS = 15 * 60 * 1000; // cierre automático a 15 minutos
+const TP_PCT = 1.9;   // +90%
+const SL_PCT = 0.88;  // -12%
+const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
+
+// ── TRAILING STOP ──────────────────────────────────────────────
+const TRAILING_BREAKEVEN_AT = 0.30;  // +30% → SL sube a entrada
+const TRAILING_LOCK_AT      = 0.63;  // +63% → SL sube a +40%
+const TRAILING_LOCK_PCT     = 0.40;  // nivel de lock
+const TRAILING_FOLLOW_PCT   = 0.20;  // seguir precio -20%
+// ──────────────────────────────────────────────────────────────
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -29,14 +36,13 @@ const state = {
     seen: 0, filtered: 0, signals: 0,
     demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0,
     demoPnL: 0,
-    // Tracking avanzado
     avgMaxGain: 0, avgMaxLoss: 0,
     maxGainSum: 0, maxLossSum: 0, closedCount: 0,
   },
 };
 
 const frontendClients = new Set();
-const seenMints = new Set();
+const seenMints = new Map(); // mint → timestamp (para limpiar los más viejos)
 const signalCooldown = new Map();
 
 function addLog(msg, type = "info") {
@@ -134,25 +140,30 @@ async function fetchTokenMetadata(mint) {
   } catch { return null; }
 }
 
-// ── DEMO TRADING ──
+// ── DEMO TRADING ───────────────────────────────────────────────
+
 function openDemoTrade(signal) {
   const trade = {
-    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     mint: signal.mint,
     symbol: signal.symbol,
     name: signal.name,
     zone: signal.zone,
     entryPrice: signal.price,
-    tp: signal.tp,
-    sl: signal.sl,
+    tp: signal.tp,           // precio TP real
+    sl: signal.sl,           // precio SL inicial (dinámico con trailing)
+    initialSl: signal.sl,    // SL original guardado
     openTime: Date.now(),
     closeTime: null,
     closePrice: null,
     result: null,
     pnlPct: null,
-    maxGainPct: 0,   // máximo % que llegó a subir
-    maxLossPct: 0,   // máximo % que llegó a bajar
-    currentPct: 0,   // % actual respecto a entrada
+    maxGainPct: 0,
+    maxLossPct: 0,
+    currentPct: 0,
+    // Trailing stop state
+    trailingPhase: "INITIAL",  // INITIAL | BREAKEVEN | LOCKED | FOLLOWING
+    trailingLevel: null,       // precio actual del SL dinámico
     status: "OPEN",
     expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
   };
@@ -160,40 +171,119 @@ function openDemoTrade(signal) {
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
+
+  const tpPct = ((TP_PCT - 1) * 100).toFixed(0);
+  const slPct = ((1 - SL_PCT) * 100).toFixed(0);
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +50% | SL -20% | Expira en 15min`, "demo");
+  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +${tpPct}% | SL -${slPct}% | Expira 15min`, "demo");
   return trade;
+}
+
+// ── TRAILING STOP LOGIC ────────────────────────────────────────
+function updateTrailingStop(trade, price) {
+  const gainPct = (price - trade.entryPrice) / trade.entryPrice;
+
+  if (trade.trailingPhase === "FOLLOWING") {
+    // SL sigue al precio con -20%
+    const newSl = price * (1 - TRAILING_FOLLOW_PCT);
+    if (newSl > trade.sl) {
+      trade.sl = +newSl.toFixed(10);
+      trade.trailingLevel = +((gainPct - TRAILING_FOLLOW_PCT) * 100).toFixed(1);
+      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
+    }
+    return;
+  }
+
+  if (gainPct >= TRAILING_LOCK_AT) {
+    // Fase FOLLOWING: >+63%
+    const newSl = price * (1 - TRAILING_FOLLOW_PCT);
+    if (trade.trailingPhase !== "FOLLOWING") {
+      trade.trailingPhase = "FOLLOWING";
+      trade.sl = +Math.max(trade.sl, newSl).toFixed(10);
+      trade.trailingLevel = +((gainPct - TRAILING_FOLLOW_PCT) * 100).toFixed(1);
+      addLog(`🔄 TRAILING FOLLOWING: ${trade.symbol} SL ahora sigue precio -20% (SL actual: +${trade.trailingLevel}%)`, "trail");
+      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
+    }
+    return;
+  }
+
+  if (gainPct >= TRAILING_LOCK_AT && trade.trailingPhase === "BREAKEVEN") {
+    // Fase LOCKED: +63% → SL sube a +40%
+    const lockedSl = trade.entryPrice * (1 + TRAILING_LOCK_PCT);
+    trade.trailingPhase = "LOCKED";
+    trade.sl = +lockedSl.toFixed(10);
+    trade.trailingLevel = TRAILING_LOCK_PCT * 100;
+    addLog(`🔒 TRAILING LOCKED: ${trade.symbol} SL bloqueado en +${(TRAILING_LOCK_PCT * 100).toFixed(0)}%`, "trail");
+    broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
+    return;
+  }
+
+  if (gainPct >= TRAILING_BREAKEVEN_AT && trade.trailingPhase === "INITIAL") {
+    // Fase BREAKEVEN: +30% → SL sube a entrada
+    trade.trailingPhase = "BREAKEVEN";
+    trade.sl = +trade.entryPrice.toFixed(10);
+    trade.trailingLevel = 0;
+    addLog(`⚖️ BREAKEVEN: ${trade.symbol} SL subido a precio de entrada (+0%)`, "trail");
+    broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
+    return;
+  }
+
+  // LOCKED → FOLLOWING (lo manejamos arriba pero por si el LOCKED se saltó)
+  if (gainPct >= TRAILING_LOCK_AT && trade.trailingPhase === "LOCKED") {
+    const newSl = price * (1 - TRAILING_FOLLOW_PCT);
+    trade.trailingPhase = "FOLLOWING";
+    trade.sl = +Math.max(trade.sl, newSl).toFixed(10);
+    trade.trailingLevel = +((gainPct - TRAILING_FOLLOW_PCT) * 100).toFixed(1);
+    addLog(`🔄 TRAILING FOLLOWING: ${trade.symbol} SL sigue precio -20%`, "trail");
+    broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
+  }
 }
 
 function closeDemoTrade(trade, price, reason) {
   trade.closePrice = price;
   trade.closeTime = Date.now();
   trade.status = "CLOSED";
-  trade.pnlPct = +((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2);
+  const durationSec = Math.round((trade.closeTime - trade.openTime) / 1000);
+
+  // PnL real basado en precio de cierre vs entrada
+  const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+  trade.pnlPct = +pnlPct.toFixed(2);
 
   if (reason === "TP") {
     trade.result = "WIN";
     state.stats.demoWins++;
-    state.stats.demoPnL += 50;
-    addLog(`✅ WIN: ${trade.symbol} +50% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
+    // P&L real: precio TP = entryPrice * TP_PCT → ganancia = (TP_PCT - 1) * 100
+    const tpGainPct = (TP_PCT - 1) * 100;
+    state.stats.demoPnL += tpGainPct;
+    addLog(`✅ WIN [TP]: ${trade.symbol} +${tpGainPct.toFixed(0)}% en ${durationSec}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
+
   } else if (reason === "SL") {
     trade.result = "LOSS";
     state.stats.demoLosses++;
-    state.stats.demoPnL -= 20;
-    addLog(`❌ LOSS: ${trade.symbol} -20% en ${Math.round((trade.closeTime - trade.openTime)/1000)}s | MaxGain fue: +${trade.maxGainPct.toFixed(1)}%`, "loss");
+    // P&L real basado en donde estaba el SL cuando se cerró (puede ser trailing)
+    state.stats.demoPnL += trade.pnlPct;
+    const icon = trade.pnlPct >= 0 ? "✅" : "❌";
+    addLog(`${icon} ${trade.pnlPct >= 0 ? "WIN" : "LOSS"} [SL/${trade.trailingPhase}]: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% en ${durationSec}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, trade.pnlPct >= 0 ? "win" : "loss");
+
+    // Si el SL era trailing y salió en positivo, contarlo como WIN
+    if (trade.pnlPct >= 0) {
+      state.stats.demoLosses--;
+      state.stats.demoWins++;
+      trade.result = "WIN";
+    }
+
   } else {
-    // Expiró por tiempo
+    // Expirada por tiempo
     trade.result = trade.pnlPct >= 0 ? "EXPIRED_WIN" : "EXPIRED_LOSS";
     state.stats.demoExpired++;
-    if (trade.pnlPct >= 0) state.stats.demoPnL += trade.pnlPct;
-    else state.stats.demoPnL += trade.pnlPct;
+    state.stats.demoPnL += trade.pnlPct;
     addLog(`⏱️ EXPIRADA: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% | MaxGain: +${trade.maxGainPct.toFixed(1)}% | MaxLoss: ${trade.maxLossPct.toFixed(1)}%`, "expire");
   }
 
   state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
 
-  // Actualizar promedios
+  // Promedios
   state.stats.maxGainSum += trade.maxGainPct;
   state.stats.maxLossSum += Math.abs(trade.maxLossPct);
   state.stats.closedCount++;
@@ -209,13 +299,16 @@ function updateDemoTrades(mint, price) {
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN") continue;
 
-    // Actualizar % actual y máximos
+    // Actualizar % actual y máximos históricos
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
 
-    // Comprobar TP / SL
+    // Actualizar trailing stop antes de comprobar SL/TP
+    updateTrailingStop(trade, price);
+
+    // Comprobar TP / SL / Expiración
     if (price >= trade.tp) {
       closeDemoTrade(trade, price, "TP");
     } else if (price <= trade.sl) {
@@ -223,13 +316,23 @@ function updateDemoTrades(mint, price) {
     } else if (now >= trade.expiresAt) {
       closeDemoTrade(trade, price, "EXPIRED");
     } else {
-      // Actualizar en tiempo real
-      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct } });
+      broadcast({
+        event: "demoTradeUpdate",
+        data: {
+          id: trade.id,
+          currentPct: trade.currentPct,
+          maxGainPct: trade.maxGainPct,
+          maxLossPct: trade.maxLossPct,
+          sl: trade.sl,
+          trailingPhase: trade.trailingPhase,
+          trailingLevel: trade.trailingLevel,
+        }
+      });
     }
   }
 }
 
-// Comprobar expiración de todas las operaciones cada 30s
+// Comprobar expiración cada 30s
 setInterval(() => {
   const now = Date.now();
   for (const trade of state.demoTrades) {
@@ -241,6 +344,8 @@ setInterval(() => {
     }
   }
 }, 30_000);
+
+// ── CANDLES ────────────────────────────────────────────────────
 
 function updateCandle(mint, price, volumeUSD = 0) {
   const token = state.monitored.get(mint);
@@ -287,6 +392,8 @@ function updateCandle(mint, price, volumeUSD = 0) {
   broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
 }
 
+// ── SEÑALES ────────────────────────────────────────────────────
+
 function checkSignal(mint, price, bb, candleCount) {
   if (candleCount < BOLLINGER_PERIOD) return;
   const token = state.monitored.get(mint);
@@ -330,6 +437,8 @@ function checkSignal(mint, price, bb, candleCount) {
   }
 }
 
+// ── MONITORING ─────────────────────────────────────────────────
+
 function startMonitoring(token) {
   if (state.monitored.has(token.mint)) return;
   const entry = {
@@ -360,8 +469,16 @@ function stopMonitoring(mint) {
 
 async function processNewToken(mint, price, volumeUSD) {
   if (seenMints.has(mint)) return;
-  seenMints.add(mint);
-  if (seenMints.size > 5000) seenMints.clear();
+
+  // Limpieza inteligente: eliminar el más viejo si hay más de 5000
+  if (seenMints.size >= 5000) {
+    let oldestMint = null, oldestTime = Infinity;
+    for (const [m, t] of seenMints.entries()) {
+      if (t < oldestTime) { oldestTime = t; oldestMint = m; }
+    }
+    if (oldestMint) seenMints.delete(oldestMint);
+  }
+  seenMints.set(mint, Date.now());
 
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
@@ -386,7 +503,7 @@ async function processNewToken(mint, price, volumeUSD) {
 
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
-    for (const [m, t] of state.monitored.entries()) {
+    for (const [, t] of state.monitored.entries()) {
       const age = Date.now() - t.detectedAt;
       if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
     }
@@ -397,6 +514,8 @@ async function processNewToken(mint, price, volumeUSD) {
   startMonitoring({ mint, name: name || "Unknown", symbol: symbol || "???", twitter, website, telegram, mc, price, detectedAt: Date.now() });
 }
 
+// ── HELIUS WS ──────────────────────────────────────────────────
+
 function connectHelius() {
   addLog("🔌 Conectando a Helius...", "info");
   broadcast({ event: "wsStatus", data: "connecting" });
@@ -405,7 +524,7 @@ function connectHelius() {
   let pingInterval;
 
   ws.on("open", () => {
-    addLog("✅ Helius Developer conectado 🚀", "info");
+    addLog("✅ Helius conectado 🚀", "info");
     broadcast({ event: "wsStatus", data: "connected" });
 
     ws.send(JSON.stringify({
@@ -463,20 +582,29 @@ function connectHelius() {
     } catch {}
   });
 
-  ws.on("error", (err) => { addLog(`❌ Error: ${err.message}`, "error"); broadcast({ event: "wsStatus", data: "error" }); });
+  ws.on("error", (err) => {
+    addLog(`❌ Error WS: ${err.message}`, "error");
+    broadcast({ event: "wsStatus", data: "error" });
+  });
+
   ws.on("close", () => {
     clearInterval(pingInterval);
     addLog("🔄 Reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    for (const [, token] of state.monitored.entries()) { if (token.ticker) clearInterval(token.ticker); }
+    for (const [, token] of state.monitored.entries()) {
+      if (token.ticker) clearInterval(token.ticker);
+    }
     state.monitored.clear();
     setTimeout(connectHelius, 5000);
   });
 }
 
+// ── HTTP + WS SERVER ───────────────────────────────────────────
+
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 app.get("/api/state", (req, res) => {
   res.json({
     monitored: Array.from(state.monitored.values()).map(tokenToJSON),
@@ -486,15 +614,38 @@ app.get("/api/state", (req, res) => {
     stats: state.stats
   });
 });
-app.delete("/api/token/:mint", (req, res) => { stopMonitoring(req.params.mint); res.json({ ok: true }); });
+
+app.delete("/api/token/:mint", (req, res) => {
+  stopMonitoring(req.params.mint);
+  res.json({ ok: true });
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({ event: "fullState", data: { monitored: Array.from(state.monitored.values()).map(tokenToJSON), signals: state.signals.slice(0, 50), demoTrades: state.demoTrades.slice(0, 200), log: state.log.slice(0, 100), stats: state.stats, wsStatus: "connected" } }));
+  ws.send(JSON.stringify({
+    event: "fullState",
+    data: {
+      monitored: Array.from(state.monitored.values()).map(tokenToJSON),
+      signals: state.signals.slice(0, 50),
+      demoTrades: state.demoTrades.slice(0, 200),
+      log: state.log.slice(0, 100),
+      stats: state.stats,
+      wsStatus: "connected"
+    }
+  }));
   ws.on("close", () => frontendClients.delete(ws));
-  ws.on("message", (data) => { try { const msg = JSON.parse(data.toString()); if (msg.action === "removeToken") stopMonitoring(msg.mint); } catch {} });
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.action === "removeToken") stopMonitoring(msg.mint);
+    } catch {}
+  });
 });
 
-server.listen(PORT, () => { console.log(`🚀 SolScanBot corriendo en puerto ${PORT}`); connectHelius(); });
+server.listen(PORT, () => {
+  console.log(`🚀 SolScanBot corriendo en puerto ${PORT}`);
+  connectHelius();
+});
