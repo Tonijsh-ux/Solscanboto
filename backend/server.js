@@ -15,7 +15,6 @@ const MIN_MONITOR_MS = 2 * 60 * 1000;
 const TP_PCT = 1.9;
 const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
-const MAX_TOKEN_AGE_MS = 2 * 60 * 60 * 1000;
 
 const TRAILING_BREAKEVEN_AT = 0.30;
 const TRAILING_LOCK_AT      = 0.63;
@@ -41,7 +40,7 @@ const state = {
 };
 
 const frontendClients = new Set();
-const seenMints = new Map();
+const seenMints = new Map(); // mint → timestamp | 0 (0 = token viejo bloqueado)
 const signalCooldown = new Map();
 
 function addLog(msg, type = "info") {
@@ -400,7 +399,7 @@ function stopMonitoring(mint) {
  broadcast({ event: "removeToken", data: { mint } });
 }
 
-async function processNewToken(mint, price, volumeUSD, createdAt) {
+async function processNewToken(mint, price, volumeUSD) {
  if (seenMints.has(mint)) return;
 
  if (seenMints.size >= 5000) {
@@ -414,20 +413,6 @@ async function processNewToken(mint, price, volumeUSD, createdAt) {
 
  state.stats.seen++;
  broadcast({ event: "stats", data: state.stats });
-
- // ── Filtro de edad ─────────────────────────────────────────
- if (createdAt && createdAt > 0) {
-   const ageMs = Date.now() - createdAt;
-   const ageMin = Math.round(ageMs / 60000);
-   if (ageMs > MAX_TOKEN_AGE_MS) {
-     addLog(`⛔ Viejo (${ageMin}min): ${shortAddr(mint)}`, "filter");
-     return;
-   }
-   addLog(`🕐 Edad: ${ageMin}min — ${shortAddr(mint)}`, "info");
- } else {
-   addLog(`⚠️ Sin blockTime: ${shortAddr(mint)} — usando Date.now()`, "warn");
- }
- // ──────────────────────────────────────────────────────────
 
  const mc = price * 1_000_000_000;
  if (mc > 0 && mc < MIN_MC_USD) {
@@ -520,17 +505,21 @@ function connectHelius() {
      if (price <= 0) return;
 
      const logs = meta.logMessages || [];
-     const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
-
-     // blockTime viene en segundos Unix — lo convertimos a ms
-     // Puede estar en result.blockTime o en result.transaction.blockTime
-     const rawBlockTime = result?.blockTime ?? tx?.blockTime ?? null;
-     const createdAt = rawBlockTime ? rawBlockTime * 1000 : null;
+     const isCreate = logs.some(l =>
+       l.includes("InitializeMint") ||
+       l.includes("Instruction: Create")
+     );
 
      if (isCreate) {
-       await processNewToken(mint, price, volumeUSD, createdAt);
+       // Token nuevo — lo procesamos
+       await processNewToken(mint, price, volumeUSD);
      } else if (state.monitored.has(mint)) {
+       // Trade de token que ya monitorizamos — actualizar precio
        updateCandle(mint, price, volumeUSD);
+     } else if (!seenMints.has(mint)) {
+       // Trade de mint desconocido — token viejo, bloquearlo
+       seenMints.set(mint, 0);
+       addLog(`🚫 Bloqueado token viejo: ${shortAddr(mint)}`, "filter");
      }
    } catch {}
  });
@@ -597,6 +586,6 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot — blockTime filter + Trailing Stop`);
+ console.log(`🚀 SolScanBot — Solo tokens nuevos + Trailing Stop`);
  connectHelius();
 });
