@@ -163,7 +163,7 @@ setInterval(async () => {
  }
 }, 30_000);
 
-// ── PUMPPORTAL WEBSOCKET — detección tokens nuevos ─────────────
+// ── PUMPPORTAL WEBSOCKET ───────────────────────────────────────
 function connectPumpPortal() {
  addLog("🔌 Conectando a PumpPortal...", "info");
  const ws = new WebSocket(PUMPPORTAL_WS);
@@ -182,80 +182,74 @@ function connectPumpPortal() {
  ws.on("message", async (raw) => {
    try {
      const coin = JSON.parse(raw.toString());
-
-     // PumpPortal envía los datos del token nuevo directamente
      if (!coin.mint) return;
-     if (seenMints.has(coin.mint)) return;
-     seenMints.set(coin.mint, Date.now());
-     state.stats.seen++;
-     broadcast({ event: "stats", data: state.stats });
 
-     const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
-     if (mcUsd < MIN_MC_USD) {
-       addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.symbol}`, "filter");
-       return;
-     }
+     // ── Token nuevo ────────────────────────────────────────
+     if (coin.txType === undefined && coin.name) {
+       if (seenMints.has(coin.mint)) return;
+       seenMints.set(coin.mint, Date.now());
+       state.stats.seen++;
+       broadcast({ event: "stats", data: state.stats });
 
-     const twitter = coin.twitter || null;
-     const website = coin.website || null;
-     const telegram = coin.telegram || null;
-     if (!twitter && !website && !telegram) {
-       addLog(`⛔ Sin sociales: ${coin.name || coin.symbol}`, "filter");
-       return;
-     }
-
-     const price = mcUsd / 1_000_000_000;
-     state.stats.filtered++;
-     addLog(`🆕 ${coin.symbol} — MC ~$${Math.round(mcUsd)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
-     broadcast({ event: "stats", data: state.stats });
-
-     if (state.monitored.size >= MAX_MONITORED) {
-       let oldest = null;
-       for (const [, t] of state.monitored.entries()) {
-         const age = Date.now() - t.detectedAt;
-         if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
-       }
-       if (oldest) stopMonitoring(oldest.mint);
-       else {
-         addLog(`⚠️ Cola llena, descartando ${coin.symbol}`, "warn");
+       const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
+       if (mcUsd < MIN_MC_USD) {
+         addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.symbol}`, "filter");
          return;
        }
+
+       const twitter = coin.twitter || null;
+       const website = coin.website || null;
+       const telegram = coin.telegram || null;
+
+       const price = mcUsd / 1_000_000_000;
+       state.stats.filtered++;
+       addLog(`🆕 ${coin.symbol} — MC ~$${Math.round(mcUsd)}${twitter ? " 𝕏" : ""}${website ? " 🌐" : ""}${telegram ? " ✈️" : ""}`, "accept");
+       broadcast({ event: "stats", data: state.stats });
+
+       if (state.monitored.size >= MAX_MONITORED) {
+         let oldest = null;
+         for (const [, t] of state.monitored.entries()) {
+           const age = Date.now() - t.detectedAt;
+           if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
+         }
+         if (oldest) stopMonitoring(oldest.mint);
+         else {
+           addLog(`⚠️ Cola llena, descartando ${coin.symbol}`, "warn");
+           return;
+         }
+       }
+
+       startMonitoring({
+         mint: coin.mint,
+         name: coin.name || "Unknown",
+         symbol: coin.symbol || "???",
+         twitter, website, telegram,
+         mc: mcUsd,
+         price,
+         detectedAt: Date.now(),
+       });
+
+       // Suscribirse a trades de este token
+       ws.send(JSON.stringify({
+         method: "subscribeTokenTrade",
+         keys: [coin.mint]
+       }));
+       return;
      }
 
-     startMonitoring({
-       mint: coin.mint,
-       name: coin.name || "Unknown",
-       symbol: coin.symbol || "???",
-       twitter, website, telegram,
-       mc: mcUsd,
-       price,
-       detectedAt: Date.now(),
-     });
-
-     // Suscribirse a trades de este token para actualizar precio
-     ws.send(JSON.stringify({
-       method: "subscribeTokenTrade",
-       keys: [coin.mint]
-     }));
+     // ── Trade de token monitorizado — actualizar precio ────
+     if (coin.txType === "buy" || coin.txType === "sell") {
+       const mint = coin.mint;
+       if (!mint || !state.monitored.has(mint)) return;
+       const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
+       const price = mcUsd / 1_000_000_000;
+       const volumeUSD = (coin.solAmount || 0) * solPriceUSD;
+       if (price > 0) updateCandle(mint, price, volumeUSD);
+     }
 
    } catch (e) {
      console.log("PumpPortal msg error:", e.message);
    }
- });
-
- ws.on("message", async (raw) => {
-   try {
-     const data = JSON.parse(raw.toString());
-     // Actualizar precio si es un trade de token monitorizado
-     if (data.txType && (data.txType === "buy" || data.txType === "sell")) {
-       const mint = data.mint;
-       if (!mint || !state.monitored.has(mint)) return;
-       const mcUsd = (data.marketCapSol || 0) * solPriceUSD;
-       const price = mcUsd / 1_000_000_000;
-       const volumeUSD = (data.solAmount || 0) * solPriceUSD;
-       if (price > 0) updateCandle(mint, price, volumeUSD);
-     }
-   } catch {}
  });
 
  ws.on("error", (err) => {
@@ -712,7 +706,7 @@ function stopMonitoring(mint) {
  broadcast({ event: "removeToken", data: { mint } });
 }
 
-// ── HELIUS WEBSOCKET — solo precios ────────────────────────────
+// ── HELIUS WEBSOCKET — precios adicionales ─────────────────────
 function connectHelius() {
  addLog("🔌 Conectando a Helius...", "info");
  broadcast({ event: "wsStatus", data: "connecting" });
@@ -741,20 +735,16 @@ function connectHelius() {
      if (!tx) return;
      const meta = tx.meta;
      if (!meta || meta.err) return;
-
-     // Filtrar transacciones propias
      const accountKeys = tx.transaction?.message?.accountKeys || [];
      const walletPubkey = wallet?.publicKey?.toString();
      if (walletPubkey) {
        const isOwnTx = accountKeys.some(k => (k.pubkey || k) === walletPubkey);
        if (isOwnTx) return;
      }
-
      const tokenBalances = meta.postTokenBalances || [];
      if (tokenBalances.length === 0) return;
      const mint = tokenBalances[0]?.mint;
      if (!mint || !state.monitored.has(mint)) return;
-
      const preSOL = meta.preBalances?.[0] || 0;
      const postSOL = meta.postBalances?.[0] || 0;
      const solDiff = Math.abs(postSOL - preSOL) / 1e9;
