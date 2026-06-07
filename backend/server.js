@@ -3,6 +3,15 @@ import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import cors from "cors";
 import fetch from "node-fetch";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
+import bs58 from "bs58";
 
 const PORT = process.env.PORT || 3001;
 const MAX_MONITORED = 10;
@@ -12,33 +21,66 @@ const MIN_MC_USD = 1000;
 const CANDLE_MS = 1000;
 const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_MONITOR_MS = 2 * 60 * 1000;
-const TP_PCT = 1.9;   // +90%
-const SL_PCT = 0.88;  // -12%
+const TP_PCT = 1.9;
+const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
-const MAX_TOKEN_AGE_MS = 2 * 60 * 60 * 1000; // máximo 2 horas
+const MAX_TOKEN_AGE_MS = 2 * 60 * 60 * 1000;
+const SOL_PER_TRADE = 0.05;
+const MAX_REAL_TRADES = 10;
 
-// ── TRAILING STOP ──────────────────────────────────────────────
 const TRAILING_BREAKEVEN_AT = 0.30;
 const TRAILING_LOCK_AT      = 0.63;
 const TRAILING_LOCK_PCT     = 0.40;
 const TRAILING_FOLLOW_PCT   = 0.20;
-// ──────────────────────────────────────────────────────────────
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
+// ── WALLET ─────────────────────────────────────────────────────
+let wallet = null;
+let connection = null;
+
+function initWallet() {
+  try {
+    const privateKeyStr = process.env.WALLET_PRIVATE_KEY;
+    if (!privateKeyStr) {
+      addLog("⚠️ WALLET_PRIVATE_KEY no configurada — modo solo demo", "warn");
+      return;
+    }
+    const privateKeyBytes = bs58.decode(privateKeyStr);
+    wallet = Keypair.fromSecretKey(privateKeyBytes);
+    connection = new Connection(HELIUS_RPC, "confirmed");
+    addLog(`✅ Wallet cargada: ${wallet.publicKey.toString().slice(0, 8)}…`, "info");
+  } catch (e) {
+    addLog(`❌ Error cargando wallet: ${e.message}`, "error");
+  }
+}
+
+async function getWalletBalance() {
+  if (!wallet || !connection) return 0;
+  try {
+    const balance = await connection.getBalance(wallet.publicKey);
+    return balance / LAMPORTS_PER_SOL;
+  } catch { return 0; }
+}
 
 const state = {
   monitored: new Map(),
   signals: [],
   demoTrades: [],
+  realTrades: [],
   log: [],
   stats: {
     seen: 0, filtered: 0, signals: 0,
     demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0,
     demoPnL: 0,
+    realOpen: 0, realWins: 0, realLosses: 0, realExpired: 0,
+    realPnL: 0, realPnLSol: 0,
     avgMaxGain: 0, avgMaxLoss: 0,
     maxGainSum: 0, maxLossSum: 0, closedCount: 0,
+    walletBalance: 0,
   },
 };
 
@@ -102,20 +144,25 @@ async function updateSolPrice() {
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
 
+// Actualizar balance cada 30s
+setInterval(async () => {
+  if (wallet) {
+    state.stats.walletBalance = await getWalletBalance();
+    broadcast({ event: "stats", data: state.stats });
+  }
+}, 30_000);
+
 async function fetchTokenMetadata(mint) {
   try {
-    const res = await fetch(
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: "1", method: "getAsset",
-          params: { id: mint }
-        }),
-        signal: AbortSignal.timeout(5000),
-      }
-    );
+    const res = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: "1", method: "getAsset",
+        params: { id: mint }
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
     const data = await res.json();
     const meta = data?.result;
     if (!meta) return null;
@@ -126,7 +173,6 @@ async function fetchTokenMetadata(mint) {
     let telegram = null;
     let name = meta.content?.metadata?.name || null;
     let symbol = meta.content?.metadata?.symbol || null;
-
     if ((!twitter && !website) && jsonUri) {
       try {
         const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
@@ -138,16 +184,119 @@ async function fetchTokenMetadata(mint) {
         if (!symbol) symbol = j.symbol;
       } catch {}
     }
-
     return { twitter, website, telegram, name, symbol };
   } catch { return null; }
 }
 
-// ── DEMO TRADING ───────────────────────────────────────────────
+// ── PUMP.FUN BUY via API ───────────────────────────────────────
+async function buyToken(mint, solAmount) {
+  if (!wallet || !connection) return null;
+  try {
+    addLog(`💳 Comprando ${solAmount} SOL de ${shortAddr(mint)}...`, "real");
 
-function openDemoTrade(signal) {
+    // Usar Pump.fun API para obtener la tx de compra
+    const response = await fetch("https://pumpportal.fun/api/trade-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        publicKey: wallet.publicKey.toString(),
+        action: "buy",
+        mint: mint,
+        denominatedInSol: "true",
+        amount: solAmount,
+        slippage: 15,
+        priorityFee: 0.0005,
+        pool: "pump"
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      addLog(`❌ Error API compra: ${response.status}`, "error");
+      return null;
+    }
+
+    const txData = await response.arrayBuffer();
+    const tx = Transaction.from(new Uint8Array(txData));
+    tx.sign(wallet);
+
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+
+    await connection.confirmTransaction(signature, "confirmed");
+    addLog(`✅ COMPRA OK: ${shortAddr(mint)} | TX: ${signature.slice(0, 8)}…`, "real");
+    return signature;
+  } catch (e) {
+    addLog(`❌ Error compra: ${e.message}`, "error");
+    return null;
+  }
+}
+
+async function sellToken(mint, sellPercent = 100) {
+  if (!wallet || !connection) return null;
+  try {
+    addLog(`💳 Vendiendo ${sellPercent}% de ${shortAddr(mint)}...`, "real");
+
+    const response = await fetch("https://pumpportal.fun/api/trade-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        publicKey: wallet.publicKey.toString(),
+        action: "sell",
+        mint: mint,
+        denominatedInSol: "false",
+        amount: sellPercent / 100,
+        slippage: 15,
+        priorityFee: 0.0005,
+        pool: "pump"
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      addLog(`❌ Error API venta: ${response.status}`, "error");
+      return null;
+    }
+
+    const txData = await response.arrayBuffer();
+    const tx = Transaction.from(new Uint8Array(txData));
+    tx.sign(wallet);
+
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+
+    await connection.confirmTransaction(signature, "confirmed");
+    addLog(`✅ VENTA OK: ${shortAddr(mint)} | TX: ${signature.slice(0, 8)}…`, "real");
+    return signature;
+  } catch (e) {
+    addLog(`❌ Error venta: ${e.message}`, "error");
+    return null;
+  }
+}
+
+// ── REAL TRADING ───────────────────────────────────────────────
+async function openRealTrade(signal) {
+  if (!wallet) return;
+  if (state.realTrades.filter(t => t.status === "OPEN").length >= MAX_REAL_TRADES) {
+    addLog(`⚠️ Máximo de trades reales alcanzado`, "warn");
+    return;
+  }
+
+  const balance = await getWalletBalance();
+  if (balance < SOL_PER_TRADE + 0.01) {
+    addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL`, "warn");
+    return;
+  }
+
+  const signature = await buyToken(signal.mint, SOL_PER_TRADE);
+  if (!signature) return;
+
   const trade = {
-    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: `real-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     mint: signal.mint,
     symbol: signal.symbol,
     name: signal.name,
@@ -156,11 +305,15 @@ function openDemoTrade(signal) {
     tp: signal.tp,
     sl: signal.sl,
     initialSl: signal.sl,
+    solAmount: SOL_PER_TRADE,
+    buySignature: signature,
+    sellSignature: null,
     openTime: Date.now(),
     closeTime: null,
     closePrice: null,
     result: null,
     pnlPct: null,
+    pnlSol: null,
     maxGainPct: 0,
     maxLossPct: 0,
     currentPct: 0,
@@ -170,22 +323,141 @@ function openDemoTrade(signal) {
     expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
   };
 
+  state.realTrades.unshift(trade);
+  if (state.realTrades.length > 200) state.realTrades.pop();
+  state.stats.realOpen++;
+  state.stats.walletBalance = await getWalletBalance();
+
+  broadcast({ event: "newRealTrade", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+  addLog(`🔴 REAL ABIERTA: ${signal.symbol} | ${SOL_PER_TRADE} SOL | TP +90% | SL -12%`, "real");
+}
+
+async function closeRealTrade(trade, price, reason) {
+  if (trade.status !== "OPEN") return;
+
+  const signature = await sellToken(trade.mint, 100);
+  trade.sellSignature = signature;
+  trade.closePrice = price;
+  trade.closeTime = Date.now();
+  trade.status = "CLOSED";
+
+  const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+  trade.pnlPct = +pnlPct.toFixed(2);
+  trade.pnlSol = +(trade.solAmount * pnlPct / 100).toFixed(4);
+
+  const durationSec = Math.round((trade.closeTime - trade.openTime) / 1000);
+
+  if (reason === "TP" || (reason === "SL" && trade.pnlPct >= 0)) {
+    trade.result = "WIN";
+    state.stats.realWins++;
+    state.stats.realPnL += trade.pnlPct;
+    state.stats.realPnLSol += trade.pnlSol;
+    addLog(`✅ REAL WIN: ${trade.symbol} +${trade.pnlPct}% (+${trade.pnlSol} SOL) en ${durationSec}s`, "realwin");
+  } else if (reason === "SL") {
+    trade.result = "LOSS";
+    state.stats.realLosses++;
+    state.stats.realPnL += trade.pnlPct;
+    state.stats.realPnLSol += trade.pnlSol;
+    addLog(`❌ REAL LOSS: ${trade.symbol} ${trade.pnlPct}% (${trade.pnlSol} SOL) en ${durationSec}s`, "realloss");
+  } else {
+    trade.result = trade.pnlPct >= 0 ? "EXPIRED_WIN" : "EXPIRED_LOSS";
+    state.stats.realExpired++;
+    state.stats.realPnL += trade.pnlPct;
+    state.stats.realPnLSol += trade.pnlSol;
+    addLog(`⏱️ REAL EXP: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% (${trade.pnlSol} SOL)`, "real");
+  }
+
+  state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
+  state.stats.walletBalance = await getWalletBalance();
+
+  broadcast({ event: "realTradeClosed", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+}
+
+function updateRealTrades(mint, price) {
+  const now = Date.now();
+  for (const trade of state.realTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN") continue;
+
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+
+    // Trailing stop en trades reales
+    updateTrailingStopReal(trade, price);
+
+    if (price >= trade.tp) {
+      closeRealTrade(trade, price, "TP");
+    } else if (price <= trade.sl) {
+      closeRealTrade(trade, price, "SL");
+    } else if (now >= trade.expiresAt) {
+      closeRealTrade(trade, price, "EXPIRED");
+    } else {
+      broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
+  }
+}
+
+function updateTrailingStopReal(trade, price) {
+  const gainPct = (price - trade.entryPrice) / trade.entryPrice;
+  if (trade.trailingPhase === "FOLLOWING") {
+    const newSl = price * (1 - TRAILING_FOLLOW_PCT);
+    if (newSl > trade.sl) trade.sl = +newSl.toFixed(10);
+    return;
+  }
+  if (gainPct >= TRAILING_LOCK_AT) {
+    const newSl = price * (1 - TRAILING_FOLLOW_PCT);
+    trade.trailingPhase = "FOLLOWING";
+    trade.sl = +Math.max(trade.sl, newSl).toFixed(10);
+    addLog(`🔄 REAL FOLLOWING: ${trade.symbol} SL sigue precio -20%`, "real");
+    return;
+  }
+  if (gainPct >= TRAILING_BREAKEVEN_AT && trade.trailingPhase === "INITIAL") {
+    trade.trailingPhase = "BREAKEVEN";
+    trade.sl = +trade.entryPrice.toFixed(10);
+    addLog(`⚖️ REAL BREAKEVEN: ${trade.symbol} SL → entrada`, "real");
+  }
+}
+
+// Expiración cada 30s
+setInterval(() => {
+  const now = Date.now();
+  for (const trade of state.realTrades) {
+    if (trade.status !== "OPEN") continue;
+    if (now >= trade.expiresAt) {
+      const token = state.monitored.get(trade.mint);
+      const price = token?.price || trade.entryPrice;
+      closeRealTrade(trade, price, "EXPIRED");
+    }
+  }
+}, 30_000);
+
+// ── DEMO TRADING ───────────────────────────────────────────────
+function openDemoTrade(signal) {
+  const trade = {
+    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    mint: signal.mint, symbol: signal.symbol, name: signal.name,
+    zone: signal.zone, entryPrice: signal.price,
+    tp: signal.tp, sl: signal.sl, initialSl: signal.sl,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null,
+    maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    trailingPhase: "INITIAL", trailingLevel: null,
+    status: "OPEN", expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
+  };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
-
-  const tpPct = ((TP_PCT - 1) * 100).toFixed(0);
-  const slPct = ((1 - SL_PCT) * 100).toFixed(0);
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +${tpPct}% | SL -${slPct}% | Trailing activo`, "demo");
+  addLog(`📝 DEMO: ${signal.symbol} @ ${signal.price.toExponential(3)} | TP +90% | SL -12%`, "demo");
   return trade;
 }
 
-// ── TRAILING STOP LOGIC ────────────────────────────────────────
 function updateTrailingStop(trade, price) {
   const gainPct = (price - trade.entryPrice) / trade.entryPrice;
-
   if (trade.trailingPhase === "FOLLOWING") {
     const newSl = price * (1 - TRAILING_FOLLOW_PCT);
     if (newSl > trade.sl) {
@@ -195,7 +467,6 @@ function updateTrailingStop(trade, price) {
     }
     return;
   }
-
   if (gainPct >= TRAILING_LOCK_AT) {
     const newSl = price * (1 - TRAILING_FOLLOW_PCT);
     trade.trailingPhase = "FOLLOWING";
@@ -205,14 +476,12 @@ function updateTrailingStop(trade, price) {
     broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
     return;
   }
-
   if (gainPct >= TRAILING_BREAKEVEN_AT && trade.trailingPhase === "INITIAL") {
     trade.trailingPhase = "BREAKEVEN";
     trade.sl = +trade.entryPrice.toFixed(10);
     trade.trailingLevel = 0;
     addLog(`⚖️ BREAKEVEN: ${trade.symbol} SL → entrada (0%)`, "trail");
     broadcast({ event: "demoTradeUpdate", data: { id: trade.id, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
-    return;
   }
 }
 
@@ -223,38 +492,32 @@ function closeDemoTrade(trade, price, reason) {
   const durationSec = Math.round((trade.closeTime - trade.openTime) / 1000);
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
-
   if (reason === "TP") {
     trade.result = "WIN";
     state.stats.demoWins++;
-    const tpGainPct = (TP_PCT - 1) * 100;
-    state.stats.demoPnL += tpGainPct;
-    addLog(`✅ WIN [TP]: ${trade.symbol} +${tpGainPct.toFixed(0)}% en ${durationSec}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "win");
+    state.stats.demoPnL += (TP_PCT - 1) * 100;
+    addLog(`✅ WIN [TP]: ${trade.symbol} +${((TP_PCT-1)*100).toFixed(0)}% en ${durationSec}s`, "win");
   } else if (reason === "SL") {
     state.stats.demoPnL += trade.pnlPct;
     if (trade.pnlPct >= 0) {
-      trade.result = "WIN";
-      state.stats.demoWins++;
+      trade.result = "WIN"; state.stats.demoWins++;
       addLog(`✅ WIN [${trade.trailingPhase}]: ${trade.symbol} +${trade.pnlPct}% en ${durationSec}s`, "win");
     } else {
-      trade.result = "LOSS";
-      state.stats.demoLosses++;
-      addLog(`❌ LOSS [${trade.trailingPhase}]: ${trade.symbol} ${trade.pnlPct}% en ${durationSec}s | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "loss");
+      trade.result = "LOSS"; state.stats.demoLosses++;
+      addLog(`❌ LOSS [${trade.trailingPhase}]: ${trade.symbol} ${trade.pnlPct}% en ${durationSec}s`, "loss");
     }
   } else {
     trade.result = trade.pnlPct >= 0 ? "EXPIRED_WIN" : "EXPIRED_LOSS";
     state.stats.demoExpired++;
     state.stats.demoPnL += trade.pnlPct;
-    addLog(`⏱️ EXP: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% | MaxGain: +${trade.maxGainPct.toFixed(1)}%`, "expire");
+    addLog(`⏱️ EXP: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}%`, "expire");
   }
-
   state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
   state.stats.maxGainSum += trade.maxGainPct;
   state.stats.maxLossSum += Math.abs(trade.maxLossPct);
   state.stats.closedCount++;
   state.stats.avgMaxGain = +(state.stats.maxGainSum / state.stats.closedCount).toFixed(1);
   state.stats.avgMaxLoss = +(state.stats.maxLossSum / state.stats.closedCount).toFixed(1);
-
   broadcast({ event: "demoTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
 }
@@ -263,34 +526,15 @@ function updateDemoTrades(mint, price) {
   const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN") continue;
-
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-
     updateTrailingStop(trade, price);
-
-    if (price >= trade.tp) {
-      closeDemoTrade(trade, price, "TP");
-    } else if (price <= trade.sl) {
-      closeDemoTrade(trade, price, "SL");
-    } else if (now >= trade.expiresAt) {
-      closeDemoTrade(trade, price, "EXPIRED");
-    } else {
-      broadcast({
-        event: "demoTradeUpdate",
-        data: {
-          id: trade.id,
-          currentPct: trade.currentPct,
-          maxGainPct: trade.maxGainPct,
-          maxLossPct: trade.maxLossPct,
-          sl: trade.sl,
-          trailingPhase: trade.trailingPhase,
-          trailingLevel: trade.trailingLevel,
-        }
-      });
-    }
+    if (price >= trade.tp) closeDemoTrade(trade, price, "TP");
+    else if (price <= trade.sl) closeDemoTrade(trade, price, "SL");
+    else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED");
+    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct, sl: trade.sl, trailingPhase: trade.trailingPhase, trailingLevel: trade.trailingLevel } });
   }
 }
 
@@ -300,20 +544,16 @@ setInterval(() => {
     if (trade.status !== "OPEN") continue;
     if (now >= trade.expiresAt) {
       const token = state.monitored.get(trade.mint);
-      const price = token?.price || trade.entryPrice;
-      closeDemoTrade(trade, price, "EXPIRED");
+      closeDemoTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
     }
   }
 }, 30_000);
-
-// ── CANDLES ────────────────────────────────────────────────────
 
 function updateCandle(mint, price, volumeUSD = 0) {
   const token = state.monitored.get(mint);
   if (!token) return;
   const now = Date.now();
   const currentSecond = Math.floor(now / CANDLE_MS) * CANDLE_MS;
-
   if (!token.currentCandle || token.currentCandle.time !== currentSecond) {
     if (token.currentCandle) {
       token.candles.push({ ...token.currentCandle });
@@ -326,7 +566,6 @@ function updateCandle(mint, price, volumeUSD = 0) {
     token.currentCandle.low = Math.min(token.currentCandle.low, price);
     token.currentCandle.close = price;
   }
-
   token.price = price;
   token.priceHigh = Math.max(token.priceHigh || 0, price);
   token.priceLow = token.priceLow === 0 ? price : Math.min(token.priceLow, price);
@@ -334,25 +573,21 @@ function updateCandle(mint, price, volumeUSD = 0) {
   token.volumeUSD = (token.volumeUSD || 0) + volumeUSD;
   token.lastUpdate = now;
   token.mc = price * 1_000_000_000;
-
   if (token.mc < MIN_MC_USD * 0.5) {
-    addLog(`🗑️ ${token.symbol} eliminado — MC cayó a $${Math.round(token.mc)}`, "filter");
+    addLog(`🗑️ ${token.symbol} eliminado — MC $${Math.round(token.mc)}`, "filter");
     stopMonitoring(mint);
     return;
   }
-
   const allCandles = [...token.candles, token.currentCandle];
   const bb = calcBollinger(allCandles);
   token.bb = bb;
   token.candleCount = allCandles.length;
   token.candles50 = allCandles.slice(-50);
-
   updateDemoTrades(mint, price);
+  updateRealTrades(mint, price);
   if (bb) checkSignal(mint, price, bb, allCandles.length);
   broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
 }
-
-// ── SEÑALES ────────────────────────────────────────────────────
 
 function checkSignal(mint, price, bb, candleCount) {
   if (candleCount < BOLLINGER_PERIOD) return;
@@ -366,10 +601,8 @@ function checkSignal(mint, price, bb, candleCount) {
     const dropFromHigh = (token.priceHigh - price) / token.priceHigh;
     if (dropFromHigh > 0.35) return;
   }
-
   const touchedLower = price <= bb.lower * 1.02;
   const touchedMiddle = !touchedLower && Math.abs(price - bb.middle) / bb.middle < 0.015;
-
   if (touchedLower || touchedMiddle) {
     const zone = touchedLower ? "LOWER" : "MIDDLE";
     const tp = +(price * TP_PCT).toFixed(10);
@@ -380,24 +613,21 @@ function checkSignal(mint, price, bb, candleCount) {
     token.sl = sl;
     signalCooldown.set(mint, Date.now());
     state.stats.signals++;
-
     const signal = {
       id: `${mint}-${Date.now()}`,
       mint, name: token.name, symbol: token.symbol,
       zone, price, tp, sl, time: Date.now(), status: "OPEN",
       tradeCount: token.tradeCount, volumeUSD: token.volumeUSD,
     };
-
     state.signals.unshift(signal);
     if (state.signals.length > 100) state.signals.pop();
     addLog(`🎯 SEÑAL ${zone} en ${token.symbol} @ ${price.toExponential(3)}`, "signal");
     broadcast({ event: "newSignal", data: signal });
     broadcast({ event: "stats", data: state.stats });
     openDemoTrade(signal);
+    openRealTrade(signal); // Ejecutar trade real
   }
 }
-
-// ── MONITORING ─────────────────────────────────────────────────
 
 function startMonitoring(token) {
   if (state.monitored.has(token.mint)) return;
@@ -408,13 +638,11 @@ function startMonitoring(token) {
     tradeCount: 0, volumeUSD: 0, ticker: null,
   };
   state.monitored.set(token.mint, entry);
-
   entry.ticker = setInterval(() => {
     const t = state.monitored.get(token.mint);
     if (!t) { clearInterval(entry.ticker); return; }
     if (t.price > 0) updateCandle(token.mint, t.price, 0);
   }, CANDLE_MS);
-
   addLog(`📊 Monitorizando ${token.symbol || shortAddr(token.mint)}`, "monitor");
   broadcast({ event: "newToken", data: tokenToJSON(entry) });
   broadcast({ event: "stats", data: state.stats });
@@ -429,7 +657,6 @@ function stopMonitoring(mint) {
 
 async function processNewToken(mint, price, volumeUSD, createdAt) {
   if (seenMints.has(mint)) return;
-
   if (seenMints.size >= 5000) {
     let oldestMint = null, oldestTime = Infinity;
     for (const [m, t] of seenMints.entries()) {
@@ -438,11 +665,8 @@ async function processNewToken(mint, price, volumeUSD, createdAt) {
     if (oldestMint) seenMints.delete(oldestMint);
   }
   seenMints.set(mint, Date.now());
-
   state.stats.seen++;
   broadcast({ event: "stats", data: state.stats });
-
-  // ── Filtro de edad usando blockTime de Helius ──────────────
   if (createdAt) {
     const ageMs = Date.now() - createdAt;
     const ageMin = Math.round(ageMs / 60000);
@@ -450,28 +674,21 @@ async function processNewToken(mint, price, volumeUSD, createdAt) {
       addLog(`⛔ Token viejo (${ageMin}min): ${shortAddr(mint)}`, "filter");
       return;
     }
-    addLog(`🕐 Token de ${ageMin}min aceptado para revisión`, "info");
   }
-  // ──────────────────────────────────────────────────────────
-
   const mc = price * 1_000_000_000;
   if (mc > 0 && mc < MIN_MC_USD) {
     addLog(`⛔ MC bajo ($${Math.round(mc)}): ${shortAddr(mint)}`, "filter");
     return;
   }
-
   const meta = await fetchTokenMetadata(mint);
   if (!meta) { addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter"); return; }
-
   const { twitter, website, telegram, name, symbol } = meta;
   if (!twitter && !website && !telegram) {
     addLog(`⛔ Sin sociales: ${name || shortAddr(mint)}`, "filter");
     return;
   }
-
   state.stats.filtered++;
   addLog(`✅ ${symbol} — MC ~$${Math.round(mc)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
-
   if (state.monitored.size >= MAX_MONITORED) {
     let oldest = null;
     for (const [, t] of state.monitored.entries()) {
@@ -481,23 +698,17 @@ async function processNewToken(mint, price, volumeUSD, createdAt) {
     if (oldest) stopMonitoring(oldest.mint);
     else { addLog(`⚠️ Cola llena, descartando ${symbol}`, "warn"); return; }
   }
-
   startMonitoring({ mint, name: name || "Unknown", symbol: symbol || "???", twitter, website, telegram, mc, price, detectedAt: Date.now() });
 }
-
-// ── HELIUS WS ──────────────────────────────────────────────────
 
 function connectHelius() {
   addLog("🔌 Conectando a Helius...", "info");
   broadcast({ event: "wsStatus", data: "connecting" });
-
   const ws = new WebSocket(HELIUS_WS);
   let pingInterval;
-
   ws.on("open", () => {
     addLog("✅ Helius conectado 🚀", "info");
     broadcast({ event: "wsStatus", data: "connected" });
-
     ws.send(JSON.stringify({
       jsonrpc: "2.0", id: 420,
       method: "transactionSubscribe",
@@ -506,14 +717,10 @@ function connectHelius() {
         { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
       ]
     }));
-
     pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
     }, 20_000);
   });
-
   ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -522,16 +729,13 @@ function connectHelius() {
       if (!tx) return;
       const meta = tx.meta;
       if (!meta || meta.err) return;
-
       const tokenBalances = meta.postTokenBalances || [];
       if (tokenBalances.length === 0) return;
       const mint = tokenBalances[0]?.mint;
       if (!mint) return;
-
       const preSOL = meta.preBalances?.[0] || 0;
       const postSOL = meta.postBalances?.[0] || 0;
       const solDiff = Math.abs(postSOL - preSOL) / 1e9;
-
       let tokenDiff = 0;
       const preTokenBalances = meta.preTokenBalances || [];
       for (const post of tokenBalances) {
@@ -540,80 +744,55 @@ function connectHelius() {
         const preAmt = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
         if (Math.abs(postAmt - preAmt) > 0) { tokenDiff = Math.abs(postAmt - preAmt); break; }
       }
-
       if (solDiff === 0 || tokenDiff === 0) return;
       const price = (solDiff / tokenDiff) * solPriceUSD;
       const volumeUSD = solDiff * solPriceUSD;
       if (price <= 0) return;
-
       const logs = meta.logMessages || [];
       const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
-
-      // ── blockTime = timestamp real de la tx en segundos Unix ──
-      const blockTime = result?.blockTime || result?.slot
-        ? result.blockTime * 1000
-        : Date.now();
-
-      if (isCreate) {
-        await processNewToken(mint, price, volumeUSD, blockTime);
-      } else if (state.monitored.has(mint)) {
-        updateCandle(mint, price, volumeUSD);
-      }
+      const blockTime = result?.blockTime ? result.blockTime * 1000 : null;
+      if (isCreate) await processNewToken(mint, price, volumeUSD, blockTime);
+      else if (state.monitored.has(mint)) updateCandle(mint, price, volumeUSD);
     } catch {}
   });
-
-  ws.on("error", (err) => {
-    addLog(`❌ Error WS: ${err.message}`, "error");
-    broadcast({ event: "wsStatus", data: "error" });
-  });
-
+  ws.on("error", (err) => { addLog(`❌ Error WS: ${err.message}`, "error"); broadcast({ event: "wsStatus", data: "error" }); });
   ws.on("close", () => {
     clearInterval(pingInterval);
     addLog("🔄 Reconectando en 5s...", "warn");
     broadcast({ event: "wsStatus", data: "disconnected" });
-    for (const [, token] of state.monitored.entries()) {
-      if (token.ticker) clearInterval(token.ticker);
-    }
+    for (const [, token] of state.monitored.entries()) { if (token.ticker) clearInterval(token.ticker); }
     state.monitored.clear();
     setTimeout(connectHelius, 5000);
   });
 }
 
-// ── HTTP + WS SERVER ───────────────────────────────────────────
-
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 app.get("/api/state", (req, res) => {
   res.json({
     monitored: Array.from(state.monitored.values()).map(tokenToJSON),
     signals: state.signals.slice(0, 50),
     demoTrades: state.demoTrades.slice(0, 200),
+    realTrades: state.realTrades.slice(0, 200),
     log: state.log.slice(0, 100),
     stats: state.stats
   });
 });
-
-app.delete("/api/token/:mint", (req, res) => {
-  stopMonitoring(req.params.mint);
-  res.json({ ok: true });
-});
+app.delete("/api/token/:mint", (req, res) => { stopMonitoring(req.params.mint); res.json({ ok: true }); });
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
-
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
   ws.send(JSON.stringify({
-    event: "fullState",
-    data: {
+    event: "fullState", data: {
       monitored: Array.from(state.monitored.values()).map(tokenToJSON),
       signals: state.signals.slice(0, 50),
       demoTrades: state.demoTrades.slice(0, 200),
+      realTrades: state.realTrades.slice(0, 200),
       log: state.log.slice(0, 100),
-      stats: state.stats,
-      wsStatus: "connected"
+      stats: state.stats, wsStatus: "connected"
     }
   }));
   ws.on("close", () => frontendClients.delete(ws));
@@ -626,6 +805,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot — blockTime age filter + Trailing Stop`);
+  console.log(`🚀 SolScanBot — Real Trading Activo`);
+  initWallet();
   connectHelius();
 });
