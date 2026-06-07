@@ -163,15 +163,51 @@ setInterval(async () => {
  }
 }, 30_000);
 
+// ── HELIUS — metadata ──────────────────────────────────────────
+async function fetchTokenMetadata(mint) {
+ try {
+   const res = await fetch(HELIUS_RPC, {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+     body: JSON.stringify({
+       jsonrpc: "2.0", id: "1", method: "getAsset",
+       params: { id: mint }
+     }),
+     signal: AbortSignal.timeout(5000),
+   });
+   const data = await res.json();
+   const meta = data?.result;
+   if (!meta) return null;
+   const links = meta.content?.links || {};
+   const jsonUri = meta.content?.json_uri;
+   let twitter = links.twitter || null;
+   let website = links.external_url || null;
+   let telegram = null;
+   let name = meta.content?.metadata?.name || null;
+   let symbol = meta.content?.metadata?.symbol || null;
+   if (jsonUri) {
+     try {
+       const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
+       const j = await r.json();
+       twitter = twitter || j.twitter || j.extensions?.twitter || null;
+       website = website || j.website || j.extensions?.website || null;
+       telegram = j.telegram || j.extensions?.telegram || null;
+       if (!name) name = j.name;
+       if (!symbol) symbol = j.symbol;
+     } catch {}
+   }
+   return { twitter, website, telegram, name, symbol };
+ } catch { return null; }
+}
+
 // ── PUMPPORTAL WEBSOCKET ───────────────────────────────────────
 function connectPumpPortal() {
  addLog("🔌 Conectando a PumpPortal...", "info");
  const ws = new WebSocket(PUMPPORTAL_WS);
  let pingInterval;
- let msgCount = 0;
 
  ws.on("open", () => {
-   addLog("✅ PumpPortal conectado", "info");
+   addLog("✅ PumpPortal conectado — escuchando tokens nuevos", "info");
    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
    pingInterval = setInterval(() => {
      if (ws.readyState === WebSocket.OPEN) {
@@ -184,67 +220,10 @@ function connectPumpPortal() {
    try {
      const coin = JSON.parse(raw.toString());
 
-     // Log primeros 5 mensajes para ver el formato
-     if (msgCount < 5) {
-       msgCount++;
-       addLog(`📨 PP[${msgCount}]: ${JSON.stringify(coin).slice(0, 200)}`, "info");
-     }
+     // Ignorar mensajes de confirmación
+     if (coin.message) return;
 
-     if (!coin.mint) return;
-
-     // Token nuevo — no tiene txType
-     if (!coin.txType) {
-       if (seenMints.has(coin.mint)) return;
-       seenMints.set(coin.mint, Date.now());
-       state.stats.seen++;
-       broadcast({ event: "stats", data: state.stats });
-
-       const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
-       if (mcUsd < MIN_MC_USD) {
-         addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.symbol}`, "filter");
-         return;
-       }
-
-       const twitter = coin.twitter || null;
-       const website = coin.website || null;
-       const telegram = coin.telegram || null;
-       const price = mcUsd / 1_000_000_000;
-
-       state.stats.filtered++;
-       addLog(`🆕 ${coin.symbol} — MC ~$${Math.round(mcUsd)}${twitter ? " 𝕏" : ""}${website ? " 🌐" : ""}${telegram ? " ✈️" : ""}`, "accept");
-       broadcast({ event: "stats", data: state.stats });
-
-       if (state.monitored.size >= MAX_MONITORED) {
-         let oldest = null;
-         for (const [, t] of state.monitored.entries()) {
-           const age = Date.now() - t.detectedAt;
-           if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
-         }
-         if (oldest) stopMonitoring(oldest.mint);
-         else {
-           addLog(`⚠️ Cola llena, descartando ${coin.symbol}`, "warn");
-           return;
-         }
-       }
-
-       startMonitoring({
-         mint: coin.mint,
-         name: coin.name || "Unknown",
-         symbol: coin.symbol || "???",
-         twitter, website, telegram,
-         mc: mcUsd,
-         price,
-         detectedAt: Date.now(),
-       });
-
-       ws.send(JSON.stringify({
-         method: "subscribeTokenTrade",
-         keys: [coin.mint]
-       }));
-       return;
-     }
-
-     // Trade — actualizar precio
+     // ── Trade de token monitorizado — actualizar precio ────
      if (coin.txType === "buy" || coin.txType === "sell") {
        const mint = coin.mint;
        if (!mint || !state.monitored.has(mint)) return;
@@ -252,7 +231,65 @@ function connectPumpPortal() {
        const price = mcUsd / 1_000_000_000;
        const volumeUSD = (coin.solAmount || 0) * solPriceUSD;
        if (price > 0) updateCandle(mint, price, volumeUSD);
+       return;
      }
+
+     // ── Token nuevo — tiene mint pero no txType ────────────
+     if (!coin.mint) return;
+     if (seenMints.has(coin.mint)) return;
+     seenMints.set(coin.mint, Date.now());
+     state.stats.seen++;
+     broadcast({ event: "stats", data: state.stats });
+
+     const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
+     if (mcUsd < MIN_MC_USD) {
+       addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.mint.slice(0,8)}`, "filter");
+       return;
+     }
+
+     // Obtener metadatos desde Helius
+     addLog(`🔍 Buscando metadata: ${coin.mint.slice(0,8)}...`, "info");
+     const meta = await fetchTokenMetadata(coin.mint);
+     if (!meta) {
+       addLog(`⛔ Sin metadata: ${coin.mint.slice(0,8)}`, "filter");
+       return;
+     }
+
+     const { twitter, website, telegram, name, symbol } = meta;
+     const price = mcUsd / 1_000_000_000;
+
+     state.stats.filtered++;
+     addLog(`🆕 ${symbol || coin.mint.slice(0,8)} — MC ~$${Math.round(mcUsd)}${twitter ? " 𝕏" : ""}${website ? " 🌐" : ""}${telegram ? " ✈️" : ""}`, "accept");
+     broadcast({ event: "stats", data: state.stats });
+
+     if (state.monitored.size >= MAX_MONITORED) {
+       let oldest = null;
+       for (const [, t] of state.monitored.entries()) {
+         const age = Date.now() - t.detectedAt;
+         if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
+       }
+       if (oldest) stopMonitoring(oldest.mint);
+       else {
+         addLog(`⚠️ Cola llena, descartando ${symbol}`, "warn");
+         return;
+       }
+     }
+
+     startMonitoring({
+       mint: coin.mint,
+       name: name || "Unknown",
+       symbol: symbol || "???",
+       twitter, website, telegram,
+       mc: mcUsd,
+       price,
+       detectedAt: Date.now(),
+     });
+
+     // Suscribirse a trades de este token
+     ws.send(JSON.stringify({
+       method: "subscribeTokenTrade",
+       keys: [coin.mint]
+     }));
 
    } catch (e) {
      console.log("PumpPortal msg error:", e.message);
