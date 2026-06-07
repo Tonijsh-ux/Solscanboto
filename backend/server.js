@@ -45,6 +45,7 @@ let connection = null;
 function initWallet() {
   try {
     const privateKeyStr = process.env.WALLET_PRIVATE_KEY;
+    addLog(`🔑 Key length: ${privateKeyStr?.length || 0} | First 4: ${privateKeyStr?.slice(0,4) || 'NONE'}`, "info");
     if (!privateKeyStr) {
       addLog("⚠️ WALLET_PRIVATE_KEY no configurada — modo solo demo", "warn");
       return;
@@ -57,6 +58,7 @@ function initWallet() {
     addLog(`❌ Error cargando wallet: ${e.message}`, "error");
   }
 }
+
 
 async function getWalletBalance() {
   if (!wallet || !connection) return 0;
