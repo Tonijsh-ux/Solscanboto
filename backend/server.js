@@ -168,9 +168,10 @@ function connectPumpPortal() {
  addLog("🔌 Conectando a PumpPortal...", "info");
  const ws = new WebSocket(PUMPPORTAL_WS);
  let pingInterval;
+ let msgCount = 0;
 
  ws.on("open", () => {
-   addLog("✅ PumpPortal conectado — escuchando tokens nuevos", "info");
+   addLog("✅ PumpPortal conectado", "info");
    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
    pingInterval = setInterval(() => {
      if (ws.readyState === WebSocket.OPEN) {
@@ -182,10 +183,17 @@ function connectPumpPortal() {
  ws.on("message", async (raw) => {
    try {
      const coin = JSON.parse(raw.toString());
+
+     // Log primeros 5 mensajes para ver el formato
+     if (msgCount < 5) {
+       msgCount++;
+       addLog(`📨 PP[${msgCount}]: ${JSON.stringify(coin).slice(0, 200)}`, "info");
+     }
+
      if (!coin.mint) return;
 
-     // ── Token nuevo ────────────────────────────────────────
-     if (coin.txType === undefined && coin.name) {
+     // Token nuevo — no tiene txType
+     if (!coin.txType) {
        if (seenMints.has(coin.mint)) return;
        seenMints.set(coin.mint, Date.now());
        state.stats.seen++;
@@ -200,8 +208,8 @@ function connectPumpPortal() {
        const twitter = coin.twitter || null;
        const website = coin.website || null;
        const telegram = coin.telegram || null;
-
        const price = mcUsd / 1_000_000_000;
+
        state.stats.filtered++;
        addLog(`🆕 ${coin.symbol} — MC ~$${Math.round(mcUsd)}${twitter ? " 𝕏" : ""}${website ? " 🌐" : ""}${telegram ? " ✈️" : ""}`, "accept");
        broadcast({ event: "stats", data: state.stats });
@@ -229,7 +237,6 @@ function connectPumpPortal() {
          detectedAt: Date.now(),
        });
 
-       // Suscribirse a trades de este token
        ws.send(JSON.stringify({
          method: "subscribeTokenTrade",
          keys: [coin.mint]
@@ -237,7 +244,7 @@ function connectPumpPortal() {
        return;
      }
 
-     // ── Trade de token monitorizado — actualizar precio ────
+     // Trade — actualizar precio
      if (coin.txType === "buy" || coin.txType === "sell") {
        const mint = coin.mint;
        if (!mint || !state.monitored.has(mint)) return;
