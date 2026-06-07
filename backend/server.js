@@ -8,7 +8,6 @@ import {
   Keypair,
   PublicKey,
   VersionedTransaction,
-  SystemProgram,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -24,19 +23,19 @@ const MIN_MONITOR_MS = 2 * 60 * 1000;
 const TP_PCT = 1.9;
 const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
-const MAX_TOKEN_AGE_MS = 2 * 60 * 60 * 1000;
+const MAX_TOKEN_AGE_MS = 5 * 60 * 1000; // 5 minutos máximo
 const SOL_PER_TRADE = 0.05;
 const MAX_REAL_TRADES = 1;
 
 const TRAILING_BREAKEVEN_AT = 0.30;
 const TRAILING_LOCK_AT      = 0.63;
-const TRAILING_LOCK_PCT     = 0.40;
 const TRAILING_FOLLOW_PCT   = 0.20;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMP_API = "https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC&includeNsfw=false";
 
 // ── WALLET ─────────────────────────────────────────────────────
 let wallet = null;
@@ -67,18 +66,15 @@ async function getWalletBalance() {
   } catch { return 0; }
 }
 
-// ── OBTENER BALANCE REAL DE TOKEN ──────────────────────────────
 async function getTokenBalance(mint) {
   if (!wallet || !connection) return 0;
   try {
     const mintPubkey = new PublicKey(mint);
-    const walletPubkey = wallet.publicKey;
-    const accounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, { mint: mintPubkey });
+    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: mintPubkey });
     if (accounts.value.length === 0) return 0;
-    const amount = accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount;
-    return amount || 0;
+    return accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
   } catch (e) {
-    addLog(`❌ Error obteniendo balance token: ${e.message}`, "error");
+    addLog(`❌ Error balance token: ${e.message}`, "error");
     return 0;
   }
 }
@@ -169,41 +165,77 @@ setInterval(async () => {
   }
 }, 30_000);
 
-async function fetchTokenMetadata(mint) {
+// ── PUMP.FUN API — detección de tokens nuevos ──────────────────
+async function fetchNewPumpTokens() {
   try {
-    const res = await fetch(HELIUS_RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: "1", method: "getAsset",
-        params: { id: mint }
-      }),
+    const res = await fetch(PUMP_API, {
       signal: AbortSignal.timeout(5000),
     });
-    const data = await res.json();
-    const meta = data?.result;
-    if (!meta) return null;
-    const links = meta.content?.links || {};
-    const jsonUri = meta.content?.json_uri;
-    let twitter = links.twitter || null;
-    let website = links.external_url || null;
-    let telegram = null;
-    let name = meta.content?.metadata?.name || null;
-    let symbol = meta.content?.metadata?.symbol || null;
-    if ((!twitter && !website) && jsonUri) {
-      try {
-        const r = await fetch(jsonUri, { signal: AbortSignal.timeout(3000) });
-        const j = await r.json();
-        twitter = twitter || j.twitter || j.extensions?.twitter || null;
-        website = website || j.website || j.extensions?.website || null;
-        telegram = j.telegram || j.extensions?.telegram || null;
-        if (!name) name = j.name;
-        if (!symbol) symbol = j.symbol;
-      } catch {}
+    if (!res.ok) return;
+    const coins = await res.json();
+    if (!Array.isArray(coins)) return;
+
+    for (const coin of coins) {
+      const createdAt = coin.created_timestamp;
+      if (!createdAt) continue;
+      const ageMs = Date.now() - createdAt;
+      if (ageMs > MAX_TOKEN_AGE_MS) continue; // Más de 5 minutos, ignorar
+      if (seenMints.has(coin.mint)) continue;
+
+      const mcUsd = coin.usd_market_cap || 0;
+      if (mcUsd < MIN_MC_USD) {
+        addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.symbol}`, "filter");
+        continue;
+      }
+
+      // Filtro sociales
+      const twitter = coin.twitter || null;
+      const website = coin.website || null;
+      const telegram = coin.telegram || null;
+      if (!twitter && !website && !telegram) {
+        addLog(`⛔ Sin sociales: ${coin.name || coin.symbol}`, "filter");
+        seenMints.set(coin.mint, Date.now());
+        continue;
+      }
+
+      const price = mcUsd / 1_000_000_000;
+      addLog(`🆕 Nuevo token (${Math.round(ageMs/1000)}s): ${coin.symbol} — MC ~$${Math.round(mcUsd)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
+      state.stats.seen++;
+      state.stats.filtered++;
+      broadcast({ event: "stats", data: state.stats });
+
+      if (state.monitored.size >= MAX_MONITORED) {
+        let oldest = null;
+        for (const [, t] of state.monitored.entries()) {
+          const age = Date.now() - t.detectedAt;
+          if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
+        }
+        if (oldest) stopMonitoring(oldest.mint);
+        else {
+          addLog(`⚠️ Cola llena, descartando ${coin.symbol}`, "warn");
+          continue;
+        }
+      }
+
+      seenMints.set(coin.mint, Date.now());
+      startMonitoring({
+        mint: coin.mint,
+        name: coin.name || "Unknown",
+        symbol: coin.symbol || "???",
+        twitter, website, telegram,
+        mc: mcUsd,
+        price,
+        detectedAt: Date.now(),
+      });
     }
-    return { twitter, website, telegram, name, symbol };
-  } catch { return null; }
+  } catch (e) {
+    addLog(`❌ Error pump.fun API: ${e.message}`, "error");
+  }
 }
+
+// Polling cada 10 segundos
+setInterval(fetchNewPumpTokens, 10_000);
+fetchNewPumpTokens();
 
 // ── PUMP.FUN TRADE via API ─────────────────────────────────────
 async function buyToken(mint, solAmount) {
@@ -216,7 +248,7 @@ async function buyToken(mint, solAmount) {
       body: JSON.stringify({
         publicKey: wallet.publicKey.toString(),
         action: "buy",
-        mint: mint,
+        mint,
         denominatedInSol: "true",
         amount: solAmount,
         slippage: 15,
@@ -248,37 +280,32 @@ async function buyToken(mint, solAmount) {
 async function sellToken(mint) {
   if (!wallet || !connection) return null;
   try {
-    // Obtener balance real de tokens
     const tokenBalance = await getTokenBalance(mint);
     if (tokenBalance <= 0) {
       addLog(`⚠️ Sin tokens para vender: ${shortAddr(mint)}`, "warn");
       return null;
     }
-
     addLog(`💳 Vendiendo ${tokenBalance} tokens de ${shortAddr(mint)}...`, "real");
-
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         publicKey: wallet.publicKey.toString(),
         action: "sell",
-        mint: mint,
+        mint,
         denominatedInSol: "false",
-        amount: tokenBalance,       // ← cantidad real de tokens
+        amount: tokenBalance,
         slippage: 15,
         priorityFee: 0.0005,
         pool: "pump"
       }),
       signal: AbortSignal.timeout(10000),
     });
-
     if (!response.ok) {
       const errText = await response.text();
       addLog(`❌ Error API venta ${response.status}: ${errText}`, "error");
       return null;
     }
-
     const txData = await response.arrayBuffer();
     const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
     tx.sign([wallet]);
@@ -311,28 +338,15 @@ async function openRealTrade(signal) {
   if (!signature) return;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    mint: signal.mint,
-    symbol: signal.symbol,
-    name: signal.name,
-    zone: signal.zone,
-    entryPrice: signal.price,
-    tp: signal.tp,
-    sl: signal.sl,
-    initialSl: signal.sl,
+    mint: signal.mint, symbol: signal.symbol, name: signal.name,
+    zone: signal.zone, entryPrice: signal.price,
+    tp: signal.tp, sl: signal.sl, initialSl: signal.sl,
     solAmount: SOL_PER_TRADE,
-    buySignature: signature,
-    sellSignature: null,
-    openTime: Date.now(),
-    closeTime: null,
-    closePrice: null,
-    result: null,
-    pnlPct: null,
-    pnlSol: null,
-    maxGainPct: 0,
-    maxLossPct: 0,
-    currentPct: 0,
-    trailingPhase: "INITIAL",
-    trailingLevel: null,
+    buySignature: signature, sellSignature: null,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null, pnlSol: null,
+    maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    trailingPhase: "INITIAL", trailingLevel: null,
     status: "OPEN",
     expiresAt: Date.now() + MAX_TRADE_DURATION_MS,
     sellRetries: 0,
@@ -349,9 +363,7 @@ async function openRealTrade(signal) {
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
-
   const signature = await sellToken(trade.mint);
-
   if (!signature) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) {
@@ -366,17 +378,14 @@ async function closeRealTrade(trade, price, reason) {
       return;
     }
   }
-
   trade.sellSignature = signature;
   trade.closePrice = price;
   trade.closeTime = Date.now();
   trade.status = "CLOSED";
-
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
   trade.pnlSol = +(trade.solAmount * pnlPct / 100).toFixed(4);
   const durationSec = Math.round((trade.closeTime - trade.openTime) / 1000);
-
   if (reason === "TP" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN";
     state.stats.realWins++;
@@ -396,7 +405,6 @@ async function closeRealTrade(trade, price, reason) {
     state.stats.realPnLSol += trade.pnlSol;
     addLog(`⏱️ REAL EXP: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}% (${trade.pnlSol} SOL)`, "real");
   }
-
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
   state.stats.walletBalance = await getWalletBalance();
   broadcast({ event: "realTradeClosed", data: trade });
@@ -412,15 +420,10 @@ function updateRealTrades(mint, price) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
     updateTrailingStopReal(trade, price);
-    if (price >= trade.tp) {
-      closeRealTrade(trade, price, "TP");
-    } else if (price <= trade.sl) {
-      closeRealTrade(trade, price, "SL");
-    } else if (now >= trade.expiresAt) {
-      closeRealTrade(trade, price, "EXPIRED");
-    } else {
-      broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
-    }
+    if (price >= trade.tp) closeRealTrade(trade, price, "TP");
+    else if (price <= trade.sl) closeRealTrade(trade, price, "SL");
+    else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
+    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
 }
 
@@ -451,8 +454,7 @@ setInterval(() => {
     if (trade.status !== "OPEN") continue;
     if (now >= trade.expiresAt) {
       const token = state.monitored.get(trade.mint);
-      const price = token?.price || trade.entryPrice;
-      closeRealTrade(trade, price, "EXPIRED");
+      closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
     }
   }
 }, 30_000);
@@ -678,52 +680,7 @@ function stopMonitoring(mint) {
   broadcast({ event: "removeToken", data: { mint } });
 }
 
-async function processNewToken(mint, price, volumeUSD, createdAt) {
-  if (seenMints.has(mint)) return;
-  if (seenMints.size >= 5000) {
-    let oldestMint = null, oldestTime = Infinity;
-    for (const [m, t] of seenMints.entries()) {
-      if (t < oldestTime) { oldestTime = t; oldestMint = m; }
-    }
-    if (oldestMint) seenMints.delete(oldestMint);
-  }
-  seenMints.set(mint, Date.now());
-  state.stats.seen++;
-  broadcast({ event: "stats", data: state.stats });
-  if (createdAt) {
-    const ageMs = Date.now() - createdAt;
-    const ageMin = Math.round(ageMs / 60000);
-    if (ageMs > MAX_TOKEN_AGE_MS) {
-      addLog(`⛔ Token viejo (${ageMin}min): ${shortAddr(mint)}`, "filter");
-      return;
-    }
-  }
-  const mc = price * 1_000_000_000;
-  if (mc > 0 && mc < MIN_MC_USD) {
-    addLog(`⛔ MC bajo ($${Math.round(mc)}): ${shortAddr(mint)}`, "filter");
-    return;
-  }
-  const meta = await fetchTokenMetadata(mint);
-  if (!meta) { addLog(`⛔ Sin metadata: ${shortAddr(mint)}`, "filter"); return; }
-  const { twitter, website, telegram, name, symbol } = meta;
-  if (!twitter && !website && !telegram) {
-    addLog(`⛔ Sin sociales: ${name || shortAddr(mint)}`, "filter");
-    return;
-  }
-  state.stats.filtered++;
-  addLog(`✅ ${symbol} — MC ~$${Math.round(mc)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
-  if (state.monitored.size >= MAX_MONITORED) {
-    let oldest = null;
-    for (const [, t] of state.monitored.entries()) {
-      const age = Date.now() - t.detectedAt;
-      if (!t.signal && age >= MIN_MONITOR_MS && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
-    }
-    if (oldest) stopMonitoring(oldest.mint);
-    else { addLog(`⚠️ Cola llena, descartando ${symbol}`, "warn"); return; }
-  }
-  startMonitoring({ mint, name: name || "Unknown", symbol: symbol || "???", twitter, website, telegram, mc, price, detectedAt: Date.now() });
-}
-
+// ── HELIUS WEBSOCKET — solo precios ────────────────────────────
 function connectHelius() {
   addLog("🔌 Conectando a Helius...", "info");
   broadcast({ event: "wsStatus", data: "connecting" });
@@ -753,19 +710,22 @@ function connectHelius() {
       const meta = tx.meta;
       if (!meta || meta.err) return;
 
-      // ── FILTRAR TRANSACCIONES PROPIAS ──────────────────────
+      // Filtrar transacciones propias
       const accountKeys = tx.transaction?.message?.accountKeys || [];
       const walletPubkey = wallet?.publicKey?.toString();
       if (walletPubkey) {
         const isOwnTx = accountKeys.some(k => (k.pubkey || k) === walletPubkey);
         if (isOwnTx) return;
       }
-      // ───────────────────────────────────────────────────────
 
       const tokenBalances = meta.postTokenBalances || [];
       if (tokenBalances.length === 0) return;
       const mint = tokenBalances[0]?.mint;
       if (!mint) return;
+
+      // Solo actualizar precio si ya estamos monitorizando este token
+      if (!state.monitored.has(mint)) return;
+
       const preSOL = meta.preBalances?.[0] || 0;
       const postSOL = meta.postBalances?.[0] || 0;
       const solDiff = Math.abs(postSOL - preSOL) / 1e9;
@@ -781,11 +741,7 @@ function connectHelius() {
       const price = (solDiff / tokenDiff) * solPriceUSD;
       const volumeUSD = solDiff * solPriceUSD;
       if (price <= 0) return;
-      const logs = meta.logMessages || [];
-      const isCreate = logs.some(l => l.includes("InitializeMint") || l.includes("Instruction: Create"));
-      const blockTime = result?.blockTime ? result.blockTime * 1000 : null;
-      if (isCreate) await processNewToken(mint, price, volumeUSD, blockTime);
-      else if (state.monitored.has(mint)) updateCandle(mint, price, volumeUSD);
+      updateCandle(mint, price, volumeUSD);
     } catch {}
   });
   ws.on("error", (err) => {
