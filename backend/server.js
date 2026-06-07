@@ -23,7 +23,6 @@ const MIN_MONITOR_MS = 2 * 60 * 1000;
 const TP_PCT = 1.9;
 const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
-const MAX_TOKEN_AGE_MS = 5 * 60 * 1000;
 const SOL_PER_TRADE = 0.05;
 const MAX_REAL_TRADES = 1;
 
@@ -35,7 +34,7 @@ const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMP_API = "https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC&includeNsfw=false";
+const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
 
 let wallet = null;
 let connection = null;
@@ -164,43 +163,37 @@ setInterval(async () => {
  }
 }, 30_000);
 
-// ── PUMP.FUN API ───────────────────────────────────────────────
-async function fetchNewPumpTokens() {
- try {
-   const res = await fetch(PUMP_API, {
-     headers: {
-       "User-Agent": "Mozilla/5.0",
-       "Accept": "application/json",
-     },
-     signal: AbortSignal.timeout(8000),
-   });
-   addLog(`🔍 Pump API status: ${res.status}`, "info");
-   if (!res.ok) {
-     addLog(`❌ Pump API error: ${res.status}`, "error");
-     return;
-   }
-   const coins = await res.json();
-   addLog(`🔍 Coins recibidos: ${Array.isArray(coins) ? coins.length : typeof coins}`, "info");
-   if (!Array.isArray(coins)) {
-     addLog(`❌ Formato inesperado: ${JSON.stringify(coins).slice(0, 100)}`, "error");
-     return;
-   }
+// ── PUMPPORTAL WEBSOCKET — detección tokens nuevos ─────────────
+function connectPumpPortal() {
+ addLog("🔌 Conectando a PumpPortal...", "info");
+ const ws = new WebSocket(PUMPPORTAL_WS);
+ let pingInterval;
 
-   let nuevos = 0;
-   for (const coin of coins) {
-     const createdAt = coin.created_timestamp;
-     if (!createdAt) continue;
-     const ageMs = Date.now() - createdAt;
-     const ageSec = Math.round(ageMs / 1000);
-     if (ageMs > MAX_TOKEN_AGE_MS) continue;
-     if (seenMints.has(coin.mint)) continue;
-     nuevos++;
+ ws.on("open", () => {
+   addLog("✅ PumpPortal conectado — escuchando tokens nuevos", "info");
+   ws.send(JSON.stringify({ method: "subscribeNewToken" }));
+   pingInterval = setInterval(() => {
+     if (ws.readyState === WebSocket.OPEN) {
+       ws.send(JSON.stringify({ method: "ping" }));
+     }
+   }, 20_000);
+ });
 
-     const mcUsd = coin.usd_market_cap || 0;
+ ws.on("message", async (raw) => {
+   try {
+     const coin = JSON.parse(raw.toString());
+
+     // PumpPortal envía los datos del token nuevo directamente
+     if (!coin.mint) return;
+     if (seenMints.has(coin.mint)) return;
+     seenMints.set(coin.mint, Date.now());
+     state.stats.seen++;
+     broadcast({ event: "stats", data: state.stats });
+
+     const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
      if (mcUsd < MIN_MC_USD) {
        addLog(`⛔ MC bajo ($${Math.round(mcUsd)}): ${coin.symbol}`, "filter");
-       seenMints.set(coin.mint, Date.now());
-       continue;
+       return;
      }
 
      const twitter = coin.twitter || null;
@@ -208,14 +201,12 @@ async function fetchNewPumpTokens() {
      const telegram = coin.telegram || null;
      if (!twitter && !website && !telegram) {
        addLog(`⛔ Sin sociales: ${coin.name || coin.symbol}`, "filter");
-       seenMints.set(coin.mint, Date.now());
-       continue;
+       return;
      }
 
      const price = mcUsd / 1_000_000_000;
-     addLog(`🆕 Token ${ageSec}s: ${coin.symbol} — MC ~$${Math.round(mcUsd)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
-     state.stats.seen++;
      state.stats.filtered++;
+     addLog(`🆕 ${coin.symbol} — MC ~$${Math.round(mcUsd)} — ${twitter ? "𝕏" : ""}${website ? "🌐" : ""}${telegram ? "✈️" : ""}`, "accept");
      broadcast({ event: "stats", data: state.stats });
 
      if (state.monitored.size >= MAX_MONITORED) {
@@ -227,11 +218,10 @@ async function fetchNewPumpTokens() {
        if (oldest) stopMonitoring(oldest.mint);
        else {
          addLog(`⚠️ Cola llena, descartando ${coin.symbol}`, "warn");
-         continue;
+         return;
        }
      }
 
-     seenMints.set(coin.mint, Date.now());
      startMonitoring({
        mint: coin.mint,
        name: coin.name || "Unknown",
@@ -241,15 +231,43 @@ async function fetchNewPumpTokens() {
        price,
        detectedAt: Date.now(),
      });
-   }
-   if (nuevos === 0) addLog(`🔍 Sin tokens nuevos (<5min) en este ciclo`, "info");
- } catch (e) {
-   addLog(`❌ Error pump.fun API: ${e.message}`, "error");
- }
-}
 
-setInterval(fetchNewPumpTokens, 10_000);
-fetchNewPumpTokens();
+     // Suscribirse a trades de este token para actualizar precio
+     ws.send(JSON.stringify({
+       method: "subscribeTokenTrade",
+       keys: [coin.mint]
+     }));
+
+   } catch (e) {
+     console.log("PumpPortal msg error:", e.message);
+   }
+ });
+
+ ws.on("message", async (raw) => {
+   try {
+     const data = JSON.parse(raw.toString());
+     // Actualizar precio si es un trade de token monitorizado
+     if (data.txType && (data.txType === "buy" || data.txType === "sell")) {
+       const mint = data.mint;
+       if (!mint || !state.monitored.has(mint)) return;
+       const mcUsd = (data.marketCapSol || 0) * solPriceUSD;
+       const price = mcUsd / 1_000_000_000;
+       const volumeUSD = (data.solAmount || 0) * solPriceUSD;
+       if (price > 0) updateCandle(mint, price, volumeUSD);
+     }
+   } catch {}
+ });
+
+ ws.on("error", (err) => {
+   addLog(`❌ Error PumpPortal: ${err.message}`, "error");
+ });
+
+ ws.on("close", () => {
+   clearInterval(pingInterval);
+   addLog("🔄 PumpPortal desconectado — reconectando en 5s...", "warn");
+   setTimeout(connectPumpPortal, 5000);
+ });
+}
 
 // ── PUMP.FUN TRADE ─────────────────────────────────────────────
 async function buyToken(mint, solAmount) {
@@ -735,10 +753,7 @@ function connectHelius() {
      const tokenBalances = meta.postTokenBalances || [];
      if (tokenBalances.length === 0) return;
      const mint = tokenBalances[0]?.mint;
-     if (!mint) return;
-
-     // Solo actualizar precio si ya monitorizamos este token
-     if (!state.monitored.has(mint)) return;
+     if (!mint || !state.monitored.has(mint)) return;
 
      const preSOL = meta.preBalances?.[0] || 0;
      const postSOL = meta.postBalances?.[0] || 0;
@@ -759,12 +774,12 @@ function connectHelius() {
    } catch {}
  });
  ws.on("error", (err) => {
-   addLog(`❌ Error WS: ${err.message}`, "error");
+   addLog(`❌ Error WS Helius: ${err.message}`, "error");
    broadcast({ event: "wsStatus", data: "error" });
  });
  ws.on("close", () => {
    clearInterval(pingInterval);
-   addLog("🔄 Reconectando en 5s...", "warn");
+   addLog("🔄 Helius desconectado — reconectando en 5s...", "warn");
    broadcast({ event: "wsStatus", data: "disconnected" });
    for (const [, token] of state.monitored.entries()) { if (token.ticker) clearInterval(token.ticker); }
    state.monitored.clear();
@@ -817,5 +832,6 @@ wss.on("connection", (ws) => {
 server.listen(PORT, () => {
  console.log(`🚀 SolScanBot — Real Trading Activo`);
  initWallet();
+ connectPumpPortal();
  connectHelius();
 });
