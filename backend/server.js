@@ -26,7 +26,7 @@ const SL_PCT = 0.88;
 const MAX_TRADE_DURATION_MS = 15 * 60 * 1000;
 const MAX_TOKEN_AGE_MS = 2 * 60 * 60 * 1000;
 const SOL_PER_TRADE = 0.05;
-const MAX_REAL_TRADES = 10;
+const MAX_REAL_TRADES = 1;
 
 const TRAILING_BREAKEVEN_AT = 0.30;
 const TRAILING_LOCK_AT      = 0.63;
