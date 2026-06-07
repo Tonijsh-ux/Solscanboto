@@ -7,7 +7,7 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
+  VersionedTransaction,
   SystemProgram,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
@@ -58,7 +58,6 @@ function initWallet() {
     addLog(`❌ Error cargando wallet: ${e.message}`, "error");
   }
 }
-
 
 async function getWalletBalance() {
   if (!wallet || !connection) return 0;
@@ -146,7 +145,6 @@ async function updateSolPrice() {
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
 
-// Actualizar balance cada 30s
 setInterval(async () => {
   if (wallet) {
     state.stats.walletBalance = await getWalletBalance();
@@ -196,7 +194,6 @@ async function buyToken(mint, solAmount) {
   try {
     addLog(`💳 Comprando ${solAmount} SOL de ${shortAddr(mint)}...`, "real");
 
-    // Usar Pump.fun API para obtener la tx de compra
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -219,8 +216,8 @@ async function buyToken(mint, solAmount) {
     }
 
     const txData = await response.arrayBuffer();
-    const tx = Transaction.from(new Uint8Array(txData));
-    tx.sign(wallet);
+    const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
+    tx.sign([wallet]);
 
     const signature = await connection.sendRawTransaction(tx.serialize(), {
       skipPreflight: false,
@@ -263,8 +260,8 @@ async function sellToken(mint, sellPercent = 100) {
     }
 
     const txData = await response.arrayBuffer();
-    const tx = Transaction.from(new Uint8Array(txData));
-    tx.sign(wallet);
+    const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
+    tx.sign([wallet]);
 
     const signature = await connection.sendRawTransaction(tx.serialize(), {
       skipPreflight: false,
@@ -387,7 +384,6 @@ function updateRealTrades(mint, price) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
 
-    // Trailing stop en trades reales
     updateTrailingStopReal(trade, price);
 
     if (price >= trade.tp) {
@@ -423,7 +419,6 @@ function updateTrailingStopReal(trade, price) {
   }
 }
 
-// Expiración cada 30s
 setInterval(() => {
   const now = Date.now();
   for (const trade of state.realTrades) {
@@ -627,7 +622,7 @@ function checkSignal(mint, price, bb, candleCount) {
     broadcast({ event: "newSignal", data: signal });
     broadcast({ event: "stats", data: state.stats });
     openDemoTrade(signal);
-    openRealTrade(signal); // Ejecutar trade real
+    openRealTrade(signal);
   }
 }
 
@@ -757,7 +752,10 @@ function connectHelius() {
       else if (state.monitored.has(mint)) updateCandle(mint, price, volumeUSD);
     } catch {}
   });
-  ws.on("error", (err) => { addLog(`❌ Error WS: ${err.message}`, "error"); broadcast({ event: "wsStatus", data: "error" }); });
+  ws.on("error", (err) => {
+    addLog(`❌ Error WS: ${err.message}`, "error");
+    broadcast({ event: "wsStatus", data: "error" });
+  });
   ws.on("close", () => {
     clearInterval(pingInterval);
     addLog("🔄 Reconectando en 5s...", "warn");
@@ -781,7 +779,10 @@ app.get("/api/state", (req, res) => {
     stats: state.stats
   });
 });
-app.delete("/api/token/:mint", (req, res) => { stopMonitoring(req.params.mint); res.json({ ok: true }); });
+app.delete("/api/token/:mint", (req, res) => {
+  stopMonitoring(req.params.mint);
+  res.json({ ok: true });
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -794,7 +795,8 @@ wss.on("connection", (ws) => {
       demoTrades: state.demoTrades.slice(0, 200),
       realTrades: state.realTrades.slice(0, 200),
       log: state.log.slice(0, 100),
-      stats: state.stats, wsStatus: "connected"
+      stats: state.stats,
+      wsStatus: "connected"
     }
   }));
   ws.on("close", () => frontendClients.delete(ws));
