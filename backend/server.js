@@ -67,6 +67,22 @@ async function getWalletBalance() {
   } catch { return 0; }
 }
 
+// ── OBTENER BALANCE REAL DE TOKEN ──────────────────────────────
+async function getTokenBalance(mint) {
+  if (!wallet || !connection) return 0;
+  try {
+    const mintPubkey = new PublicKey(mint);
+    const walletPubkey = wallet.publicKey;
+    const accounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, { mint: mintPubkey });
+    if (accounts.value.length === 0) return 0;
+    const amount = accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount;
+    return amount || 0;
+  } catch (e) {
+    addLog(`❌ Error obteniendo balance token: ${e.message}`, "error");
+    return 0;
+  }
+}
+
 const state = {
   monitored: new Map(),
   signals: [],
@@ -229,10 +245,18 @@ async function buyToken(mint, solAmount) {
   }
 }
 
-async function sellToken(mint, sellPercent = 100) {
+async function sellToken(mint) {
   if (!wallet || !connection) return null;
   try {
-    addLog(`💳 Vendiendo ${sellPercent}% de ${shortAddr(mint)}...`, "real");
+    // Obtener balance real de tokens
+    const tokenBalance = await getTokenBalance(mint);
+    if (tokenBalance <= 0) {
+      addLog(`⚠️ Sin tokens para vender: ${shortAddr(mint)}`, "warn");
+      return null;
+    }
+
+    addLog(`💳 Vendiendo ${tokenBalance} tokens de ${shortAddr(mint)}...`, "real");
+
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -241,18 +265,20 @@ async function sellToken(mint, sellPercent = 100) {
         action: "sell",
         mint: mint,
         denominatedInSol: "false",
-        amount: sellPercent / 100,
+        amount: tokenBalance,       // ← cantidad real de tokens
         slippage: 15,
         priorityFee: 0.0005,
         pool: "pump"
       }),
       signal: AbortSignal.timeout(10000),
     });
+
     if (!response.ok) {
       const errText = await response.text();
       addLog(`❌ Error API venta ${response.status}: ${errText}`, "error");
       return null;
     }
+
     const txData = await response.arrayBuffer();
     const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
     tx.sign([wallet]);
@@ -261,7 +287,7 @@ async function sellToken(mint, sellPercent = 100) {
       preflightCommitment: "confirmed",
     });
     await connection.confirmTransaction(signature, "confirmed");
-    addLog(`✅ VENTA OK: ${shortAddr(mint)} | TX: ${signature}`, "real");
+    addLog(`✅ VENTA OK: ${shortAddr(mint)} | ${tokenBalance} tokens | TX: ${signature}`, "real");
     return signature;
   } catch (e) {
     addLog(`❌ Error venta: ${e.message}`, "error");
@@ -322,18 +348,15 @@ async function openRealTrade(signal) {
 
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
-
-  // Marcar como cerrando para evitar doble cierre
   trade.status = "CLOSING";
 
-  const signature = await sellToken(trade.mint, 100);
+  const signature = await sellToken(trade.mint);
 
   if (!signature) {
-    // Venta fallida — reintentar hasta 3 veces
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) {
       addLog(`⚠️ VENTA FALLIDA (intento ${trade.sellRetries}/3): ${trade.symbol} — reintentando en 15s`, "error");
-      trade.status = "OPEN"; // Volver a abrir para reintentar
+      trade.status = "OPEN";
       setTimeout(() => closeRealTrade(trade, price, reason), 15000);
       return;
     } else {
