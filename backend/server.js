@@ -23,7 +23,9 @@ const TRAILING_LOCK_AT = 0.63;
 const TRAILING_FOLLOW_PCT = 0.20;
 
 const ENTRY_WINDOW_MS = 30_000;
-const ENTRY_MIN_VOLUME_USD = 300;
+const ENTRY_MIN_VOLUME_USD = 1000;
+const ENTRY_MIN_MC_USD = 5000;
+const ENTRY_MAX_MC_USD = 15000;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -149,18 +151,23 @@ setInterval(async () => {
 // ── VENTANA DE OBSERVACIÓN ─────────────────────────────────────
 function startWatching(coin) {
  if (seenMints.has(coin.mint)) return;
+
+ const createMcSol = coin.marketCapSol || 0;
+ const createMcUsd = createMcSol * solPriceUSD;
+
+ // Filtro MC en el create — solo observar si MC está en rango $5K-$15K
+ if (createMcUsd < ENTRY_MIN_MC_USD || createMcUsd > ENTRY_MAX_MC_USD) {
+   seenMints.add(coin.mint);
+   state.stats.seen++;
+   addLog(`⛔ MC fuera de rango (${formatMC(createMcUsd)}): ${coin.symbol}`, "filter");
+   broadcast({ event: "stats", data: state.stats });
+   return;
+ }
+
  seenMints.add(coin.mint);
  state.stats.seen++;
 
- // ── PRECIO DESDE MENSAJE CREATE ────────────────────────────
- // PumpPortal envía marketCapSol en el create pero NO en trades
- // Usamos ese valor como firstPrice si es válido (> 1 SOL de MC)
- const createMcSol = coin.marketCapSol || 0;
- const createMcUsd = createMcSol * solPriceUSD;
  const createPrice = createMcUsd / 1_000_000_000;
-
- // MC válido: entre $500 y $500K en el momento de creación
- const createMcValido = createMcUsd >= 500 && createMcUsd <= 500_000;
 
  const entry = {
    mint: coin.mint,
@@ -172,18 +179,17 @@ function startWatching(coin) {
    startTime: Date.now(),
    volumeUSD: 0,
    tradeCount: 0,
-   // Usar precio del create si es válido
-   firstPrice: createMcValido ? createPrice : null,
-   firstMcUsd: createMcValido ? createMcUsd : null,
-   lastPrice: createMcValido ? createPrice : null,
-   lastMcUsd: createMcValido ? createMcUsd : null,
+   firstPrice: createPrice,
+   firstMcUsd: createMcUsd,
+   lastPrice: createPrice,
+   lastMcUsd: createMcUsd,
    timer: null,
  };
 
  state.watching.set(coin.mint, entry);
  state.stats.watched++;
  broadcast({ event: "stats", data: state.stats });
- addLog(`👀 ${coin.symbol} | MC ${formatMC(createMcUsd)}${createMcValido ? " ✅" : " ⚠️ fuera rango"} — necesita $${ENTRY_MIN_VOLUME_USD} vol`, "info");
+ addLog(`👀 ${coin.symbol} | MC ${formatMC(createMcUsd)} ✅ — necesita $${ENTRY_MIN_VOLUME_USD} vol en ${ENTRY_WINDOW_MS/1000}s`, "info");
 
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({
@@ -195,31 +201,20 @@ function startWatching(coin) {
  entry.timer = setTimeout(() => evaluateEntry(coin.mint), ENTRY_WINDOW_MS);
 }
 
-function updateWatching(mint, solAmount, tokenAmount) {
+function updateWatching(mint, price, solAmount, mcUsd) {
  const entry = state.watching.get(mint);
  if (!entry) return;
-
- // Calcular precio desde solAmount/tokenAmount si tokenAmount disponible
- let price = null;
- let mcUsd = null;
-
- if (tokenAmount > 0 && solAmount > 0) {
-   price = (solAmount / tokenAmount) * solPriceUSD;
-   mcUsd = price * 1_000_000_000;
- }
 
  const volumeUSD = solAmount * solPriceUSD;
  entry.volumeUSD += volumeUSD;
  entry.tradeCount++;
 
- if (price && price > 0) {
+ if (price > 0) {
    entry.lastPrice = price;
    entry.lastMcUsd = mcUsd;
-   // Actualizar firstPrice solo si aún no lo tenemos
    if (!entry.firstPrice) {
      entry.firstPrice = price;
      entry.firstMcUsd = mcUsd;
-     addLog(`📍 ${entry.symbol} firstPrice desde trade: MC ${formatMC(mcUsd)}`, "info");
    }
  }
 
@@ -244,10 +239,8 @@ function evaluateEntry(mint) {
    broadcast({ event: "stats", data: state.stats });
    openTrades(entry);
  } else {
-   const reason = !entry.firstPrice
-     ? "sin precio válido"
-     : `solo ${formatMC(entry.volumeUSD)} vol`;
-   addLog(`❌ RECHAZADO: ${entry.symbol} — ${reason} en ${elapsed}s`, "filter");
+   const reason = `solo ${formatMC(entry.volumeUSD)} vol en ${elapsed}s`;
+   addLog(`❌ RECHAZADO: ${entry.symbol} — ${reason}`, "filter");
    state.stats.rejected++;
    broadcast({ event: "stats", data: state.stats });
  }
@@ -295,26 +288,7 @@ function startMonitoring(entry, initialPrice) {
 
 function updatePrice(mint, price, solAmount, mcUsd) {
  if (state.watching.has(mint)) {
-   // Para watching usamos solAmount y price directamente
-   const entry = state.watching.get(mint);
-   if (!entry) return;
-   const volumeUSD = solAmount * solPriceUSD;
-   entry.volumeUSD += volumeUSD;
-   entry.tradeCount++;
-   if (price > 0) {
-     entry.lastPrice = price;
-     entry.lastMcUsd = mcUsd;
-     if (!entry.firstPrice) {
-       entry.firstPrice = price;
-       entry.firstMcUsd = mcUsd;
-     }
-   }
-   broadcast({ event: "watchUpdate", data: {
-     mint, volumeUSD: entry.volumeUSD,
-     tradeCount: entry.tradeCount,
-     needed: ENTRY_MIN_VOLUME_USD,
-     mcUsd: entry.firstMcUsd || mcUsd,
-   }});
+   updateWatching(mint, price, solAmount, mcUsd);
    return;
  }
  const token = state.monitored.get(mint);
@@ -667,7 +641,6 @@ function connectPumpPortal() {
        const solAmount = data.solAmount || 0;
        const tokenAmount = data.tokenAmount || 0;
 
-       // Calcular precio desde solAmount/tokenAmount
        let price = 0;
        let mcUsd = 0;
        if (tokenAmount > 0 && solAmount > 0) {
@@ -679,7 +652,7 @@ function connectPumpPortal() {
        return;
      }
 
-     // Token nuevo — txType === "create"
+     // Token nuevo
      if (data.mint && (data.txType === "create" || !data.txType)) {
        startWatching({
          mint: data.mint,
@@ -689,8 +662,6 @@ function connectPumpPortal() {
          website: data.website || null,
          telegram: data.telegram || null,
          marketCapSol: data.marketCapSol || 0,
-         initialBuy: data.initialBuy || 0,
-         solAmount: data.solAmount || 0,
        });
      }
 
@@ -829,7 +800,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v2 — create price + tokenAmount calc`);
+ console.log(`🚀 SolScanBot v2 — MC $${ENTRY_MIN_MC_USD/1000}K-$${ENTRY_MAX_MC_USD/1000}K | Vol $${ENTRY_MIN_VOLUME_USD}`);
  initWallet();
  connectPumpPortal();
  connectHelius();
