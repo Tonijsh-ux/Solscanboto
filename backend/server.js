@@ -194,7 +194,7 @@ async function scanPumpSwap() {
     let added = 0;
     for (let page = 1; page <= 3; page++) {
       const res = await fetch(
-        `${GECKO_PUMPSWAP}?page=${page}&sort=h24_volume_usd_liquidity_desc`,
+        `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
         {
           headers: { "Accept": "application/json;version=20230302" },
           signal: AbortSignal.timeout(10000),
