@@ -22,7 +22,7 @@ const TRAILING_BREAKEVEN_AT = 0.30;
 const TRAILING_LOCK_AT = 0.63;
 const TRAILING_FOLLOW_PCT = 0.20;
 
-const ENTRY_WINDOW_MS = 30_000;
+const ENTRY_WINDOW_MS = 20_000;
 const ENTRY_MIN_VOLUME_USD = 600;
 const ENTRY_MIN_MC_USD = 1000;   // MC mínimo para registrar firstPrice
 const ENTRY_MAX_MC_USD = 100_000; // MC máximo razonable en primeros 30s
