@@ -23,7 +23,7 @@ const TRAILING_LOCK_AT = 0.63;
 const TRAILING_FOLLOW_PCT = 0.20;
 
 const ENTRY_WINDOW_MS = 30_000;
-const ENTRY_MIN_VOLUME_USD = 100;
+const ENTRY_MIN_VOLUME_USD = 300;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -160,7 +160,7 @@ function startWatching(coin) {
  state.watching.set(coin.mint, entry);
  state.stats.watched++;
  broadcast({ event: "stats", data: state.stats });
- addLog(`👀 ${coin.symbol}${coin.twitter ? " 𝕏" : ""}${coin.website ? " 🌐" : ""}${coin.telegram ? " ✈️" : ""} — necesita $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`, "info");
+ addLog(`👀 ${coin.symbol} — necesita $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`, "info");
 
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({
@@ -592,23 +592,15 @@ function connectPumpPortal() {
        return;
      }
 
-     // Token nuevo — tiene mint pero no txType
+     // Token nuevo — cualquier mensaje con mint sin txType
      if (data.mint && !data.txType) {
-       const twitter = data.twitter || null;
-       const website = data.website || null;
-       const telegram = data.telegram || null;
-
-       if (!twitter && !website && !telegram) {
-         addLog(`⛔ Sin sociales: ${data.symbol || data.mint.slice(0,8)}`, "filter");
-         seenMints.add(data.mint);
-         return;
-       }
-
        startWatching({
          mint: data.mint,
          name: data.name || "Unknown",
          symbol: data.symbol || "???",
-         twitter, website, telegram,
+         twitter: data.twitter || null,
+         website: data.website || null,
+         telegram: data.telegram || null,
        });
      }
 
@@ -744,7 +736,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v2 — Volumen Strategy`);
+ console.log(`🚀 SolScanBot v2 — Volumen Strategy $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`);
  initWallet();
  connectPumpPortal();
  connectHelius();
