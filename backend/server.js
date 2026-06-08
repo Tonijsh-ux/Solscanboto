@@ -34,6 +34,7 @@ const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data";
 let wallet = null;
 let connection = null;
 let pumpPortalWs = null;
+let logCount = 0;
 
 function initWallet() {
  try {
@@ -581,6 +582,13 @@ function connectPumpPortal() {
  pumpPortalWs.on("message", async (raw) => {
    try {
      const data = JSON.parse(raw.toString());
+
+     // ── LOG DIAGNÓSTICO — primeros 20 mensajes ─────────────
+     if (logCount < 20) {
+       logCount++;
+       addLog(`📨[${logCount}] txType:${data.txType ?? "none"} mint:${data.mint ? data.mint.slice(0,8) : "none"} keys:${Object.keys(data).join(",")}`, "info");
+     }
+
      if (data.message || data.errors) return;
 
      // Trade — actualizar precio
@@ -592,7 +600,7 @@ function connectPumpPortal() {
        return;
      }
 
-     // Token nuevo — cualquier mensaje con mint sin txType
+     // Token nuevo
      if (data.mint && !data.txType) {
        startWatching({
          mint: data.mint,
@@ -736,7 +744,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v2 — Volumen Strategy $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`);
+ console.log(`🚀 SolScanBot v2 — $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`);
  initWallet();
  connectPumpPortal();
  connectHelius();
