@@ -193,7 +193,9 @@ async function scanPumpSwap() {
  addLog("🔍 Escaneando PumpSwap via GeckoTerminal...", "info");
  try {
    let added = 0;
-   for (let page = 1; page <= 3; page++) {
+   let updated = 0;
+
+   for (let page = 1; page <= 5; page++) {
      const res = await fetch(
        `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
        {
@@ -204,11 +206,12 @@ async function scanPumpSwap() {
      if (!res.ok) { addLog(`❌ GeckoTerminal ${res.status}`, "error"); break; }
      const json = await res.json();
      const pools = json?.data || [];
+     if (pools.length === 0) break;
 
      for (const pool of pools) {
        const attr = pool.attributes || {};
        const poolAddr = attr.address || pool.id?.replace("solana_", "");
-       if (!poolAddr || seenPools.has(poolAddr)) continue;
+       if (!poolAddr) continue;
 
        const createdAt = attr.pool_created_at ? new Date(attr.pool_created_at).getTime() : null;
        if (!createdAt) continue;
@@ -233,10 +236,30 @@ async function scanPumpSwap() {
        const mint = baseTokenId.replace("solana_", "") || null;
        if (!mint || mint.length < 32) continue;
 
+       // ── Si ya está monitorizando — actualizar datos ────────
+       if (state.monitored.has(mint)) {
+         const t = state.monitored.get(mint);
+         t.vol24h = vol24h;
+         t.pricePct1h = pricePct1h;
+         t.pricePct6h = pricePct6h;
+         // Si no tiene trades aún, usar precio de GeckoTerminal como seed
+         if (t.tradeCount === 0 && price > 0) {
+           updateCandle(mint, price, 0);
+         }
+         seenPools.add(poolAddr);
+         updated++;
+         broadcast({ event: "tokenUpdate", data: tokenToJSON(t) });
+         continue;
+       }
+
+       // ── Si ya fue visto y rechazado — saltar ──────────────
+       if (seenPools.has(poolAddr)) continue;
+
        seenPools.add(poolAddr);
        state.stats.scanned++;
 
        if (state.monitored.size >= MAX_MONITORED) {
+         // Eliminar el token más viejo sin señal activa y sin trades abiertos
          let oldest = null;
          for (const [, t] of state.monitored.entries()) {
            if (!t.signal && (!oldest || t.detectedAt < oldest.detectedAt)) oldest = t;
@@ -257,8 +280,10 @@ async function scanPumpSwap() {
      }
      await new Promise(r => setTimeout(r, 600));
    }
-   if (added > 0) addLog(`✅ ${added} tokens añadidos`, "info");
-   else addLog("ℹ️ Sin tokens nuevos", "info");
+
+   if (added > 0) addLog(`✅ ${added} tokens nuevos | ${updated} actualizados`, "info");
+   else if (updated > 0) addLog(`🔄 ${updated} tokens actualizados`, "info");
+   else addLog("ℹ️ Sin cambios", "info");
    broadcast({ event: "stats", data: state.stats });
  } catch (e) {
    addLog(`❌ Error scanner: ${e.message}`, "error");
@@ -277,11 +302,16 @@ function startMonitoring(token) {
    ticker: null,
  };
  state.monitored.set(token.mint, entry);
+
+ // Seed inicial con precio de GeckoTerminal
+ if (token.price > 0) updateCandle(token.mint, token.price, 0);
+
  entry.ticker = setInterval(() => {
    const t = state.monitored.get(token.mint);
    if (!t) { clearInterval(entry.ticker); return; }
    if (t.price > 0) updateCandle(token.mint, t.price, 0);
  }, CANDLE_MS);
+
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [token.mint] }));
  }
@@ -316,8 +346,10 @@ function updateCandle(mint, price, volumeUSD = 0) {
  token.mc = price * 1_000_000_000;
  token.priceHigh = Math.max(token.priceHigh || 0, price);
  token.priceLow = token.priceLow === 0 ? price : Math.min(token.priceLow, price);
- token.tradeCount++;
- token.volumeUSD += volumeUSD;
+ if (volumeUSD > 0) {
+   token.tradeCount++;
+   token.volumeUSD += volumeUSD;
+ }
  token.lastUpdate = now;
  const allCandles = [...token.candles, token.currentCandle];
  const bb = calcBollinger(allCandles);
@@ -619,10 +651,7 @@ function connectHelius() {
      jsonrpc: "2.0", id: 420,
      method: "transactionSubscribe",
      params: [
-       {
-         accountInclude: [PUMPSWAP_PROGRAM, PUMPFUN_PROGRAM],
-         failed: false
-       },
+       { accountInclude: [PUMPSWAP_PROGRAM, PUMPFUN_PROGRAM], failed: false },
        { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
      ]
    }));
@@ -696,7 +725,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v3 — PumpSwap Bollinger | PumpSwap+PumpFun Helius`);
+ console.log(`🚀 SolScanBot v3 — PumpSwap Bollinger`);
  initWallet();
  connectPumpPortal();
  connectHelius();
