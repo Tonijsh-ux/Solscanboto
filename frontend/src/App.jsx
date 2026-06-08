@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 
 const BACKEND_WS = import.meta.env.VITE_BACKEND_WS || "ws://localhost:3001";
 
@@ -20,39 +20,36 @@ function shortAddr(addr) { return addr ? `${addr.slice(0, 4)}…${addr.slice(-4)
 function elapsed(ts) {
   const s = Math.floor((Date.now() - ts) / 1000);
   if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m${s % 60}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
 }
 function pctColor(pct) { return pct >= 0 ? "#22c55e" : "#ef4444"; }
-function priceToMC(price) { return price * 1_000_000_000; }
 
 function useBackend() {
-  const [watching, setWatching] = useState([]);
   const [monitored, setMonitored] = useState([]);
   const [signals, setSignals] = useState([]);
   const [demoTrades, setDemoTrades] = useState([]);
   const [realTrades, setRealTrades] = useState([]);
   const [log, setLog] = useState([]);
   const [stats, setStats] = useState({
-    seen: 0, watched: 0, entered: 0, rejected: 0,
+    scanned: 0, added: 0, filtered: 0,
     demoOpen: 0, demoWins: 0, demoLosses: 0, demoExpired: 0, demoPnL: 0,
-    realOpen: 0, realWins: 0, realLosses: 0, realExpired: 0, realPnL: 0, realPnLSol: 0,
+    realOpen: 0, realWins: 0, realLosses: 0, realExpired: 0,
+    realPnL: 0, realPnLSol: 0,
     avgMaxGain: 0, avgMaxLoss: 0, closedCount: 0, walletBalance: 0,
   });
   const [wsStatus, setWsStatus] = useState("connecting");
-  const wsRef = useRef(null);
 
   useEffect(() => {
     let ws; let reconnectTimer;
     const connect = () => {
       setWsStatus("connecting");
       ws = new WebSocket(BACKEND_WS);
-      wsRef.current = ws;
       ws.onopen = () => setWsStatus("connected");
       ws.onmessage = (evt) => {
         try {
           const { event, data } = JSON.parse(evt.data);
           if (event === "fullState") {
-            setWatching(data.watching || []);
             setMonitored(data.monitored || []);
             setSignals(data.signals || []);
             setDemoTrades(data.demoTrades || []);
@@ -62,12 +59,7 @@ function useBackend() {
             setWsStatus(data.wsStatus || "connected");
             return;
           }
-          if (event === "wsStatus") { setWsStatus(data); return; }
           if (event === "stats") { setStats(data); return; }
-          if (event === "watchUpdate") {
-            setWatching(p => p.map(w => w.mint === data.mint ? { ...w, volumeUSD: data.volumeUSD, tradeCount: data.tradeCount } : w));
-            return;
-          }
           if (event === "newToken") { setMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
           if (event === "removeToken") { setMonitored(p => p.filter(t => t.mint !== data.mint)); return; }
           if (event === "tokenUpdate") { setMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
@@ -100,7 +92,90 @@ function useBackend() {
     return () => { ws?.close(); clearTimeout(reconnectTimer); };
   }, []);
 
-  return { watching, monitored, signals, demoTrades, realTrades, log, stats, wsStatus };
+  return { monitored, signals, demoTrades, realTrades, log, stats, wsStatus };
+}
+
+function Sparkline({ candles, bb }) {
+  if (!candles || candles.length < 3) return (
+    <div style={{ fontSize: 10, color: "#334155", fontFamily: "monospace" }}>acumulando velas…</div>
+  );
+  const w = 120, h = 40;
+  const prices = candles.map(c => c.close);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const pts = prices.map((p, i) => `${(i / (prices.length - 1)) * w},${h - ((p - min) / range) * (h - 4) - 2}`).join(" ");
+  const bbY = v => h - ((v - min) / range) * (h - 4) - 2;
+  const isUp = prices[prices.length - 1] >= prices[0];
+  return (
+    <svg width={w} height={h} style={{ display: "block" }}>
+      {bb && bb.upper >= min && bb.upper <= max * 1.5 && (
+        <>
+          <line x1="0" y1={bbY(bb.upper)} x2={w} y2={bbY(bb.upper)} stroke="#ef4444" strokeWidth="0.7" strokeDasharray="2,2" opacity="0.7" />
+          <line x1="0" y1={bbY(bb.middle)} x2={w} y2={bbY(bb.middle)} stroke="#facc15" strokeWidth="0.9" opacity="0.8" />
+          <line x1="0" y1={bbY(bb.lower)} x2={w} y2={bbY(bb.lower)} stroke="#22c55e" strokeWidth="0.7" strokeDasharray="2,2" opacity="0.7" />
+        </>
+      )}
+      <polyline points={pts} fill="none" stroke={isUp ? "#22c55e" : "#ef4444"} strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function TokenCard({ token }) {
+  const { mint, symbol, name, mc, price, vol24h, ageMs, bb, candleCount, candles, signal, tp, sl, tradeCount, pricePct1h, pricePct6h } = token;
+  const hasBB = candleCount >= 20;
+  const signalColor = signal === "LOWER" ? "#22c55e" : signal === "MIDDLE" ? "#facc15" : null;
+
+  return (
+    <div style={{ background: "#0d1117", border: `1px solid ${signalColor || "#1e2d40"}`, borderRadius: 12, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8, boxShadow: signal ? `0 0 16px ${signalColor}22` : "none" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{symbol}</span>
+          {signal && <span style={{ fontSize: 10, color: signalColor, fontWeight: 700, background: `${signalColor}22`, padding: "2px 6px", borderRadius: 8, fontFamily: "monospace" }}>🎯 {signal}</span>}
+        </div>
+        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{ageMs ? `${Math.round(ageMs / 3600000)}h` : "—"}</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden" }}>
+        {[
+          { label: "MC", value: formatMC(mc) },
+          { label: "Vol 24h", value: formatMC(vol24h) },
+          { label: "1h", value: `${(pricePct1h || 0) > 0 ? "+" : ""}${(pricePct1h || 0).toFixed(1)}%`, color: pctColor(pricePct1h || 0) },
+          { label: "Velas", value: `${candleCount}/20`, color: hasBB ? "#22c55e" : "#facc15" },
+        ].map((m, i) => (
+          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
+            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
+            <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <Sparkline candles={candles} bb={bb} />
+        {bb && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2, fontFamily: "monospace", fontSize: 9 }}>
+            <span style={{ color: "#ef4444" }}>↑{formatUSD(bb.upper)}</span>
+            <span style={{ color: "#facc15" }}>—{formatUSD(bb.middle)}</span>
+            <span style={{ color: "#22c55e" }}>↓{formatUSD(bb.lower)}</span>
+          </div>
+        )}
+      </div>
+
+      {signal && tp && sl && (
+        <div style={{ background: `${signalColor}18`, border: `1px solid ${signalColor}`, borderRadius: 8, padding: "6px 10px", display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontFamily: "monospace", fontSize: 11, color: signalColor, fontWeight: 700 }}>Banda {signal}</span>
+          <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 11 }}>
+            <span style={{ color: "#22c55e" }}>TP {formatUSD(tp)}</span>
+            <span style={{ color: "#ef4444" }}>SL {formatUSD(sl)}</span>
+          </div>
+        </div>
+      )}
+
+      <a href={`https://dexscreener.com/solana/${mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>
+        📊 {shortAddr(mint)} — Ver en DexScreener
+      </a>
+    </div>
+  );
 }
 
 function DemoTradeCard({ trade }) {
@@ -114,20 +189,9 @@ function DemoTradeCard({ trade }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
           <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>{statusLabel}</span>
+          {trade.zone && <span style={{ fontSize: 9, color: trade.zone === "LOWER" ? "#22c55e" : "#facc15", fontFamily: "monospace" }}>B.{trade.zone}</span>}
         </div>
         <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}</span>
-      </div>
-      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
-        {[
-          { label: "MC Entrada", value: formatMC(priceToMC(trade.entryPrice)) },
-          { label: "MC TP", value: formatMC(priceToMC(trade.tp)), color: "#22c55e" },
-          { label: "MC SL", value: formatMC(priceToMC(trade.sl)), color: "#ef4444" },
-        ].map((m, i) => (
-          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 2 ? "1px solid #1e2d40" : "none" }}>
-            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
-            <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
-          </div>
-        ))}
       </div>
       <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
         {[
@@ -144,7 +208,7 @@ function DemoTradeCard({ trade }) {
       </div>
       {!isOpen && (
         <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 6 }}>
-          Cerrada @ MC {formatMC(priceToMC(trade.closePrice || trade.entryPrice))} — P&L: <span style={{ color: pctColor(trade.pnlPct) }}>{trade.pnlPct > 0 ? "+" : ""}{trade.pnlPct}%</span>
+          P&L: <span style={{ color: pctColor(trade.pnlPct) }}>{trade.pnlPct > 0 ? "+" : ""}{trade.pnlPct}%</span>
         </div>
       )}
       <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 Ver en DexScreener</a>
@@ -156,35 +220,23 @@ function RealTradeCard({ trade }) {
   const isOpen = trade.status === "OPEN";
   const isWin = trade.result === "WIN" || trade.result === "EXPIRED_WIN";
   const color = isOpen ? "#f97316" : isWin ? "#22c55e" : "#ef4444";
-  const statusLabel = isOpen ? "🔴 REAL ABIERTA" : trade.result === "WIN" ? "✅ WIN REAL" : trade.result === "LOSS" ? "❌ LOSS REAL" : "⏱️ EXP REAL";
+  const statusLabel = isOpen ? "🔴 REAL" : trade.result === "WIN" ? "✅ WIN" : trade.result === "LOSS" ? "❌ LOSS" : "⏱️ EXP";
   return (
     <div style={{ background: "#0d1117", border: `1px solid ${color}55`, borderRadius: 10, padding: "10px 14px", boxShadow: isOpen ? `0 0 20px ${color}22` : "none" }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
           <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>{statusLabel}</span>
+          {trade.zone && <span style={{ fontSize: 9, color: trade.zone === "LOWER" ? "#22c55e" : "#facc15", fontFamily: "monospace" }}>B.{trade.zone}</span>}
         </div>
         <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}</span>
-      </div>
-      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
-        {[
-          { label: "SOL invertido", value: `${trade.solAmount} SOL`, color: "#f97316" },
-          { label: "MC Entrada", value: formatMC(priceToMC(trade.entryPrice)) },
-          { label: "MC TP", value: formatMC(priceToMC(trade.tp)), color: "#22c55e" },
-          { label: "MC SL", value: formatMC(priceToMC(trade.sl)), color: "#ef4444" },
-        ].map((m, i) => (
-          <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
-            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
-            <div style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 700, color: m.color || "#94a3b8" }}>{m.value}</div>
-          </div>
-        ))}
       </div>
       <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
         {[
           { label: "Actual %", value: `${(trade.currentPct || 0) > 0 ? "+" : ""}${(trade.currentPct || 0).toFixed(1)}%`, color: pctColor(trade.currentPct || 0) },
           { label: "Max ↑", value: `+${(trade.maxGainPct || 0).toFixed(1)}%`, color: "#22c55e" },
           { label: "Trailing", value: trade.trailingPhase || "INITIAL", color: trade.trailingPhase !== "INITIAL" ? "#facc15" : "#64748b" },
-          { label: isOpen ? "⏱️" : "P&L SOL", value: isOpen ? elapsed(trade.openTime) : `${(trade.pnlSol || 0) > 0 ? "+" : ""}${(trade.pnlSol || 0).toFixed(4)} SOL`, color: isOpen ? "#94a3b8" : pctColor(trade.pnlSol || 0) },
+          { label: isOpen ? "⏱️" : "P&L SOL", value: isOpen ? elapsed(trade.openTime) : `${(trade.pnlSol || 0) > 0 ? "+" : ""}${(trade.pnlSol || 0).toFixed(4)}`, color: isOpen ? "#94a3b8" : pctColor(trade.pnlSol || 0) },
         ].map((m, i) => (
           <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
             <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
@@ -193,13 +245,13 @@ function RealTradeCard({ trade }) {
         ))}
       </div>
       {trade.buySignature && (
-        <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 4 }}>
-          Buy TX: <a href={`https://solscan.io/tx/${trade.buySignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.buySignature.slice(0, 12)}…</a>
+        <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 2 }}>
+          Buy: <a href={`https://solscan.io/tx/${trade.buySignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.buySignature.slice(0, 12)}…</a>
         </div>
       )}
       {trade.sellSignature && (
         <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 4 }}>
-          Sell TX: <a href={`https://solscan.io/tx/${trade.sellSignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.sellSignature.slice(0, 12)}…</a>
+          Sell: <a href={`https://solscan.io/tx/${trade.sellSignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.sellSignature.slice(0, 12)}…</a>
         </div>
       )}
       <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 Ver en DexScreener</a>
@@ -208,7 +260,7 @@ function RealTradeCard({ trade }) {
 }
 
 export default function App() {
-  const { watching, monitored, signals, demoTrades, realTrades, log, stats, wsStatus } = useBackend();
+  const { monitored, signals, demoTrades, realTrades, log, stats, wsStatus } = useBackend();
   const [tab, setTab] = useState("monitor");
   const [demoFilter, setDemoFilter] = useState("all");
   const [realFilter, setRealFilter] = useState("all");
@@ -238,7 +290,7 @@ export default function App() {
         <div style={{ display: "flex", gap: 10 }}>
           {[
             { label: "W%", val: `${winRate}%`, color: winRate >= 50 ? "#22c55e" : "#ef4444" },
-            { label: "DEMO", val: `${stats.demoPnL > 0 ? "+" : ""}${Math.round(stats.demoPnL || 0)}%`, color: (stats.demoPnL || 0) >= 0 ? "#22c55e" : "#ef4444" },
+            { label: "DEMO", val: `${(stats.demoPnL || 0) > 0 ? "+" : ""}${Math.round(stats.demoPnL || 0)}%`, color: (stats.demoPnL || 0) >= 0 ? "#22c55e" : "#ef4444" },
             { label: "SOL", val: `${(stats.walletBalance || 0).toFixed(3)}`, color: "#f97316" },
             { label: "REAL", val: `${(stats.realPnLSol || 0) >= 0 ? "+" : ""}${(stats.realPnLSol || 0).toFixed(3)}`, color: pctColor(stats.realPnLSol || 0) },
           ].map(s => (
@@ -253,7 +305,7 @@ export default function App() {
       {/* TABS */}
       <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40", overflowX: "auto" }}>
         {[
-          { id: "monitor", label: "👀", badge: watching.length + monitored.length },
+          { id: "monitor", label: "📊", badge: monitored.length },
           { id: "signals", label: "🎯", badge: signals.length, accent: "#facc15" },
           { id: "demo", label: "💰 Demo", badge: stats.demoOpen },
           { id: "real", label: "🔴 Real", badge: stats.realOpen, accent: "#f97316" },
@@ -272,59 +324,34 @@ export default function App() {
 
         {tab === "monitor" && (
           <>
-            {/* Tokens en observación */}
-            {watching.length > 0 && (
-              <div style={{ background: "#0d1117", border: "1px solid #1e2d4088", borderRadius: 10, padding: 12 }}>
-                <div style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", marginBottom: 8 }}>👀 OBSERVANDO — esperando $300 en 30s</div>
-                {watching.map(w => (
-                  <div key={w.mint} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "1px solid #1e2d4044" }}>
-                    <span style={{ fontFamily: "monospace", fontSize: 12, color: "#f1f5f9" }}>{w.symbol}</span>
-                    <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 11 }}>
-                      <span style={{ color: (w.volumeUSD || 0) >= 300 ? "#22c55e" : "#facc15" }}>${Math.round(w.volumeUSD || 0)}</span>
-                      <span style={{ color: "#64748b" }}>{Math.max(0, Math.round((w.timeLeft || 0) / 1000))}s</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {/* Tokens monitorizando */}
-            {monitored.length === 0 && watching.length === 0 && <EmptyState icon="🔍" text="Escaneando tokens nuevos..." />}
-            {monitored.map(t => (
-              <div key={t.mint} style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: "10px 14px" }}>
+            {monitored.length === 0 && <EmptyState icon="📊" text="Escaneando PumpSwap cada 60s…" />}
+            {monitored.map(t => <TokenCard key={t.mint} token={t} />)}
+          </>
+        )}
+
+        {tab === "signals" && (
+          <>
+            {signals.length === 0 && <EmptyState icon="🎯" text="Esperando señales de Bollinger…" />}
+            {signals.map(s => (
+              <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.zone === "LOWER" ? "#22c55e" : "#facc15"}33`, borderRadius: 10, padding: "10px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                  <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{t.symbol}</span>
-                  <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{elapsed(t.detectedAt)}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{s.symbol}</span>
+                    <span style={{ fontSize: 10, color: s.zone === "LOWER" ? "#22c55e" : "#facc15", fontWeight: 700, background: s.zone === "LOWER" ? "#22c55e22" : "#facc1522", padding: "1px 6px", borderRadius: 8, fontFamily: "monospace" }}>Banda {s.zone}</span>
+                  </div>
+                  <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(s.time)}</span>
                 </div>
-                <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>
-                  <span>MC {formatMC(t.mc)}</span>
-                  <span>Vol ${Math.round(t.volumeUSD || 0)}</span>
-                  <span>{t.tradeCount || 0} trades</span>
+                <div style={{ display: "flex", gap: 12, fontFamily: "monospace", fontSize: 11, marginBottom: 8 }}>
+                  <span style={{ color: "#94a3b8" }}>MC {formatMC(s.mc)}</span>
+                  <span style={{ color: "#64748b" }}>Vol {formatMC(s.vol24h)}</span>
+                  <span style={{ color: "#22c55e" }}>TP {formatUSD(s.tp)}</span>
+                  <span style={{ color: "#ef4444" }}>SL {formatUSD(s.sl)}</span>
                 </div>
-                <a href={`https://dexscreener.com/solana/${t.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none", marginTop: 6, display: "block" }}>📊 Ver en DexScreener</a>
+                <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>📊 Ver en DexScreener →</a>
               </div>
             ))}
           </>
         )}
-
-        {tab === "signals" && signals.length === 0 && <EmptyState icon="🎯" text="Esperando señales..." />}
-        {tab === "signals" && signals.map(s => (
-          <div key={s.id} style={{ background: "#0d1117", border: "1px solid #22c55e22", borderRadius: 10, padding: "10px 14px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-              <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{s.symbol || shortAddr(s.mint)}</span>
-              <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(s.time)}</span>
-            </div>
-            <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 12, marginBottom: 6 }}>
-              <span style={{ color: "#22c55e", fontWeight: 700 }}>✅ ENTRADA</span>
-              <span style={{ color: "#94a3b8" }}>MC {formatMC(priceToMC(s.price))}</span>
-              <span style={{ color: "#64748b" }}>${Math.round(s.volumeUSD)} vol</span>
-            </div>
-            <div style={{ display: "flex", gap: 14, fontFamily: "monospace", fontSize: 11, marginBottom: 8 }}>
-              <span style={{ color: "#22c55e" }}>TP {formatMC(priceToMC(s.tp))}</span>
-              <span style={{ color: "#ef4444" }}>SL {formatMC(priceToMC(s.sl))}</span>
-            </div>
-            <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>📊 Ver en DexScreener →</a>
-          </div>
-        ))}
 
         {tab === "demo" && (
           <>
@@ -342,12 +369,11 @@ export default function App() {
 
         {tab === "real" && (
           <>
-            <div style={{ background: "#0d1117", border: "1px solid #f9741633", borderRadius: 10, padding: 12 }}>
+            <div style={{ background: "#0d1117", border: "1px solid #f9741633", borderRadius: 10, padding: 12, marginBottom: 4 }}>
               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#f97316", marginBottom: 8, fontWeight: 700 }}>🔴 TRADING REAL</div>
               <div style={{ display: "flex", justifyContent: "space-around" }}>
                 {[
                   { label: "Balance", val: `${(stats.walletBalance || 0).toFixed(4)} SOL`, color: "#f97316" },
-                  { label: "Abiertas", val: stats.realOpen || 0, color: "#38bdf8" },
                   { label: "Wins", val: stats.realWins || 0, color: "#22c55e" },
                   { label: "Losses", val: stats.realLosses || 0, color: "#ef4444" },
                   { label: "P&L SOL", val: `${(stats.realPnLSol || 0) >= 0 ? "+" : ""}${(stats.realPnLSol || 0).toFixed(4)}`, color: pctColor(stats.realPnLSol || 0) },
@@ -367,22 +393,20 @@ export default function App() {
                 </button>
               ))}
             </div>
-            {filteredReal.length === 0 && <EmptyState icon="🔴" text="Las operaciones reales aparecerán aquí automáticamente." />}
+            {filteredReal.length === 0 && <EmptyState icon="🔴" text="Las operaciones reales aparecerán aquí." />}
             {filteredReal.map(t => <RealTradeCard key={t.id} trade={t} />)}
           </>
         )}
 
         {tab === "stats" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {/* Filtros */}
             <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
-              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>FILTROS</div>
+              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>SCANNER</div>
               {[
-                { label: "Vistos", val: stats.seen || 0 },
-                { label: "Observados", val: stats.watched || 0, color: "#38bdf8" },
-                { label: "Entradas", val: stats.entered || 0, color: "#22c55e" },
-                { label: "Rechazados", val: stats.rejected || 0, color: "#ef4444" },
-                { label: "Tasa entrada", val: stats.watched > 0 ? `${Math.round((stats.entered / stats.watched) * 100)}%` : "—", color: "#facc15" },
+                { label: "Tokens escaneados", val: stats.scanned || 0 },
+                { label: "Añadidos a monitor", val: stats.added || 0, color: "#38bdf8" },
+                { label: "Señales generadas", val: stats.filtered || 0, color: "#facc15" },
+                { label: "Monitorizando ahora", val: monitored.length, color: "#22c55e" },
               ].map(s => (
                 <div key={s.label} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d40" }}>
                   <span style={{ fontSize: 12, color: "#94a3b8" }}>{s.label}</span>
@@ -414,10 +438,8 @@ export default function App() {
                 { label: "Balance wallet", val: `${(stats.walletBalance || 0).toFixed(4)} SOL`, color: "#f97316" },
                 { label: "Wins", val: stats.realWins || 0, color: "#22c55e" },
                 { label: "Losses", val: stats.realLosses || 0, color: "#ef4444" },
-                { label: "Expiradas", val: stats.realExpired || 0, color: "#f97316" },
-                { label: "Win Rate Real", val: `${realWinRate}%`, color: realWinRate >= 50 ? "#22c55e" : "#ef4444" },
+                { label: "Win Rate", val: `${realWinRate}%`, color: realWinRate >= 50 ? "#22c55e" : "#ef4444" },
                 { label: "P&L SOL", val: `${(stats.realPnLSol || 0) >= 0 ? "+" : ""}${(stats.realPnLSol || 0).toFixed(4)} SOL`, color: pctColor(stats.realPnLSol || 0) },
-                { label: "P&L %", val: `${(stats.realPnL || 0) >= 0 ? "+" : ""}${Math.round(stats.realPnL || 0)}%`, color: pctColor(stats.realPnL || 0) },
               ].map(s => (
                 <div key={s.label} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d40" }}>
                   <span style={{ fontSize: 12, color: "#94a3b8" }}>{s.label}</span>
@@ -427,13 +449,13 @@ export default function App() {
             </div>
 
             <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 14 }}>
-              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>ANÁLISIS DE PRECIO</div>
+              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#64748b", marginBottom: 10 }}>ANÁLISIS BOLLINGER</div>
               {(stats.closedCount || 0) === 0 ? (
-                <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Necesitas operaciones cerradas para ver el análisis</div>
+                <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Necesitas operaciones cerradas</div>
               ) : [
                 { label: "Ganancia máx media", val: `+${(stats.avgMaxGain || 0).toFixed(1)}%`, color: "#22c55e", desc: "Media del máximo que suben" },
                 { label: "Pérdida máx media", val: `-${(stats.avgMaxLoss || 0).toFixed(1)}%`, color: "#ef4444", desc: "Media del máximo que bajan" },
-                { label: "Trailing stop óptimo", val: (stats.avgMaxGain || 0) > 0 ? `+${Math.max(5, Math.round((stats.avgMaxGain || 0) * 0.6))}%` : "—", color: "#facc15", desc: "60% del máximo de ganancia" },
+                { label: "Trailing óptimo", val: (stats.avgMaxGain || 0) > 0 ? `+${Math.max(5, Math.round((stats.avgMaxGain || 0) * 0.6))}%` : "—", color: "#facc15", desc: "60% del máximo de ganancia" },
               ].map(s => (
                 <div key={s.label} style={{ padding: "8px 0", borderBottom: "1px solid #1e2d40" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
