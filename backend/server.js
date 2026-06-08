@@ -110,6 +110,7 @@ function shortAddr(addr) {
 function tokenToJSON(t) {
  return {
    mint: t.mint, name: t.name, symbol: t.symbol,
+   twitter: t.twitter, website: t.website, telegram: t.telegram,
    mc: t.mc, price: t.price,
    detectedAt: t.detectedAt, lastUpdate: t.lastUpdate,
    tradeCount: t.tradeCount, volumeUSD: t.volumeUSD,
@@ -145,6 +146,9 @@ function startWatching(coin) {
    mint: coin.mint,
    name: coin.name || "Unknown",
    symbol: coin.symbol || "???",
+   twitter: coin.twitter || null,
+   website: coin.website || null,
+   telegram: coin.telegram || null,
    startTime: Date.now(),
    volumeUSD: 0,
    tradeCount: 0,
@@ -156,7 +160,7 @@ function startWatching(coin) {
  state.watching.set(coin.mint, entry);
  state.stats.watched++;
  broadcast({ event: "stats", data: state.stats });
- addLog(`👀 Observando ${coin.symbol} — necesita $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`, "info");
+ addLog(`👀 ${coin.symbol}${coin.twitter ? " 𝕏" : ""}${coin.website ? " 🌐" : ""}${coin.telegram ? " ✈️" : ""} — necesita $${ENTRY_MIN_VOLUME_USD} en ${ENTRY_WINDOW_MS/1000}s`, "info");
 
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({
@@ -208,6 +212,7 @@ function openTrades(entry) {
  const signal = {
    id: `${entry.mint}-${Date.now()}`,
    mint: entry.mint, name: entry.name, symbol: entry.symbol,
+   twitter: entry.twitter, website: entry.website, telegram: entry.telegram,
    price, tp, sl, time: Date.now(),
    volumeUSD: entry.volumeUSD, tradeCount: entry.tradeCount,
  };
@@ -226,6 +231,7 @@ function startMonitoring(entry, initialPrice) {
  if (state.monitored.has(entry.mint)) return;
  const token = {
    mint: entry.mint, name: entry.name, symbol: entry.symbol,
+   twitter: entry.twitter, website: entry.website, telegram: entry.telegram,
    price: initialPrice,
    mc: initialPrice * 1_000_000_000,
    priceHigh: initialPrice, priceLow: initialPrice,
@@ -254,11 +260,6 @@ function updatePrice(mint, price, solAmount) {
  updateDemoTrades(mint, price);
  updateRealTrades(mint, price);
  broadcast({ event: "tokenUpdate", data: tokenToJSON(token) });
-}
-
-function stopMonitoring(mint) {
- state.monitored.delete(mint);
- broadcast({ event: "removeToken", data: { mint } });
 }
 
 // ── REAL TRADING ───────────────────────────────────────────────
@@ -341,7 +342,6 @@ async function openRealTrade(signal) {
  }
  const signature = await buyToken(signal.mint, SOL_PER_TRADE);
  if (!signature) return;
-
  const trade = {
    id: `real-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
    mint: signal.mint, symbol: signal.symbol, name: signal.name,
@@ -354,7 +354,6 @@ async function openRealTrade(signal) {
    trailingPhase: "INITIAL", status: "OPEN",
    expiresAt: Date.now() + MAX_TRADE_DURATION_MS, sellRetries: 0,
  };
-
  state.realTrades.unshift(trade);
  if (state.realTrades.length > 200) state.realTrades.pop();
  state.stats.realOpen++;
@@ -567,7 +566,6 @@ setInterval(() => {
 function connectPumpPortal() {
  addLog("🔌 Conectando a PumpPortal...", "info");
  pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
- let pingInterval;
 
  pumpPortalWs.on("open", () => {
    addLog("✅ PumpPortal conectado", "info");
@@ -578,38 +576,39 @@ function connectPumpPortal() {
    for (const [mint] of state.monitored.entries()) {
      pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
    }
-   pingInterval = setInterval(() => {
-     if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-       pumpPortalWs.send(JSON.stringify({ method: "ping" }));
-     }
-   }, 20_000);
  });
 
  pumpPortalWs.on("message", async (raw) => {
    try {
      const data = JSON.parse(raw.toString());
-
-     // Log primeros mensajes para diagnóstico
-     console.log("PP RAW:", JSON.stringify(data).slice(0, 300));
-
-     if (data.message) return;
+     if (data.message || data.errors) return;
 
      // Trade — actualizar precio
      if ((data.txType === "buy" || data.txType === "sell") && data.mint) {
-       const mint = data.mint;
        const mcUsd = (data.marketCapSol || 0) * solPriceUSD;
        const price = mcUsd / 1_000_000_000;
        const solAmount = data.solAmount || 0;
-       if (price > 0) updatePrice(mint, price, solAmount);
+       if (price > 0) updatePrice(data.mint, price, solAmount);
        return;
      }
 
-     // Cualquier mensaje con mint que no sea trade → token nuevo
-     if (data.mint) {
+     // Token nuevo — tiene mint pero no txType
+     if (data.mint && !data.txType) {
+       const twitter = data.twitter || null;
+       const website = data.website || null;
+       const telegram = data.telegram || null;
+
+       if (!twitter && !website && !telegram) {
+         addLog(`⛔ Sin sociales: ${data.symbol || data.mint.slice(0,8)}`, "filter");
+         seenMints.add(data.mint);
+         return;
+       }
+
        startWatching({
          mint: data.mint,
-         name: data.name || data.symbol || "Unknown",
+         name: data.name || "Unknown",
          symbol: data.symbol || "???",
+         twitter, website, telegram,
        });
      }
 
@@ -623,7 +622,6 @@ function connectPumpPortal() {
  });
 
  pumpPortalWs.on("close", () => {
-   clearInterval(pingInterval);
    addLog("🔄 PumpPortal desconectado — reconectando en 5s...", "warn");
    setTimeout(connectPumpPortal, 5000);
  });
@@ -706,6 +704,7 @@ app.get("/api/state", (req, res) => {
  res.json({
    watching: Array.from(state.watching.values()).map(w => ({
      mint: w.mint, symbol: w.symbol, name: w.name,
+     twitter: w.twitter, website: w.website, telegram: w.telegram,
      volumeUSD: w.volumeUSD, tradeCount: w.tradeCount,
      timeLeft: Math.max(0, ENTRY_WINDOW_MS - (Date.now() - w.startTime)),
    })),
@@ -728,6 +727,7 @@ wss.on("connection", (ws) => {
    data: {
      watching: Array.from(state.watching.values()).map(w => ({
        mint: w.mint, symbol: w.symbol, name: w.name,
+       twitter: w.twitter, website: w.website, telegram: w.telegram,
        volumeUSD: w.volumeUSD, tradeCount: w.tradeCount,
        timeLeft: Math.max(0, ENTRY_WINDOW_MS - (Date.now() - w.startTime)),
      })),
