@@ -24,8 +24,8 @@ const TRAILING_FOLLOW_PCT = 0.20;
 
 const ENTRY_WINDOW_MS = 30_000;
 const ENTRY_MIN_VOLUME_USD = 1000;
-const ENTRY_MIN_MC_USD = 5000;
-const ENTRY_MAX_MC_USD = 15000;
+const ENTRY_MIN_MC_USD = 3000;
+const ENTRY_MAX_MC_USD = 30000;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -152,22 +152,27 @@ setInterval(async () => {
 function startWatching(coin) {
  if (seenMints.has(coin.mint)) return;
 
+ // Filtro sociales — al menos uno
+ const tieneSociales = !!(coin.twitter || coin.website || coin.telegram);
+ if (!tieneSociales) {
+   seenMints.add(coin.mint);
+   state.stats.seen++;
+   broadcast({ event: "stats", data: state.stats });
+   return;
+ }
+
+ // Filtro MC del create — $3K-$30K
  const createMcSol = coin.marketCapSol || 0;
  const createMcUsd = createMcSol * solPriceUSD;
-
- // Filtro MC en el create — solo observar si MC está en rango $5K-$15K
  if (createMcUsd < ENTRY_MIN_MC_USD || createMcUsd > ENTRY_MAX_MC_USD) {
    seenMints.add(coin.mint);
    state.stats.seen++;
-   addLog(`⛔ MC fuera de rango (${formatMC(createMcUsd)}): ${coin.symbol}`, "filter");
    broadcast({ event: "stats", data: state.stats });
    return;
  }
 
  seenMints.add(coin.mint);
  state.stats.seen++;
-
- const createPrice = createMcUsd / 1_000_000_000;
 
  const entry = {
    mint: coin.mint,
@@ -177,19 +182,21 @@ function startWatching(coin) {
    website: coin.website || null,
    telegram: coin.telegram || null,
    startTime: Date.now(),
+   createMcUsd,           // MC del create — solo para referencia
    volumeUSD: 0,
    tradeCount: 0,
-   firstPrice: createPrice,
-   firstMcUsd: createMcUsd,
-   lastPrice: createPrice,
-   lastMcUsd: createMcUsd,
+   firstPrice: null,      // ← se llena con el primer trade real (sol/token)
+   firstMcUsd: null,
+   lastPrice: null,
    timer: null,
  };
 
  state.watching.set(coin.mint, entry);
  state.stats.watched++;
  broadcast({ event: "stats", data: state.stats });
- addLog(`👀 ${coin.symbol} | MC ${formatMC(createMcUsd)} ✅ — necesita $${ENTRY_MIN_VOLUME_USD} vol en ${ENTRY_WINDOW_MS/1000}s`, "info");
+
+ const sociales = [coin.twitter ? "𝕏" : "", coin.website ? "🌐" : "", coin.telegram ? "✈️" : ""].filter(Boolean).join("");
+ addLog(`👀 ${coin.symbol} ${sociales} | MC create: ${formatMC(createMcUsd)} — esperando primer trade`, "info");
 
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({
@@ -208,14 +215,14 @@ function updateWatching(mint, price, solAmount, mcUsd) {
  const volumeUSD = solAmount * solPriceUSD;
  entry.volumeUSD += volumeUSD;
  entry.tradeCount++;
+ entry.lastPrice = price;
 
- if (price > 0) {
-   entry.lastPrice = price;
-   entry.lastMcUsd = mcUsd;
-   if (!entry.firstPrice) {
-     entry.firstPrice = price;
-     entry.firstMcUsd = mcUsd;
-   }
+ // firstPrice = primer trade real calculado con sol/token
+ // Es el mismo método que usaremos para todos los updates → consistente
+ if (!entry.firstPrice && price > 0) {
+   entry.firstPrice = price;
+   entry.firstMcUsd = mcUsd;
+   addLog(`📍 ${entry.symbol} firstPrice: MC ${formatMC(mcUsd)} (create fue ${formatMC(entry.createMcUsd)})`, "info");
  }
 
  broadcast({ event: "watchUpdate", data: {
@@ -223,7 +230,7 @@ function updateWatching(mint, price, solAmount, mcUsd) {
    volumeUSD: entry.volumeUSD,
    tradeCount: entry.tradeCount,
    needed: ENTRY_MIN_VOLUME_USD,
-   mcUsd: entry.firstMcUsd || 0,
+   mcUsd: entry.firstMcUsd || mcUsd,
  }});
 }
 
@@ -239,8 +246,10 @@ function evaluateEntry(mint) {
    broadcast({ event: "stats", data: state.stats });
    openTrades(entry);
  } else {
-   const reason = `solo ${formatMC(entry.volumeUSD)} vol en ${elapsed}s`;
-   addLog(`❌ RECHAZADO: ${entry.symbol} — ${reason}`, "filter");
+   const reason = !entry.firstPrice
+     ? "sin trades en ventana"
+     : `solo ${formatMC(entry.volumeUSD)} vol`;
+   addLog(`❌ RECHAZADO: ${entry.symbol} — ${reason} en ${elapsed}s`, "filter");
    state.stats.rejected++;
    broadcast({ event: "stats", data: state.stats });
  }
@@ -633,7 +642,7 @@ function connectPumpPortal() {
      const data = JSON.parse(raw.toString());
      if (data.message || data.errors) return;
 
-     // Trade — actualizar precio
+     // Trade — calcular precio con sol/token (método consistente)
      if ((data.txType === "buy" || data.txType === "sell") && data.mint) {
        const walletPubkey = wallet?.publicKey?.toString();
        if (walletPubkey && data.traderPublicKey === walletPubkey) return;
@@ -641,14 +650,11 @@ function connectPumpPortal() {
        const solAmount = data.solAmount || 0;
        const tokenAmount = data.tokenAmount || 0;
 
-       let price = 0;
-       let mcUsd = 0;
        if (tokenAmount > 0 && solAmount > 0) {
-         price = (solAmount / tokenAmount) * solPriceUSD;
-         mcUsd = price * 1_000_000_000;
+         const price = (solAmount / tokenAmount) * solPriceUSD;
+         const mcUsd = price * 1_000_000_000;
+         if (price > 0) updatePrice(data.mint, price, solAmount, mcUsd);
        }
-
-       if (price > 0) updatePrice(data.mint, price, solAmount, mcUsd);
        return;
      }
 
@@ -800,7 +806,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v2 — MC $${ENTRY_MIN_MC_USD/1000}K-$${ENTRY_MAX_MC_USD/1000}K | Vol $${ENTRY_MIN_VOLUME_USD}`);
+ console.log(`🚀 SolScanBot v2 — sociales + MC $${ENTRY_MIN_MC_USD/1000}K-$${ENTRY_MAX_MC_USD/1000}K | Vol $${ENTRY_MIN_VOLUME_USD}`);
  initWallet();
  connectPumpPortal();
  connectHelius();
