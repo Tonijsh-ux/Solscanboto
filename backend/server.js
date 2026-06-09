@@ -32,7 +32,7 @@ const MIG_FOLLOW_PCT = 0.12;
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.15;
 const MOM_SL = 0.95;
-const MOM_DURATION_MS = 15 * 60 * 1000;
+const MOM_DURATION_MS = 45 * 60 * 1000; // 45 minutos
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
@@ -43,6 +43,7 @@ const MOM_BREAKEVEN_AT = 0.07;
 const MOM_LOCK_AT = 0.12;
 const MOM_FOLLOW_PCT = 0.05;
 const MOM_PENDING_TIMEOUT_MS = 30_000;
+const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000; // 3 minutos
 
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
@@ -296,11 +297,7 @@ async function momentumScan() {
          const token = state.momMonitored.get(mint);
          token.vol1h = vol1h;
          token.pct1h = pct1h;
-         // Actualizar precio con GeckoTerminal cada scan
-         if (geckoPrice > 0) {
-           addLog(`🔄 Gecko precio: ${token.symbol} $${geckoPrice.toFixed(8)}`, "info");
-           momUpdatePrice(mint, geckoPrice, 0);
-         }
+         if (geckoPrice > 0) momUpdatePrice(mint, geckoPrice, 0);
          seenMomPools.add(poolAddr);
          continue;
        }
@@ -312,7 +309,7 @@ async function momentumScan() {
        if (pct1h > MOM_MAX_PCT_1H) continue;
 
        const lastSig = momSignalCooldown.get(mint) || 0;
-       if (Date.now() - lastSig < 10 * 60 * 1000) continue;
+       if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
 
        seenMomPools.add(poolAddr);
        state.stats.mom_scanned++;
@@ -322,7 +319,6 @@ async function momentumScan() {
        state.stats.mom_signals++;
        totalSignals++;
 
-       // ── Guardar pendiente esperando precio real de PP ──────
        state.momPending.set(mint, {
          mint, symbol, name: symbol,
          geckoPrice, mc, vol1h, pct1h,
@@ -331,17 +327,17 @@ async function momentumScan() {
        });
        state.stats.mom_pending = state.momPending.size;
 
-       addLog(`⚡ MOMENTUM detectado: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)} — esperando precio real`, "info");
+       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
        if (pumpPortalWs?.readyState === WebSocket.OPEN) {
          pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
        }
 
-       // ── Fallback: si no llega precio real en 30s usar gecko ─
+       // Fallback gecko si no llega precio real en 30s
        setTimeout(() => {
          if (state.momPending.has(mint)) {
            const pending = state.momPending.get(mint);
-           addLog(`⚡ MOMENTUM entrada gecko (sin trade real): ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
+           addLog(`⚡ MOMENTUM entrada gecko: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
            momActivateFromPending(mint, pending.geckoPrice, 0);
          }
        }, MOM_PENDING_TIMEOUT_MS);
@@ -350,7 +346,7 @@ async function momentumScan() {
      }
      await new Promise(r => setTimeout(r, 500));
    }
-   addLog(`⚡ Momentum scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
+   addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
    broadcast({ event: "stats", data: state.stats });
  } catch (e) {
    addLog(`❌ Momentum scan error: ${e.message}`, "error");
@@ -375,7 +371,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
  };
 
  const source = solAmount > 0 ? "real" : "gecko";
- addLog(`⚡ MOMENTUM ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)}`, "accept");
+ addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +15% SL -5% | 45min`, "accept");
 
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
@@ -398,7 +394,6 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
 }
 
 function momUpdatePrice(mint, price, solAmount) {
- // Si está pendiente activar con precio real de PumpPortal
  if (state.momPending.has(mint) && solAmount > 0) {
    momActivateFromPending(mint, price, solAmount);
    return;
@@ -693,7 +688,7 @@ function connectPumpPortal() {
  pumpPortalWs.on("close", () => { addLog("🔄 PumpPortal reconectando...", "warn"); setTimeout(connectPumpPortal, 5000); });
 }
 
-// ── HELIUS WS — solo ping, sin procesar precios ────────────────
+// ── HELIUS WS — solo ping ──────────────────────────────────────
 function connectHelius() {
  addLog("🔌 Conectando a Helius...", "info");
  const ws = new WebSocket(HELIUS_WS);
@@ -755,7 +750,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5.3 — Gecko precio entrada + seguimiento`);
+ console.log(`🚀 SolScanBot v5.4 — 45min momentum | cooldown 3min`);
  initWallet();
  connectPumpPortal();
  connectHelius();
