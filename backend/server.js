@@ -30,8 +30,8 @@ const MIG_LOCK_AT = 0.25;
 const MIG_FOLLOW_PCT = 0.12;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.15;
-const MOM_SL = 0.95;
+const MOM_TP = 1.06;           // +6%
+const MOM_SL = 0.97;           // -3%
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
@@ -39,9 +39,9 @@ const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
-const MOM_BREAKEVEN_AT = 0.07;
-const MOM_LOCK_AT = 0.12;
-const MOM_FOLLOW_PCT = 0.05;
+const MOM_BREAKEVEN_AT = 0.03;
+const MOM_LOCK_AT = 0.05;
+const MOM_FOLLOW_PCT = 0.02;
 const MOM_PENDING_TIMEOUT_MS = 30_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 
@@ -133,7 +133,6 @@ function formatMC(n) {
  return `$${Math.round(n)}`;
 }
 
-// ── Desuscribir token de PumpPortal ───────────────────────────
 function unsubscribeToken(mint) {
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
@@ -192,7 +191,7 @@ function migUpdateWatching(mint, price, solAmount) {
  if (!entry) return;
  entry.volumeUSD += solAmount * solPriceUSD;
  entry.tradeCount++;
- entry.lastPrice = price;
+ entry.lastPrice = price; // siempre actualizar último precio
  if (!entry.firstPrice && price > 0) entry.firstPrice = price;
  broadcast({ event: "migWatchUpdate", data: {
    mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD,
@@ -207,13 +206,14 @@ function migEvaluate(mint) {
  if (!entry) return;
  state.migWatching.delete(mint);
  const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
- if (entry.volumeUSD >= MIG_MIN_VOL && entry.firstPrice) {
+ if (entry.volumeUSD >= MIG_MIN_VOL && entry.lastPrice) {
+   // ── Usar último precio estabilizado, no el primero ─────
+   entry.firstPrice = entry.lastPrice;
    addLog(`✅ MIG ENTRADA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s`, "accept");
    state.stats.mig_entered++;
    broadcast({ event: "stats", data: state.stats });
    migOpenTrades(entry);
  } else {
-   // Rechazado — desuscribir inmediatamente para no consumir eventos
    unsubscribeToken(mint);
    addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
    state.stats.mig_rejected++;
@@ -248,7 +248,6 @@ function migOpenTrades(entry) {
 }
 
 function migCleanup(mint, symbol) {
- // Desuscribir y borrar token — dejar de consumir eventos
  unsubscribeToken(mint);
  state.migMonitored.delete(mint);
  broadcast({ event: "removeToken", data: { mint } });
@@ -300,7 +299,6 @@ async function momentumScan() {
        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
        if (!mint || mint.length < 32) continue;
        totalScanned++;
-       // Actualizar precio de tokens ya monitorizados
        if (state.momMonitored.has(mint)) {
          const token = state.momMonitored.get(mint);
          token.vol1h = vol1h; token.pct1h = pct1h;
@@ -327,7 +325,6 @@ async function momentumScan() {
        });
        state.stats.mom_pending = state.momPending.size;
        addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-       // Fallback gecko si no llega precio real en 30s
        setTimeout(() => {
          if (state.momPending.has(mint)) {
            const pending = state.momPending.get(mint);
@@ -362,7 +359,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    time: Date.now(),
  };
  const source = solAmount > 0 ? "real" : "gecko";
- addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +15% SL -5% | 45min`, "accept");
+ addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3% | 45min`, "accept");
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
@@ -449,7 +446,7 @@ async function openRealTrade(signal) {
  const openReal = state.realTrades.filter(t => t.status === "OPEN");
  const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
  if (stratOpen >= 1) { addLog(`⚠️ Ya hay real abierta (${signal.strategy})`, "warn"); return; }
- if (openReal.length >= MAX_REAL_TRADES) { addLog(`⚠️ Máximo reales alcanzado`, "warn"); return; }
+ if (openReal.length >= MAX_REAL_TRADES) return;
  const balance = await getWalletBalance();
  if (balance < SOL_PER_TRADE + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL`, "warn"); return; }
  const sig = await buyToken(signal.mint, SOL_PER_TRADE);
@@ -505,7 +502,6 @@ async function closeRealTrade(trade, price, reason) {
  }
  state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
  state.stats.walletBalance = await getWalletBalance();
- // ── Limpiar token al cerrar ────────────────────────────────
  if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
  broadcast({ event: "realTradeClosed", data: trade });
@@ -565,8 +561,8 @@ function openDemoTrade(signal) {
  state.stats.demoOpen++;
  broadcast({ event: "newDemoTrade", data: trade });
  broadcast({ event: "stats", data: state.stats });
- const tpPct = signal.strategy === "migration" ? "+40%" : "+15%";
- const slPct = signal.strategy === "migration" ? "-10%" : "-5%";
+ const tpPct = signal.strategy === "migration" ? "+40%" : "+6%";
+ const slPct = signal.strategy === "migration" ? "-10%" : "-3%";
  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
 
@@ -626,7 +622,6 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
  state.stats[`${prefix}_closedCount`]++;
  state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
  state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
- // ── Limpiar token al cerrar demo ───────────────────────────
  if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
  broadcast({ event: "demoTradeClosed", data: trade });
@@ -726,7 +721,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5.5 — Cleanup al cerrar trades`);
+ console.log(`🚀 SolScanBot v5.6 — Precio entrada estabilizado + cleanup`);
  initWallet();
  connectPumpPortal();
  connectHelius();
