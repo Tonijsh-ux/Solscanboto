@@ -22,7 +22,7 @@ const MIG_TP = 1.40;
 const MIG_SL = 0.90;
 const MIG_DURATION_MS = 10 * 60 * 1000;
 const MIG_WINDOW_MS = 60_000;
-const MIG_MIN_VOL = 10_000;
+const MIG_MIN_VOL = 2_000;
 const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
 const MIG_BREAKEVEN_AT = 0.15;
@@ -30,17 +30,19 @@ const MIG_LOCK_AT = 0.25;
 const MIG_FOLLOW_PCT = 0.12;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.30;
-const MOM_SL = 0.92;
-const MOM_DURATION_MS = 5 * 60 * 1000;
-const MOM_MIN_PCT_1H = 10;      // +10% en 1h mínimo
-const MOM_MIN_VOL_1H = 100_000; // $100K vol en 1h
+const MOM_TP = 1.15;           // +15%
+const MOM_SL = 0.95;           // -5%
+const MOM_DURATION_MS = 15 * 60 * 1000; // 15 minutos
+const MOM_MIN_PCT_1H = 10;     // +10% en 1h mínimo
+const MOM_MAX_PCT_1H = 30;     // +30% máximo — no entrar si ya subió mucho
+const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
-const MOM_BREAKEVEN_AT = 0.10;
-const MOM_LOCK_AT = 0.20;
-const MOM_FOLLOW_PCT = 0.08;
+const MOM_BREAKEVEN_AT = 0.07;
+const MOM_LOCK_AT = 0.12;
+const MOM_FOLLOW_PCT = 0.05;
+const MOM_PENDING_TIMEOUT_MS = 30_000; // esperar 30s precio real
 
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
@@ -84,6 +86,7 @@ async function getTokenBalance(mint) {
 const state = {
  migWatching: new Map(),
  migMonitored: new Map(),
+ momPending: new Map(),   // ← esperando primer precio real
  momMonitored: new Map(),
  signals: [],
  demoTrades: [],
@@ -95,7 +98,7 @@ const state = {
    mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
    mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
    mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
-   mom_scanned: 0, mom_signals: 0, mom_rejected: 0,
+   mom_scanned: 0, mom_signals: 0, mom_pending: 0,
    mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
    mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
    mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
@@ -158,31 +161,24 @@ function migStartWatching(coin) {
  if (seenMigMints.has(coin.mint)) return;
  seenMigMints.add(coin.mint);
  state.stats.mig_migrations++;
-
  const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
-
- // ── FIX: solo filtrar MC si tenemos datos reales ───────────
  if (mcUsd > 0 && (mcUsd < MIG_MIN_MC || mcUsd > MIG_MAX_MC)) {
    addLog(`⛔ MIG MC fuera rango (${formatMC(mcUsd)}): ${coin.symbol}`, "filter");
    broadcast({ event: "stats", data: state.stats });
    return;
  }
-
  const entry = {
    mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
    startTime: Date.now(), migratedMcUsd: mcUsd,
    volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null, timer: null,
  };
-
  state.migWatching.set(coin.mint, entry);
  state.stats.mig_watched++;
  broadcast({ event: "stats", data: state.stats });
  addLog(`🌉 MIGRACIÓN: ${coin.symbol} | MC ${mcUsd > 0 ? formatMC(mcUsd) : "?"} — ${MIG_WINDOW_MS/1000}s`, "accept");
-
  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [coin.mint] }));
  }
-
  entry.timer = setTimeout(() => migEvaluate(coin.mint), MIG_WINDOW_MS);
 }
 
@@ -283,16 +279,18 @@ async function momentumScan() {
        const mc = parseFloat(attr.fdv_usd || 0);
        if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
 
-       // ── FIX: usar h1 en vez de m5 ─────────────────────────
        const vol1h = parseFloat(attr.volume_usd?.h1 || 0);
        const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
 
        totalScanned++;
 
-       if (vol1h < MOM_MIN_VOL_1H || pct1h < MOM_MIN_PCT_1H) continue;
+       // ── Filtros momentum ───────────────────────────────────
+       if (vol1h < MOM_MIN_VOL_1H) continue;
+       if (pct1h < MOM_MIN_PCT_1H) continue;
+       if (pct1h > MOM_MAX_PCT_1H) continue; // ya subió demasiado
 
-       const price = parseFloat(attr.base_token_price_usd || 0);
-       if (price <= 0) continue;
+       const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
+       if (geckoPrice <= 0) continue;
 
        const relationships = pool.relationships || {};
        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
@@ -305,42 +303,42 @@ async function momentumScan() {
        state.stats.mom_scanned++;
 
        const symbol = (attr.name || "").split(" / ")[0] || mint.slice(0, 8);
-       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+
+       addLog(`⚡ MOMENTUM detectado: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)} — esperando precio real`, "info");
        momSignalCooldown.set(mint, Date.now());
        state.stats.mom_signals++;
        totalSignals++;
 
-       if (!state.momMonitored.has(mint)) {
-         state.momMonitored.set(mint, {
-           mint, symbol, name: symbol, mc, price,
-           priceHigh: price, priceLow: price,
-           pct1h, vol1h,
-           tradeCount: 0, volumeUSD: 0,
-           detectedAt: Date.now(), lastUpdate: Date.now(),
-         });
-         if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-           pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-         }
-         broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
+       // ── GUARDAR PENDIENTE — no abrir trade aún ─────────────
+       // Esperamos el primer trade real de Helius/PumpPortal
+       // para usar ese precio como entryPrice real
+       state.momPending.set(mint, {
+         mint, symbol, name: symbol,
+         geckoPrice, mc, vol1h, pct1h,
+         pendingSince: Date.now(),
+         strategy: "momentum",
+       });
+       state.stats.mom_pending = state.momPending.size;
+
+       // Suscribir a trades
+       if (pumpPortalWs?.readyState === WebSocket.OPEN) {
+         pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
        }
 
-       const signal = {
-         id: `mom-${mint}-${Date.now()}`,
-         strategy: "momentum",
-         mint, name: symbol, symbol,
-         price, tp: +(price * MOM_TP).toFixed(12), sl: +(price * MOM_SL).toFixed(12),
-         mcUsd: mc, vol1h, pct1h, time: Date.now(),
-       };
-       state.signals.unshift(signal);
-       if (state.signals.length > 100) state.signals.pop();
-       broadcast({ event: "newSignal", data: signal });
-       openDemoTrade(signal);
-       openRealTrade(signal);
+       // Timeout — si en 30s no llega precio real, cancelar
+       setTimeout(() => {
+         if (state.momPending.has(mint)) {
+           addLog(`⏱️ MOMENTUM timeout sin precio real: ${symbol}`, "filter");
+           state.momPending.delete(mint);
+           state.stats.mom_pending = state.momPending.size;
+           broadcast({ event: "stats", data: state.stats });
+         }
+       }, MOM_PENDING_TIMEOUT_MS);
+
+       broadcast({ event: "stats", data: state.stats });
      }
      await new Promise(r => setTimeout(r, 500));
    }
-
-   // Log diagnóstico siempre
    addLog(`⚡ Momentum scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
    broadcast({ event: "stats", data: state.stats });
  } catch (e) {
@@ -348,7 +346,51 @@ async function momentumScan() {
  }
 }
 
+function momActivateFromPending(mint, realPrice, solAmount) {
+ const pending = state.momPending.get(mint);
+ if (!pending) return;
+ state.momPending.delete(mint);
+ state.stats.mom_pending = state.momPending.size;
+
+ // Usar precio real como entryPrice
+ const signal = {
+   id: `mom-${mint}-${Date.now()}`,
+   strategy: "momentum",
+   mint, name: pending.name, symbol: pending.symbol,
+   price: realPrice,
+   tp: +(realPrice * MOM_TP).toFixed(12),
+   sl: +(realPrice * MOM_SL).toFixed(12),
+   mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h,
+   time: Date.now(),
+ };
+
+ addLog(`⚡ MOMENTUM ENTRADA: ${pending.symbol} | precio real $${realPrice.toFixed(8)} (gecko $${pending.geckoPrice.toFixed(8)})`, "accept");
+
+ state.signals.unshift(signal);
+ if (state.signals.length > 100) state.signals.pop();
+ broadcast({ event: "newSignal", data: signal });
+
+ // Añadir a monitorizados
+ state.momMonitored.set(mint, {
+   mint, symbol: pending.symbol, name: pending.name,
+   mc: pending.mc, price: realPrice,
+   priceHigh: realPrice, priceLow: realPrice,
+   pct1h: pending.pct1h, vol1h: pending.vol1h,
+   tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
+   detectedAt: Date.now(), lastUpdate: Date.now(),
+ });
+ broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
+
+ openDemoTrade(signal);
+ openRealTrade(signal);
+}
+
 function momUpdatePrice(mint, price, solAmount) {
+ // Si está pendiente, activar con precio real
+ if (state.momPending.has(mint)) {
+   momActivateFromPending(mint, price, solAmount);
+   return;
+ }
  const token = state.momMonitored.get(mint);
  if (!token) return;
  token.price = price; token.mc = price * 1_000_000_000;
@@ -448,7 +490,7 @@ async function closeRealTrade(trade, price, reason) {
  trade.pnlPct = +pnlPct.toFixed(2);
  trade.pnlSol = +(trade.solAmount * pnlPct / 100).toFixed(4);
  const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
- const prefix = `${trade.strategy === "migration" ? "mig" : "mom"}`;
+ const prefix = trade.strategy === "migration" ? "mig" : "mom";
  if (reason === "TP" || (reason === "SL" && trade.pnlPct >= 0)) {
    trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
@@ -521,8 +563,8 @@ function openDemoTrade(signal) {
  state.stats.demoOpen++;
  broadcast({ event: "newDemoTrade", data: trade });
  broadcast({ event: "stats", data: state.stats });
- const tpPct = signal.strategy === "migration" ? "+40%" : "+30%";
- const slPct = signal.strategy === "migration" ? "-10%" : "-8%";
+ const tpPct = signal.strategy === "migration" ? "+40%" : "+15%";
+ const slPct = signal.strategy === "migration" ? "-10%" : "-5%";
  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
 
@@ -606,6 +648,7 @@ function connectPumpPortal() {
    for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
    for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
    for (const [mint] of state.momMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+   for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
  });
  pumpPortalWs.on("message", async (raw) => {
    try {
@@ -625,7 +668,7 @@ function connectPumpPortal() {
          const price = (sol / tok) * solPriceUSD;
          if (price > 0) {
            if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
-           if (state.momMonitored.has(data.mint)) momUpdatePrice(data.mint, price, sol);
+           if (state.momPending.has(data.mint) || state.momMonitored.has(data.mint)) momUpdatePrice(data.mint, price, sol);
          }
        }
      }
@@ -666,7 +709,7 @@ function connectHelius() {
      const mint = tokenBalances[0]?.mint;
      if (!mint) return;
      const isMig = state.migWatching.has(mint) || state.migMonitored.has(mint);
-     const isMom = state.momMonitored.has(mint);
+     const isMom = state.momPending.has(mint) || state.momMonitored.has(mint);
      if (!isMig && !isMom) return;
      const solDiff = Math.abs((meta.preBalances?.[0] || 0) - (meta.postBalances?.[0] || 0)) / 1e9;
      let tokenDiff = 0;
@@ -726,7 +769,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5 — Migración + Momentum`);
+ console.log(`🚀 SolScanBot v5.1 — Migración + Momentum (precio real)`);
  initWallet();
  connectPumpPortal();
  connectHelius();
