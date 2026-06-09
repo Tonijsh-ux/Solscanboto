@@ -15,7 +15,7 @@ import bs58 from "bs58";
 // ── CONFIG GLOBAL ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE = 0.05;
-const MAX_REAL_TRADES = 0;
+const MAX_REAL_TRADES = 0; // 0 = solo demo
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 1.40;
@@ -32,7 +32,7 @@ const MIG_FOLLOW_PCT = 0.12;
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.15;
 const MOM_SL = 0.95;
-const MOM_DURATION_MS = 45 * 60 * 1000; // 45 minutos
+const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
@@ -43,14 +43,11 @@ const MOM_BREAKEVEN_AT = 0.07;
 const MOM_LOCK_AT = 0.12;
 const MOM_FOLLOW_PCT = 0.05;
 const MOM_PENDING_TIMEOUT_MS = 30_000;
-const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000; // 3 minutos
+const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const HELIUS_WS = `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-const PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data?api-key=e12mybvnahb5cx2uahup8y1rahn4ewbp99rn4j2u6h6mmy37f1c7cdakf5432kbkcctmmwkcdd37cgke718qey9ne96mpy1mdncmjmut6crkeeb5f5n7ac1gf137auudd56m4u1tcwyku6h130u3m9164cdad99rmuxjpd8b9qq4d3bddu76wu7ad270k2h7155gnbm5x0kuf8";
 const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
 
@@ -136,6 +133,13 @@ function formatMC(n) {
  return `$${Math.round(n)}`;
 }
 
+// ── Desuscribir token de PumpPortal ───────────────────────────
+function unsubscribeToken(mint) {
+ if (pumpPortalWs?.readyState === WebSocket.OPEN) {
+   pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
+ }
+}
+
 let solPriceUSD = 150;
 async function updateSolPrice() {
  try {
@@ -209,6 +213,8 @@ function migEvaluate(mint) {
    broadcast({ event: "stats", data: state.stats });
    migOpenTrades(entry);
  } else {
+   // Rechazado — desuscribir inmediatamente para no consumir eventos
+   unsubscribeToken(mint);
    addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
    state.stats.mig_rejected++;
    broadcast({ event: "stats", data: state.stats });
@@ -241,6 +247,14 @@ function migOpenTrades(entry) {
  openRealTrade(signal);
 }
 
+function migCleanup(mint, symbol) {
+ // Desuscribir y borrar token — dejar de consumir eventos
+ unsubscribeToken(mint);
+ state.migMonitored.delete(mint);
+ broadcast({ event: "removeToken", data: { mint } });
+ addLog(`🗑️ ${symbol} eliminado — eventos liberados`, "info");
+}
+
 function migUpdatePrice(mint, price, solAmount) {
  if (state.migWatching.has(mint)) { migUpdateWatching(mint, price, solAmount); return; }
  const token = state.migMonitored.get(mint);
@@ -256,7 +270,7 @@ function migUpdatePrice(mint, price, solAmount) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// ESTRATEGIA 2: MOMENTUM — precio entrada y seguimiento via Gecko
+// ESTRATEGIA 2: MOMENTUM — precio via GeckoTerminal
 // ════════════════════════════════════════════════════════════════
 
 async function momentumScan() {
@@ -272,76 +286,55 @@ async function momentumScan() {
      if (!res.ok) break;
      const json = await res.json();
      const pools = json?.data || [];
-
      for (const pool of pools) {
        const attr = pool.attributes || {};
        const poolAddr = attr.address || pool.id?.replace("solana_", "");
        if (!poolAddr) continue;
-
        const mc = parseFloat(attr.fdv_usd || 0);
        if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
-
        const vol1h = parseFloat(attr.volume_usd?.h1 || 0);
        const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
        const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
        if (geckoPrice <= 0) continue;
-
        const relationships = pool.relationships || {};
        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
        if (!mint || mint.length < 32) continue;
-
        totalScanned++;
-
-       // ── Actualizar precio de tokens ya monitorizados ───────
+       // Actualizar precio de tokens ya monitorizados
        if (state.momMonitored.has(mint)) {
          const token = state.momMonitored.get(mint);
-         token.vol1h = vol1h;
-         token.pct1h = pct1h;
+         token.vol1h = vol1h; token.pct1h = pct1h;
          if (geckoPrice > 0) momUpdatePrice(mint, geckoPrice, 0);
          seenMomPools.add(poolAddr);
          continue;
        }
-
-       // ── Filtros para nuevas entradas ───────────────────────
        if (seenMomPools.has(poolAddr)) continue;
        if (vol1h < MOM_MIN_VOL_1H) continue;
        if (pct1h < MOM_MIN_PCT_1H) continue;
        if (pct1h > MOM_MAX_PCT_1H) continue;
-
        const lastSig = momSignalCooldown.get(mint) || 0;
        if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
-
        seenMomPools.add(poolAddr);
        state.stats.mom_scanned++;
-
        const symbol = (attr.name || "").split(" / ")[0] || mint.slice(0, 8);
        momSignalCooldown.set(mint, Date.now());
        state.stats.mom_signals++;
        totalSignals++;
-
        state.momPending.set(mint, {
          mint, symbol, name: symbol,
          geckoPrice, mc, vol1h, pct1h,
          pendingSince: Date.now(),
-         strategy: "momentum",
        });
        state.stats.mom_pending = state.momPending.size;
-
        addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-
-       if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-         pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-       }
-
        // Fallback gecko si no llega precio real en 30s
        setTimeout(() => {
          if (state.momPending.has(mint)) {
            const pending = state.momPending.get(mint);
-           addLog(`⚡ MOMENTUM entrada gecko: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
+           addLog(`⚡ ENTRADA gecko: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
            momActivateFromPending(mint, pending.geckoPrice, 0);
          }
        }, MOM_PENDING_TIMEOUT_MS);
-
        broadcast({ event: "stats", data: state.stats });
      }
      await new Promise(r => setTimeout(r, 500));
@@ -358,7 +351,6 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
  if (!pending) return;
  state.momPending.delete(mint);
  state.stats.mom_pending = state.momPending.size;
-
  const signal = {
    id: `mom-${mint}-${Date.now()}`,
    strategy: "momentum",
@@ -369,14 +361,11 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h,
    time: Date.now(),
  };
-
  const source = solAmount > 0 ? "real" : "gecko";
  addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +15% SL -5% | 45min`, "accept");
-
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
-
  state.momMonitored.set(mint, {
    mint, symbol: pending.symbol, name: pending.name,
    mc: pending.mc, price: entryPrice,
@@ -385,10 +374,8 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    tradeCount: solAmount > 0 ? 1 : 0,
    volumeUSD: solAmount * solPriceUSD,
    detectedAt: Date.now(), lastUpdate: Date.now(),
-   priceSource: source,
  });
  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
-
  openDemoTrade(signal);
  openRealTrade(signal);
 }
@@ -403,14 +390,16 @@ function momUpdatePrice(mint, price, solAmount) {
  token.price = price; token.mc = price * 1_000_000_000;
  token.priceHigh = Math.max(token.priceHigh, price);
  token.priceLow = Math.min(token.priceLow, price);
- if (solAmount > 0) {
-   token.tradeCount++;
-   token.volumeUSD += solAmount * solPriceUSD;
- }
+ if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
  token.lastUpdate = Date.now();
  updateDemoTrades(mint, price, "momentum");
  updateRealTrades(mint, price, "momentum");
  broadcast({ event: "momTokenUpdate", data: token });
+}
+
+function momCleanup(mint, symbol) {
+ state.momMonitored.delete(mint);
+ broadcast({ event: "removeToken", data: { mint } });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -516,6 +505,9 @@ async function closeRealTrade(trade, price, reason) {
  }
  state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
  state.stats.walletBalance = await getWalletBalance();
+ // ── Limpiar token al cerrar ────────────────────────────────
+ if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
+ if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
  broadcast({ event: "realTradeClosed", data: trade });
  broadcast({ event: "stats", data: state.stats });
 }
@@ -634,6 +626,9 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
  state.stats[`${prefix}_closedCount`]++;
  state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
  state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
+ // ── Limpiar token al cerrar demo ───────────────────────────
+ if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
+ if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
  broadcast({ event: "demoTradeClosed", data: trade });
  broadcast({ event: "stats", data: state.stats });
 }
@@ -657,7 +652,6 @@ function connectPumpPortal() {
    pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
    for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
    for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-   for (const [mint] of state.momMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
    for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
  });
  pumpPortalWs.on("message", async (raw) => {
@@ -678,7 +672,7 @@ function connectPumpPortal() {
          const price = (sol / tok) * solPriceUSD;
          if (price > 0) {
            if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
-           if (state.momPending.has(data.mint) || state.momMonitored.has(data.mint)) momUpdatePrice(data.mint, price, sol);
+           if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
          }
        }
      }
@@ -688,12 +682,10 @@ function connectPumpPortal() {
  pumpPortalWs.on("close", () => { addLog("🔄 PumpPortal reconectando...", "warn"); setTimeout(connectPumpPortal, 5000); });
 }
 
-// ── HELIUS WS — solo ping ──────────────────────────────────────
 // ── HELIUS — desactivado ───────────────────────────────────────
 function connectHelius() {
-  addLog("ℹ️ Helius desactivado — precios via PumpPortal + Gecko", "info");
+ addLog("ℹ️ Helius desactivado — precios via PumpPortal + Gecko", "info");
 }
-
 
 // ── EXPRESS + WS ───────────────────────────────────────────────
 const app = express();
@@ -734,7 +726,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5.4 — 45min momentum | cooldown 3min`);
+ console.log(`🚀 SolScanBot v5.5 — Cleanup al cerrar trades`);
  initWallet();
  connectPumpPortal();
  connectHelius();
