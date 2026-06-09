@@ -30,11 +30,11 @@ const MIG_LOCK_AT = 0.25;
 const MIG_FOLLOW_PCT = 0.12;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.15;           // +15%
-const MOM_SL = 0.95;           // -5%
-const MOM_DURATION_MS = 15 * 60 * 1000; // 15 minutos
-const MOM_MIN_PCT_1H = 10;     // +10% en 1h mínimo
-const MOM_MAX_PCT_1H = 30;     // +30% máximo — no entrar si ya subió mucho
+const MOM_TP = 1.15;
+const MOM_SL = 0.95;
+const MOM_DURATION_MS = 15 * 60 * 1000;
+const MOM_MIN_PCT_1H = 10;
+const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
@@ -42,7 +42,7 @@ const MOM_SCAN_MS = 30_000;
 const MOM_BREAKEVEN_AT = 0.07;
 const MOM_LOCK_AT = 0.12;
 const MOM_FOLLOW_PCT = 0.05;
-const MOM_PENDING_TIMEOUT_MS = 30_000; // esperar 30s precio real
+const MOM_PENDING_TIMEOUT_MS = 30_000;
 
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
@@ -86,7 +86,7 @@ async function getTokenBalance(mint) {
 const state = {
  migWatching: new Map(),
  migMonitored: new Map(),
- momPending: new Map(),   // ← esperando primer precio real
+ momPending: new Map(),
  momMonitored: new Map(),
  signals: [],
  demoTrades: [],
@@ -270,48 +270,32 @@ async function momentumScan() {
      if (!res.ok) break;
      const json = await res.json();
      const pools = json?.data || [];
-
      for (const pool of pools) {
        const attr = pool.attributes || {};
        const poolAddr = attr.address || pool.id?.replace("solana_", "");
        if (!poolAddr || seenMomPools.has(poolAddr)) continue;
-
        const mc = parseFloat(attr.fdv_usd || 0);
        if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
-
        const vol1h = parseFloat(attr.volume_usd?.h1 || 0);
        const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
-
        totalScanned++;
-
-       // ── Filtros momentum ───────────────────────────────────
        if (vol1h < MOM_MIN_VOL_1H) continue;
        if (pct1h < MOM_MIN_PCT_1H) continue;
-       if (pct1h > MOM_MAX_PCT_1H) continue; // ya subió demasiado
-
+       if (pct1h > MOM_MAX_PCT_1H) continue;
        const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
        if (geckoPrice <= 0) continue;
-
        const relationships = pool.relationships || {};
        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
        if (!mint || mint.length < 32) continue;
-
        const lastSig = momSignalCooldown.get(mint) || 0;
        if (Date.now() - lastSig < 10 * 60 * 1000) continue;
-
        seenMomPools.add(poolAddr);
        state.stats.mom_scanned++;
-
        const symbol = (attr.name || "").split(" / ")[0] || mint.slice(0, 8);
-
        addLog(`⚡ MOMENTUM detectado: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)} — esperando precio real`, "info");
        momSignalCooldown.set(mint, Date.now());
        state.stats.mom_signals++;
        totalSignals++;
-
-       // ── GUARDAR PENDIENTE — no abrir trade aún ─────────────
-       // Esperamos el primer trade real de Helius/PumpPortal
-       // para usar ese precio como entryPrice real
        state.momPending.set(mint, {
          mint, symbol, name: symbol,
          geckoPrice, mc, vol1h, pct1h,
@@ -319,13 +303,9 @@ async function momentumScan() {
          strategy: "momentum",
        });
        state.stats.mom_pending = state.momPending.size;
-
-       // Suscribir a trades
        if (pumpPortalWs?.readyState === WebSocket.OPEN) {
          pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
        }
-
-       // Timeout — si en 30s no llega precio real, cancelar
        setTimeout(() => {
          if (state.momPending.has(mint)) {
            addLog(`⏱️ MOMENTUM timeout sin precio real: ${symbol}`, "filter");
@@ -334,7 +314,6 @@ async function momentumScan() {
            broadcast({ event: "stats", data: state.stats });
          }
        }, MOM_PENDING_TIMEOUT_MS);
-
        broadcast({ event: "stats", data: state.stats });
      }
      await new Promise(r => setTimeout(r, 500));
@@ -351,8 +330,6 @@ function momActivateFromPending(mint, realPrice, solAmount) {
  if (!pending) return;
  state.momPending.delete(mint);
  state.stats.mom_pending = state.momPending.size;
-
- // Usar precio real como entryPrice
  const signal = {
    id: `mom-${mint}-${Date.now()}`,
    strategy: "momentum",
@@ -363,14 +340,10 @@ function momActivateFromPending(mint, realPrice, solAmount) {
    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h,
    time: Date.now(),
  };
-
  addLog(`⚡ MOMENTUM ENTRADA: ${pending.symbol} | precio real $${realPrice.toFixed(8)} (gecko $${pending.geckoPrice.toFixed(8)})`, "accept");
-
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
-
- // Añadir a monitorizados
  state.momMonitored.set(mint, {
    mint, symbol: pending.symbol, name: pending.name,
    mc: pending.mc, price: realPrice,
@@ -380,13 +353,11 @@ function momActivateFromPending(mint, realPrice, solAmount) {
    detectedAt: Date.now(), lastUpdate: Date.now(),
  });
  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
-
  openDemoTrade(signal);
  openRealTrade(signal);
 }
 
 function momUpdatePrice(mint, price, solAmount) {
- // Si está pendiente, activar con precio real
  if (state.momPending.has(mint)) {
    momActivateFromPending(mint, price, solAmount);
    return;
@@ -638,7 +609,7 @@ setInterval(() => {
  }
 }, 30_000);
 
-// ── PUMPPORTAL WS ──────────────────────────────────────────────
+// ── PUMPPORTAL WS — única fuente de precios ────────────────────
 function connectPumpPortal() {
  addLog("🔌 Conectando a PumpPortal...", "info");
  pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
@@ -678,7 +649,7 @@ function connectPumpPortal() {
  pumpPortalWs.on("close", () => { addLog("🔄 PumpPortal reconectando...", "warn"); setTimeout(connectPumpPortal, 5000); });
 }
 
-// ── HELIUS WS ──────────────────────────────────────────────────
+// ── HELIUS WS — solo mantiene conexión, no procesa precios ─────
 function connectHelius() {
  addLog("🔌 Conectando a Helius...", "info");
  const ws = new WebSocket(HELIUS_WS);
@@ -692,40 +663,12 @@ function connectHelius() {
        { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
      ]
    }));
-   pingInterval = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" })); }, 20_000);
+   pingInterval = setInterval(() => {
+     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
+   }, 20_000);
  });
- ws.on("message", async (raw) => {
-   try {
-     const msg = JSON.parse(raw.toString());
-     const tx = msg?.params?.result?.transaction;
-     if (!tx) return;
-     const meta = tx.meta;
-     if (!meta || meta.err) return;
-     const accountKeys = tx.transaction?.message?.accountKeys || [];
-     const walletPubkey = wallet?.publicKey?.toString();
-     if (walletPubkey && accountKeys.some(k => (k.pubkey || k) === walletPubkey)) return;
-     const tokenBalances = meta.postTokenBalances || [];
-     if (!tokenBalances.length) return;
-     const mint = tokenBalances[0]?.mint;
-     if (!mint) return;
-     const isMig = state.migWatching.has(mint) || state.migMonitored.has(mint);
-     const isMom = state.momPending.has(mint) || state.momMonitored.has(mint);
-     if (!isMig && !isMom) return;
-     const solDiff = Math.abs((meta.preBalances?.[0] || 0) - (meta.postBalances?.[0] || 0)) / 1e9;
-     let tokenDiff = 0;
-     const pre = meta.preTokenBalances || [];
-     for (const post of tokenBalances) {
-       const p = pre.find(x => x.accountIndex === post.accountIndex);
-       const diff = Math.abs(parseFloat(post.uiTokenAmount?.uiAmount || 0) - parseFloat(p?.uiTokenAmount?.uiAmount || 0));
-       if (diff > 0) { tokenDiff = diff; break; }
-     }
-     if (solDiff === 0 || tokenDiff === 0) return;
-     const price = (solDiff / tokenDiff) * solPriceUSD;
-     if (price <= 0) return;
-     if (isMig) migUpdatePrice(mint, price, solDiff);
-     if (isMom) momUpdatePrice(mint, price, solDiff);
-   } catch {}
- });
+ // ── Precios vienen solo de PumpPortal — Helius ignorado ───────
+ ws.on("message", async () => {});
  ws.on("error", (err) => addLog(`❌ Helius: ${err.message}`, "error"));
  ws.on("close", () => { clearInterval(pingInterval); addLog("🔄 Helius reconectando...", "warn"); setTimeout(connectHelius, 5000); });
 }
@@ -769,7 +712,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5.1 — Migración + Momentum (precio real)`);
+ console.log(`🚀 SolScanBot v5.2 — Solo PumpPortal para precios`);
  initWallet();
  connectPumpPortal();
  connectHelius();
