@@ -259,6 +259,7 @@ function migUpdatePrice(mint, price, solAmount) {
 // ════════════════════════════════════════════════════════════════
 
 async function momentumScan() {
+ seenMomPools.clear();
  let totalScanned = 0;
  let totalSignals = 0;
  try {
