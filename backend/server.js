@@ -689,27 +689,11 @@ function connectPumpPortal() {
 }
 
 // ── HELIUS WS — solo ping ──────────────────────────────────────
+// ── HELIUS — desactivado ───────────────────────────────────────
 function connectHelius() {
- addLog("🔌 Conectando a Helius...", "info");
- const ws = new WebSocket(HELIUS_WS);
- let pingInterval;
- ws.on("open", () => {
-   addLog("✅ Helius conectado 🚀", "info");
-   ws.send(JSON.stringify({
-     jsonrpc: "2.0", id: 420, method: "transactionSubscribe",
-     params: [
-       { accountInclude: [PUMPSWAP_PROGRAM, PUMPFUN_PROGRAM], failed: false },
-       { commitment: "processed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
-     ]
-   }));
-   pingInterval = setInterval(() => {
-     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "ping" }));
-   }, 20_000);
- });
- ws.on("message", async () => {});
- ws.on("error", (err) => addLog(`❌ Helius: ${err.message}`, "error"));
- ws.on("close", () => { clearInterval(pingInterval); addLog("🔄 Helius reconectando...", "warn"); setTimeout(connectHelius, 5000); });
+  addLog("ℹ️ Helius desactivado — precios via PumpPortal + Gecko", "info");
 }
+
 
 // ── EXPRESS + WS ───────────────────────────────────────────────
 const app = express();
