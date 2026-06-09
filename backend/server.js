@@ -15,7 +15,7 @@ import bs58 from "bs58";
 // ── CONFIG GLOBAL ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE = 0.05;
-const MAX_REAL_TRADES = 2;
+const MAX_REAL_TRADES = 0;
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 1.40;
