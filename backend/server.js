@@ -19,7 +19,7 @@ const MAX_REAL_TRADES = 0; // 0 = solo demo
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 1.40;
-const MIG_SL = 0.90;
+const MIG_SL = 0.85;
 const MIG_DURATION_MS = 10 * 60 * 1000;
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL = 2_000;
@@ -28,10 +28,11 @@ const MIG_MAX_MC = 2_000_000;
 const MIG_BREAKEVEN_AT = 0.15;
 const MIG_LOCK_AT = 0.25;
 const MIG_FOLLOW_PCT = 0.12;
+const MIG_MAX_PRICE_RATIO = 2.0;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.06;           // +6%
-const MOM_SL = 0.97;           // -3%
+const MOM_TP = 1.06;
+const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
@@ -139,6 +140,26 @@ function unsubscribeToken(mint) {
  }
 }
 
+// ── Calcular precio desde datos PumpPortal ─────────────────────
+function calcPrice(data) {
+ // Preferir marketCapSol — precio oficial del protocolo
+ if (data.marketCapSol && data.marketCapSol > 0) {
+   return (data.marketCapSol * solPriceUSD) / 1_000_000_000;
+ }
+ // Fallback: sol/token
+ const sol = data.solAmount || 0;
+ const tok = data.tokenAmount || 0;
+ if (sol > 0 && tok > 0) return (sol / tok) * solPriceUSD;
+ return 0;
+}
+
+// ── Filtrar precio absurdo ─────────────────────────────────────
+function isPriceValid(newPrice, knownPrice) {
+ if (!knownPrice || knownPrice === 0) return newPrice > 0;
+ const ratio = newPrice / knownPrice;
+ return ratio >= (1 / MIG_MAX_PRICE_RATIO) && ratio <= MIG_MAX_PRICE_RATIO;
+}
+
 let solPriceUSD = 150;
 async function updateSolPrice() {
  try {
@@ -186,12 +207,11 @@ function migStartWatching(coin) {
  entry.timer = setTimeout(() => migEvaluate(coin.mint), MIG_WINDOW_MS);
 }
 
-function migUpdateWatching(mint, price, solAmount) {
- const entry = state.migWatching.get(mint);
- if (!entry) return;
+function migUpdateWatching(mint, price, solAmount, entry) {
+ if (!isPriceValid(price, entry.lastPrice)) return;
  entry.volumeUSD += solAmount * solPriceUSD;
  entry.tradeCount++;
- entry.lastPrice = price; // siempre actualizar último precio
+ entry.lastPrice = price;
  if (!entry.firstPrice && price > 0) entry.firstPrice = price;
  broadcast({ event: "migWatchUpdate", data: {
    mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD,
@@ -207,7 +227,6 @@ function migEvaluate(mint) {
  state.migWatching.delete(mint);
  const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
  if (entry.volumeUSD >= MIG_MIN_VOL && entry.lastPrice) {
-   // ── Usar último precio estabilizado, no el primero ─────
    entry.firstPrice = entry.lastPrice;
    addLog(`✅ MIG ENTRADA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s`, "accept");
    state.stats.mig_entered++;
@@ -255,9 +274,11 @@ function migCleanup(mint, symbol) {
 }
 
 function migUpdatePrice(mint, price, solAmount) {
- if (state.migWatching.has(mint)) { migUpdateWatching(mint, price, solAmount); return; }
+ const entry = state.migWatching.get(mint);
+ if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
  const token = state.migMonitored.get(mint);
  if (!token) return;
+ if (!isPriceValid(price, token.price)) return;
  token.price = price; token.mc = price * 1_000_000_000;
  token.priceHigh = Math.max(token.priceHigh, price);
  token.priceLow = Math.min(token.priceLow, price);
@@ -562,7 +583,7 @@ function openDemoTrade(signal) {
  broadcast({ event: "newDemoTrade", data: trade });
  broadcast({ event: "stats", data: state.stats });
  const tpPct = signal.strategy === "migration" ? "+40%" : "+6%";
- const slPct = signal.strategy === "migration" ? "-10%" : "-3%";
+ const slPct = signal.strategy === "migration" ? "-15%" : "-3%";
  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
 
@@ -661,14 +682,17 @@ function connectPumpPortal() {
      if ((data.txType === "buy" || data.txType === "sell") && data.mint) {
        const walletPubkey = wallet?.publicKey?.toString();
        if (walletPubkey && data.traderPublicKey === walletPubkey) return;
+
+       // ── Precio via marketCapSol (preferido) o sol/token ───
+       const price = calcPrice(data);
+       if (price <= 0) return;
+
        const sol = data.solAmount || 0;
-       const tok = data.tokenAmount || 0;
-       if (tok > 0 && sol > 0) {
-         const price = (sol / tok) * solPriceUSD;
-         if (price > 0) {
-           if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
-           if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
-         }
+       if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) {
+         migUpdatePrice(data.mint, price, sol);
+       }
+       if (state.momPending.has(data.mint)) {
+         momActivateFromPending(data.mint, price, sol);
        }
      }
    } catch (e) { console.log("PP:", e.message); }
@@ -721,7 +745,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v5.6 — Precio entrada estabilizado + cleanup`);
+ console.log(`🚀 SolScanBot v5.8 — marketCapSol precio oficial`);
  initWallet();
  connectPumpPortal();
  connectHelius();
