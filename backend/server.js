@@ -44,9 +44,9 @@ const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
-const MOM_MIN_VOL_1H = 100_000;
-const MOM_MIN_MC = 100_000;
-const MOM_MAX_MC = 1_000_000;
+const MOM_MIN_VOL_1H = 50_000;    // bajado de $100K a $50K
+const MOM_MIN_MC = 50_000;         // bajado de $100K a $50K
+const MOM_MAX_MC = 5_000_000;      // subido de $1M a $5M
 const MOM_SCAN_MS = 30_000;
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
@@ -314,7 +314,6 @@ function migValidateAndEnter(entry) {
  setTimeout(() => {
    const now = Date.now();
    const priceNow = entry.lastPrice || priceAtTrigger;
-   // Check 1: caída durante delay
    if (priceAtTrigger > 0 && priceNow > 0) {
      const dropInDelay = (priceAtTrigger - priceNow) / priceAtTrigger;
      if (dropInDelay > MIG_MAX_DROP_IN_DELAY) {
@@ -323,7 +322,6 @@ function migValidateAndEnter(entry) {
        broadcast({ event: "stats", data: state.stats }); return;
      }
    }
-   // Check 2: colapso vertical vs máximo reciente
    const recent3s = entry.priceHistory.filter(p => now - p.time <= 3000);
    if (recent3s.length >= 2) {
      const maxRecent = Math.max(...recent3s.map(p => p.price));
@@ -335,7 +333,6 @@ function migValidateAndEnter(entry) {
        broadcast({ event: "stats", data: state.stats }); return;
      }
    }
-   // Check 3: señal alcista obligatoria
    const lookback5s = entry.priceHistory.filter(p => now - p.time <= 5000);
    if (lookback5s.length >= 2) {
      const priceAgo = lookback5s[0].price;
@@ -414,7 +411,7 @@ async function momentumScan() {
      sort_type: "desc",
      offset: "0",
      limit: "50",
-     min_liquidity: "50000",
+     min_liquidity: "10000",
      min_volume_1h_usd: String(MOM_MIN_VOL_1H),
      min_price_change_1h_percent: String(MOM_MIN_PCT_1H),
      min_market_cap: String(MOM_MIN_MC),
@@ -437,12 +434,10 @@ async function momentumScan() {
    }
 
    const json = await res.json();
-   addLog(`🔍 Birdeye raw: ${JSON.stringify(json).slice(0, 300)}`, "info");
-const tokens = json?.data?.items || json?.data?.tokens || json?.data || [];
-
+   const tokens = json?.data?.items || json?.data?.tokens || json?.data || [];
 
    if (!Array.isArray(tokens)) {
-     addLog(`⚠️ Birdeye respuesta inesperada: ${JSON.stringify(json).slice(0, 100)}`, "warn");
+     addLog(`⚠️ Birdeye respuesta inesperada`, "warn");
      return;
    }
 
@@ -458,7 +453,7 @@ const tokens = json?.data?.items || json?.data?.tokens || json?.data || [];
      const name = token.name || symbol;
 
      if (price <= 0) continue;
-     if (pct1h > MOM_MAX_PCT_1H) continue; // filtrar si subió demasiado
+     if (pct1h > MOM_MAX_PCT_1H) continue;
 
      totalScanned++;
 
@@ -490,16 +485,13 @@ const tokens = json?.data?.items || json?.data?.tokens || json?.data || [];
 
      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
-     // Cancelar si no llega precio real en 30s
+     // ── Si no llega precio real en 30s, usar precio Birdeye ──
      setTimeout(() => {
        if (state.momPending.has(mint)) {
          const pending = state.momPending.get(mint);
-         addLog(`⛔ MOM CANCELADA [timeout]: ${pending.symbol} — sin precio real en 30s`, "filter");
-         state.momPending.delete(mint);
-         state.stats.mom_pending = state.momPending.size;
-         state.stats.mom_cancelled++;
-         unsubscribeToken(mint);
-         broadcast({ event: "stats", data: state.stats });
+         addLog(`⚡ ENTRADA [birdeye]: ${pending.symbol} @ $${pending.birdeyePrice.toFixed(8)}`, "accept");
+         // Pasar solAmount=1 para bypass del check, marcar como birdeye
+         momActivateFromPending(mint, pending.birdeyePrice, 1);
        }
      }, MOM_PENDING_TIMEOUT_MS);
 
@@ -525,14 +517,13 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    price: entryPrice, tp: +(entryPrice * MOM_TP).toFixed(12), sl: +(entryPrice * MOM_SL).toFixed(12),
    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
  };
- addLog(`⚡ ENTRADA [real PP]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3%`, "accept");
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
  state.momMonitored.set(mint, {
    mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
    priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
-   tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
+   tradeCount: 0, volumeUSD: 0,
    detectedAt: Date.now(), lastUpdate: Date.now(),
  });
  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
@@ -926,7 +917,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v6.5 — Birdeye V3 API correcto`);
+ console.log(`🚀 SolScanBot v6.6 — Birdeye V3 + filtros relajados + fallback precio`);
  loadState();
  initWallet();
  connectPumpPortal();
