@@ -444,7 +444,9 @@ async function momentumScan() {
 
     const json = await res.json();
     const tokens = json?.data?.items || [];
+    addLog(`🔍 Birdeye devolvió ${tokens.length} tokens (antes de filtrar)`, "info");
 
+    
     if (!Array.isArray(tokens)) {
       addLog(`⚠️ Birdeye respuesta inesperada`, "warn");
       return;
