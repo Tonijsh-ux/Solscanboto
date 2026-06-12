@@ -267,7 +267,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [],
+    priceHistory: [], calSupply: null,
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -307,7 +307,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * 1_000_000_000,
+    mc: price * (entry.calSupply || 1_000_000_000),
   }});
 }
 
@@ -365,7 +365,7 @@ function migValidateAndEnter(entry) {
       }
     }
     entry.firstPrice = priceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * (entry.calSupply || 1_000_000_000))}`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -373,11 +373,12 @@ function migValidateAndEnter(entry) {
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
+  const supply = entry.calSupply || 1_000_000_000;
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price * MIG_TP).toFixed(12), sl: +(price * MIG_SL).toFixed(12),
-    mcUsd: price * 1_000_000_000, volumeUSD: entry.volumeUSD, time: Date.now(),
+    mcUsd: price * supply, volumeUSD: entry.volumeUSD, time: Date.now(),
   };
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
@@ -385,7 +386,8 @@ function migOpenTrades(entry) {
   if (!state.migMonitored.has(entry.mint)) {
     state.migMonitored.set(entry.mint, {
       mint: entry.mint, name: entry.name, symbol: entry.symbol,
-      price, mc: price * 1_000_000_000, priceHigh: price, priceLow: price,
+      price, mc: price * supply, priceHigh: price, priceLow: price,
+      calSupply: entry.calSupply,
       tradeCount: entry.tradeCount, volumeUSD: entry.volumeUSD,
       detectedAt: entry.startTime, lastUpdate: Date.now(),
     });
@@ -408,7 +410,8 @@ function migUpdatePrice(mint, price, solAmount) {
   const token = state.migMonitored.get(mint);
   if (!token) return;
   if (!isPriceValid(price, token.price)) return;
-  token.price = price; token.mc = price * 1_000_000_000;
+  const supply = token.calSupply || 1_000_000_000;
+  token.price = price; token.mc = price * supply;
   token.priceHigh = Math.max(token.priceHigh, price);
   token.priceLow = Math.min(token.priceLow, price);
   token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD;
@@ -509,7 +512,8 @@ async function momentumScan() {
       state.momPending.set(mint, {
         mint, symbol, name,
         birdeyePrice: price,
-        supply,                         // supply real guardado
+        supply,                         // supply de Birdeye (fallback)
+        calSupply: null,                // supply calibrado (se rellena con trades)
         mc, vol1h, pct1h,
         pendingSince: Date.now(),
       });
@@ -564,6 +568,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   state.momPending.delete(mint);
   state.stats.mom_pending = state.momPending.size;
 
+  const supply = pending.calSupply || pending.supply;
   const signal = {
     id: `mom-${mint}-${Date.now()}`, strategy: "momentum",
     mint, name: pending.name, symbol: pending.symbol,
@@ -576,7 +581,8 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   broadcast({ event: "newSignal", data: signal });
   state.momMonitored.set(mint, {
     mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
-    supply: pending.supply,             // supply real guardado para los updates
+    supply: pending.supply,             // supply Birdeye (fallback)
+    calSupply: pending.calSupply,       // supply calibrado si ya se calculó
     priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
     tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
     detectedAt: Date.now(), lastUpdate: Date.now(),
@@ -593,7 +599,8 @@ function momUpdatePrice(mint, price, solAmount) {
   }
   const token = state.momMonitored.get(mint);
   if (!token) return;
-  token.price = price; token.mc = price * (token.supply || 1_000_000_000);
+  const supply = token.calSupply || token.supply || 1_000_000_000;
+  token.price = price; token.mc = price * supply;
   token.priceHigh = Math.max(token.priceHigh, price);
   token.priceLow = Math.min(token.priceLow, price);
   if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
@@ -1013,7 +1020,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.9 — Birdeye Meme List (PumpSwap) + supply real`);
+  console.log(`🚀 SolScanBot v7.0 — calcPrice una escala + autocalibración supply + reset stats`);
   loadState();
   initWallet();
   connectPumpPortal();
