@@ -462,11 +462,13 @@ async function momentumScan() {
       const pct1h = token.price_change_1h_percent || 0;
       const price = token.price || 0;
       const supply = token.total_supply || token.circulating_supply || 1_000_000_000;
+      const liquidity = token.liquidity || 0;
       const symbol = token.symbol || mint.slice(0, 8);
       const name = token.name || symbol;
 
       if (price <= 0) continue;
       if (pct1h > MOM_MAX_PCT_1H) continue;
+      if (liquidity > 0 && liquidity < 10000) continue; // filtro liquidez en código
 
       totalScanned++;
 
