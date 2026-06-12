@@ -412,6 +412,10 @@ async function momentumScan() {
   let totalSignals = 0;
   try {
     const minLastTrade = Math.floor((Date.now() - MOM_LAST_TRADE_WINDOW_MS) / 1000);
+    // Birdeye limita a 5 filtros min/max simultáneos. Estos son los 5:
+    // min_volume_1h_usd, min_price_change_1h_percent, min_market_cap,
+    // max_market_cap, min_last_trade_unix_time
+    // min_liquidity se filtra en el código (graduated:true ya garantiza pool real)
     const params = new URLSearchParams({
       sort_by: "price_change_1h_percent",
       sort_type: "desc",
@@ -419,7 +423,6 @@ async function momentumScan() {
       graduated: "true",                // solo los ya migrados a PumpSwap
       offset: "0",
       limit: "50",
-      min_liquidity: "10000",
       min_volume_1h_usd: String(MOM_MIN_VOL_1H),
       min_price_change_1h_percent: String(MOM_MIN_PCT_1H),
       min_market_cap: String(MOM_MIN_MC),
