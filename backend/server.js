@@ -47,7 +47,7 @@ const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 50_000;
 const MOM_MIN_MC = 50_000;
 const MOM_MAX_MC = 5_000_000;
-const MOM_MAX_OPEN = 3;            // máximo 3 momentum abiertas a la vez
+const MOM_MAX_OPEN = 3;
 const MOM_SCAN_MS = 30_000;
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
@@ -400,7 +400,7 @@ function migUpdatePrice(mint, price, solAmount) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// ESTRATEGIA 2: MOMENTUM — Birdeye V3 API
+// ESTRATEGIA 2: MOMENTUM — Birdeye V3 + precio real PumpPortal
 // ════════════════════════════════════════════════════════════════
 
 async function momentumScan() {
@@ -467,7 +467,7 @@ async function momentumScan() {
      const lastSig = momSignalCooldown.get(mint) || 0;
      if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
 
-     // ── Comprobar límite de abiertas ANTES de añadir a pending ──
+     // Comprobar límite de abiertas
      const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
      if (momOpen >= MOM_MAX_OPEN) continue;
 
@@ -483,18 +483,23 @@ async function momentumScan() {
      });
      state.stats.mom_pending = state.momPending.size;
 
+     // Suscribir a PumpPortal para precio real
      if (pumpPortalWs?.readyState === WebSocket.OPEN) {
        pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
      }
 
      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
-     // Si no llega precio real en 30s, usar precio Birdeye
+     // ── Opción A: cancelar si no llega precio real en 30s ─────
      setTimeout(() => {
        if (state.momPending.has(mint)) {
          const pending = state.momPending.get(mint);
-         addLog(`⚡ ENTRADA [birdeye]: ${pending.symbol} @ $${pending.birdeyePrice.toFixed(8)}`, "accept");
-         momActivateFromPending(mint, pending.birdeyePrice, 1);
+         addLog(`⛔ MOM CANCELADA [timeout]: ${pending.symbol} — sin precio real en 30s`, "filter");
+         state.momPending.delete(mint);
+         state.stats.mom_pending = state.momPending.size;
+         state.stats.mom_cancelled++;
+         unsubscribeToken(mint);
+         broadcast({ event: "stats", data: state.stats });
        }
      }, MOM_PENDING_TIMEOUT_MS);
 
@@ -513,7 +518,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
  const pending = state.momPending.get(mint);
  if (!pending) return;
 
- // ── Comprobar límite al activar ───────────────────────────────
+ // Comprobar límite al activar
  const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
  if (momOpen >= MOM_MAX_OPEN) {
    addLog(`⛔ MOM límite: ya hay ${momOpen} abiertas — cancelando ${pending.symbol}`, "filter");
@@ -533,13 +538,14 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    price: entryPrice, tp: +(entryPrice * MOM_TP).toFixed(12), sl: +(entryPrice * MOM_SL).toFixed(12),
    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
  };
+ addLog(`⚡ ENTRADA [real PP]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3%`, "accept");
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
  state.momMonitored.set(mint, {
    mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
    priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
-   tradeCount: 0, volumeUSD: 0,
+   tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
    detectedAt: Date.now(), lastUpdate: Date.now(),
  });
  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
@@ -933,7 +939,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v6.7 — MOM máximo 3 abiertas`);
+ console.log(`🚀 SolScanBot v6.8 — MOM solo precio real PumpPortal`);
  loadState();
  initWallet();
  connectPumpPortal();
