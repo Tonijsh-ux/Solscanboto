@@ -412,10 +412,9 @@ async function momentumScan() {
   let totalSignals = 0;
   try {
     const minLastTrade = Math.floor((Date.now() - MOM_LAST_TRADE_WINDOW_MS) / 1000);
-    // Birdeye limita a 5 filtros min/max simultáneos. Estos son los 5:
-    // min_volume_1h_usd, min_price_change_1h_percent, min_market_cap,
-    // max_market_cap, min_last_trade_unix_time
-    // min_liquidity se filtra en el código (graduated:true ya garantiza pool real)
+    // Birdeye cuenta graduated + cada min/max como "filtro" y limita a 5 total.
+    // En la query: graduated + 3 min/max (MC min, MC max, price change) = 4.
+    // min_volume_1h_usd y min_last_trade se filtran en el código (abajo).
     const params = new URLSearchParams({
       sort_by: "price_change_1h_percent",
       sort_type: "desc",
@@ -423,11 +422,9 @@ async function momentumScan() {
       graduated: "true",                // solo los ya migrados a PumpSwap
       offset: "0",
       limit: "50",
-      min_volume_1h_usd: String(MOM_MIN_VOL_1H),
       min_price_change_1h_percent: String(MOM_MIN_PCT_1H),
       min_market_cap: String(MOM_MIN_MC),
       max_market_cap: String(MOM_MAX_MC),
-      min_last_trade_unix_time: String(minLastTrade),
     });
 
     const res = await fetch(`${BIRDEYE_MEME_URL}?${params}`, {
@@ -463,12 +460,16 @@ async function momentumScan() {
       const price = token.price || 0;
       const supply = token.total_supply || token.circulating_supply || 1_000_000_000;
       const liquidity = token.liquidity || 0;
+      const lastTrade = token.last_trade_unix_time || 0;
       const symbol = token.symbol || mint.slice(0, 8);
       const name = token.name || symbol;
 
       if (price <= 0) continue;
       if (pct1h > MOM_MAX_PCT_1H) continue;
-      if (liquidity > 0 && liquidity < 10000) continue; // filtro liquidez en código
+      // Filtros movidos de la query al código (límite de 5 filtros en Birdeye):
+      if (vol1h < MOM_MIN_VOL_1H) continue;                       // volumen 1h mínimo
+      if (lastTrade > 0 && lastTrade < minLastTrade) continue;    // trade en últimos 10min
+      if (liquidity > 0 && liquidity < 10000) continue;           // liquidez mínima
 
       totalScanned++;
 
