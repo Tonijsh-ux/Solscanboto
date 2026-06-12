@@ -44,9 +44,10 @@ const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
-const MOM_MIN_VOL_1H = 50_000;    // bajado de $100K a $50K
-const MOM_MIN_MC = 50_000;         // bajado de $100K a $50K
-const MOM_MAX_MC = 5_000_000;      // subido de $1M a $5M
+const MOM_MIN_VOL_1H = 50_000;
+const MOM_MIN_MC = 50_000;
+const MOM_MAX_MC = 5_000_000;
+const MOM_MAX_OPEN = 3;            // máximo 3 momentum abiertas a la vez
 const MOM_SCAN_MS = 30_000;
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
@@ -445,9 +446,9 @@ async function momentumScan() {
      const mint = token.address;
      if (!mint || mint.length < 32) continue;
 
-     const mc = token.market_cap || token.mc || token.realMc || 0;
-     const vol1h = token.volume_1h_usd || token.v1hUSD || 0;
-     const pct1h = token.price_change_1h_percent || token.v1hChangePercent || 0;
+     const mc = token.market_cap || token.mc || 0;
+     const vol1h = token.volume_1h_usd || 0;
+     const pct1h = token.price_change_1h_percent || 0;
      const price = token.price || 0;
      const symbol = token.symbol || mint.slice(0, 8);
      const name = token.name || symbol;
@@ -466,6 +467,10 @@ async function momentumScan() {
      const lastSig = momSignalCooldown.get(mint) || 0;
      if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
 
+     // ── Comprobar límite de abiertas ANTES de añadir a pending ──
+     const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
+     if (momOpen >= MOM_MAX_OPEN) continue;
+
      state.stats.mom_scanned++;
      momSignalCooldown.set(mint, Date.now());
      state.stats.mom_signals++;
@@ -478,19 +483,17 @@ async function momentumScan() {
      });
      state.stats.mom_pending = state.momPending.size;
 
-     // Suscribir a PumpPortal para precio real
      if (pumpPortalWs?.readyState === WebSocket.OPEN) {
        pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
      }
 
      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
-     // ── Si no llega precio real en 30s, usar precio Birdeye ──
+     // Si no llega precio real en 30s, usar precio Birdeye
      setTimeout(() => {
        if (state.momPending.has(mint)) {
          const pending = state.momPending.get(mint);
          addLog(`⚡ ENTRADA [birdeye]: ${pending.symbol} @ $${pending.birdeyePrice.toFixed(8)}`, "accept");
-         // Pasar solAmount=1 para bypass del check, marcar como birdeye
          momActivateFromPending(mint, pending.birdeyePrice, 1);
        }
      }, MOM_PENDING_TIMEOUT_MS);
@@ -509,8 +512,21 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
  if (solAmount <= 0) return;
  const pending = state.momPending.get(mint);
  if (!pending) return;
+
+ // ── Comprobar límite al activar ───────────────────────────────
+ const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
+ if (momOpen >= MOM_MAX_OPEN) {
+   addLog(`⛔ MOM límite: ya hay ${momOpen} abiertas — cancelando ${pending.symbol}`, "filter");
+   state.momPending.delete(mint);
+   state.stats.mom_pending = state.momPending.size;
+   unsubscribeToken(mint);
+   broadcast({ event: "stats", data: state.stats });
+   return;
+ }
+
  state.momPending.delete(mint);
  state.stats.mom_pending = state.momPending.size;
+
  const signal = {
    id: `mom-${mint}-${Date.now()}`, strategy: "momentum",
    mint, name: pending.name, symbol: pending.symbol,
@@ -917,7 +933,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v6.6 — Birdeye V3 + filtros relajados + fallback precio`);
+ console.log(`🚀 SolScanBot v6.7 — MOM máximo 3 abiertas`);
  loadState();
  initWallet();
  connectPumpPortal();
