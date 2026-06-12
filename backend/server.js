@@ -32,11 +32,11 @@ const MIG_BREAKEVEN_AT = 0.22;
 const MIG_BREAKEVEN_MARGIN = 0.03;
 const MIG_LOCK_AT = 0.20;
 const MIG_FOLLOW_PCT = 0.20;
-const MIG_MAX_PRICE_RATIO = 2.0;
+const MIG_MAX_PRICE_RATIO = 5.0;   // Fix 1: relajado de 2x a 5x para capturar caídas
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
-const MIG_MAX_DROP_IN_DELAY = 0.05;  // abortar si cae >5% en delay
-const MIG_MAX_DROP_VERTICAL = 0.15;  // abortar si cayó >15% en últimos 3s
+const MIG_MAX_DROP_IN_DELAY = 0.05;
+const MIG_MAX_DROP_VERTICAL = 0.15;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
@@ -101,12 +101,12 @@ const state = {
  log: [],
  stats: {
    mig_migrations: 0, mig_watched: 0, mig_entered: 0, mig_rejected: 0,
-   mig_aborted: 0, // nuevas entradas abortadas por validación
+   mig_aborted: 0,
    mig_demoWins: 0, mig_demoLosses: 0, mig_demoExpired: 0, mig_demoPnL: 0,
    mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
    mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
    mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
-   mom_scanned: 0, mom_signals: 0, mom_pending: 0,
+   mom_scanned: 0, mom_signals: 0, mom_pending: 0, mom_cancelled: 0,
    mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
    mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
    mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
@@ -246,7 +246,7 @@ function migStartWatching(coin) {
    mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
    startTime: Date.now(), migratedMcUsd: mcUsd,
    volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-   priceHistory: [], // historial de precios para detectar colapso vertical
+   priceHistory: [],
    timer: null, entered: false,
  };
  state.migWatching.set(coin.mint, entry);
@@ -261,14 +261,18 @@ function migStartWatching(coin) {
 
 function migUpdateWatching(mint, price, solAmount, entry) {
  if (entry.entered) return;
+
+ // ── Fix 1: guardar en historial ANTES de filtrar ───────────
+ if (price > 0) {
+   entry.priceHistory.push({ price, time: Date.now() });
+   if (entry.priceHistory.length > 30) entry.priceHistory.shift();
+ }
+
+ // Filtro anti-glitch extremo (5x en vez de 2x)
  if (!isPriceValid(price, entry.lastPrice)) return;
+
  entry.volumeUSD += solAmount * solPriceUSD;
  entry.tradeCount++;
-
- // Guardar historial de precios con timestamp
- entry.priceHistory.push({ price, time: Date.now() });
- if (entry.priceHistory.length > 20) entry.priceHistory.shift();
-
  entry.lastPrice = price;
  if (!entry.firstPrice && price > 0) entry.firstPrice = price;
  const elapsed = Date.now() - entry.startTime;
@@ -311,12 +315,12 @@ function migEvaluate(mint) {
  }
 }
 
-// ── VALIDACIÓN DE PRECIO ANTES DE ENTRAR (Fuga A) ─────────────
+// ── VALIDACIÓN COMPLETA ANTES DE ENTRAR ────────────────────────
 function migValidateAndEnter(entry) {
  const priceAtTrigger = entry.lastPrice;
 
  setTimeout(() => {
-   // Precio actual al final del delay
+   const now = Date.now();
    const priceNow = entry.lastPrice || priceAtTrigger;
 
    // ── Check 1: caída durante el delay ───────────────────────
@@ -331,15 +335,14 @@ function migValidateAndEnter(entry) {
      }
    }
 
-   // ── Check 2: colapso vertical reciente ────────────────────
-   const now = Date.now();
+   // ── Fix 2: check vertical vs MÁXIMO reciente (no oldest) ──
    const recent3s = entry.priceHistory.filter(p => now - p.time <= 3000);
    if (recent3s.length >= 2) {
-     const oldest = recent3s[0].price;
+     const maxRecent = Math.max(...recent3s.map(p => p.price));
      const newest = recent3s[recent3s.length - 1].price;
-     const verticalDrop = (oldest - newest) / oldest;
+     const verticalDrop = (maxRecent - newest) / maxRecent;
      if (verticalDrop > MIG_MAX_DROP_VERTICAL) {
-       addLog(`⛔ MIG ABORTADA [vertical]: ${entry.symbol} colapso ${(verticalDrop*100).toFixed(1)}% en 3s`, "filter");
+       addLog(`⛔ MIG ABORTADA [vertical]: ${entry.symbol} colapso ${(verticalDrop*100).toFixed(1)}% desde pico`, "filter");
        state.stats.mig_aborted++;
        unsubscribeToken(entry.mint);
        broadcast({ event: "stats", data: state.stats });
@@ -347,7 +350,22 @@ function migValidateAndEnter(entry) {
      }
    }
 
-   // ── Todo OK — entrar con precio actual ────────────────────
+   // ── Fix 3: exigir señal alcista — vela de entrada verde ───
+   const lookback5s = entry.priceHistory.filter(p => now - p.time <= 5000);
+   if (lookback5s.length >= 2) {
+     const priceAgo = lookback5s[0].price;
+     const priceNowLB = lookback5s[lookback5s.length - 1].price;
+     const trend = (priceNowLB - priceAgo) / priceAgo;
+     if (trend < 0) {
+       addLog(`⛔ MIG ABORTADA [bajista]: ${entry.symbol} tendencia ${(trend*100).toFixed(1)}% en 5s`, "filter");
+       state.stats.mig_aborted++;
+       unsubscribeToken(entry.mint);
+       broadcast({ event: "stats", data: state.stats });
+       return;
+     }
+   }
+
+   // ── Todo OK — entrar ──────────────────────────────────────
    entry.firstPrice = priceNow;
    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
    migOpenTrades(entry);
@@ -375,7 +393,6 @@ function migOpenTrades(entry) {
      priceHigh: price, priceLow: price,
      tradeCount: entry.tradeCount, volumeUSD: entry.volumeUSD,
      detectedAt: entry.startTime, lastUpdate: Date.now(),
-     lastPrices: [{ price, time: Date.now() }], // historial para SL en tiempo real
    });
    broadcast({ event: "newMigToken", data: state.migMonitored.get(entry.mint) });
  }
@@ -396,12 +413,6 @@ function migUpdatePrice(mint, price, solAmount) {
  const token = state.migMonitored.get(mint);
  if (!token) return;
  if (!isPriceValid(price, token.price)) return;
-
- // Guardar historial de precios recientes para SL en tiempo real
- if (!token.lastPrices) token.lastPrices = [];
- token.lastPrices.push({ price, time: Date.now() });
- if (token.lastPrices.length > 10) token.lastPrices.shift();
-
  token.price = price; token.mc = price * 1_000_000_000;
  token.priceHigh = Math.max(token.priceHigh, price);
  token.priceLow = Math.min(token.priceLow, price);
@@ -409,7 +420,7 @@ function migUpdatePrice(mint, price, solAmount) {
  token.lastUpdate = Date.now();
  updateDemoTrades(mint, price, "migration");
  updateRealTrades(mint, price, "migration");
- broadcast({ event: "migTokenUpdate", data: { ...token, lastPrices: undefined } });
+ broadcast({ event: "migTokenUpdate", data: token });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -421,12 +432,31 @@ async function momentumScan() {
  let totalScanned = 0;
  let totalSignals = 0;
  try {
-   for (let page = 1; page <= 3; page++) {
-     const res = await fetch(
-       `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
-       { headers: { "Accept": "application/json;version=20230302" }, signal: AbortSignal.timeout(10000) }
-     );
-     if (!res.ok) break;
+   // ── Fix momentum 2: 2 páginas + retry backoff en 429 ──────
+   for (let page = 1; page <= 2; page++) {
+     let res;
+     let attempts = 0;
+     while (attempts < 3) {
+       try {
+         res = await fetch(
+           `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
+           { headers: { "Accept": "application/json;version=20230302" }, signal: AbortSignal.timeout(10000) }
+         );
+         if (res.status === 429) {
+           attempts++;
+           const wait = 2000 * attempts;
+           addLog(`⏳ Gecko 429 (pág ${page}) — esperando ${wait/1000}s`, "warn");
+           await new Promise(r => setTimeout(r, wait));
+           continue;
+         }
+         break;
+       } catch (e) {
+         attempts++;
+         await new Promise(r => setTimeout(r, 2000));
+       }
+     }
+     if (!res || !res.ok) { addLog(`⚠️ Gecko pág ${page} falló — saltando`, "warn"); continue; }
+
      const json = await res.json();
      const pools = json?.data || [];
      for (const pool of pools) {
@@ -462,15 +492,30 @@ async function momentumScan() {
        momSignalCooldown.set(mint, Date.now());
        state.stats.mom_signals++;
        totalSignals++;
+
        state.momPending.set(mint, { mint, symbol, name: symbol, geckoPrice, mc, vol1h, pct1h, pendingSince: Date.now() });
        state.stats.mom_pending = state.momPending.size;
+
+       // Suscribir a PumpPortal para recibir precio real
+       if (pumpPortalWs?.readyState === WebSocket.OPEN) {
+         pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+       }
+
        addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+
+       // ── Fix momentum 1: cancelar si no llega precio real en 30s ──
        setTimeout(() => {
          if (state.momPending.has(mint)) {
            const pending = state.momPending.get(mint);
-           momActivateFromPending(mint, pending.geckoPrice, 0);
+           addLog(`⛔ MOM CANCELADA [timeout]: ${pending.symbol} — sin precio real en 30s`, "filter");
+           state.momPending.delete(mint);
+           state.stats.mom_pending = state.momPending.size;
+           state.stats.mom_cancelled++;
+           unsubscribeToken(mint);
+           broadcast({ event: "stats", data: state.stats });
          }
        }, MOM_PENDING_TIMEOUT_MS);
+
        broadcast({ event: "stats", data: state.stats });
      }
      await new Promise(r => setTimeout(r, 500));
@@ -481,6 +526,8 @@ async function momentumScan() {
 }
 
 function momActivateFromPending(mint, entryPrice, solAmount) {
+ // Solo activar con precio real de PumpPortal (solAmount > 0)
+ if (solAmount <= 0) return;
  const pending = state.momPending.get(mint);
  if (!pending) return;
  state.momPending.delete(mint);
@@ -491,15 +538,14 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
    price: entryPrice, tp: +(entryPrice * MOM_TP).toFixed(12), sl: +(entryPrice * MOM_SL).toFixed(12),
    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
  };
- const source = solAmount > 0 ? "real" : "gecko";
- addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3%`, "accept");
+ addLog(`⚡ ENTRADA [real]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3%`, "accept");
  state.signals.unshift(signal);
  if (state.signals.length > 100) state.signals.pop();
  broadcast({ event: "newSignal", data: signal });
  state.momMonitored.set(mint, {
    mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
    priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
-   tradeCount: solAmount > 0 ? 1 : 0, volumeUSD: solAmount * solPriceUSD,
+   tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
    detectedAt: Date.now(), lastUpdate: Date.now(),
  });
  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
@@ -508,7 +554,11 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
 }
 
 function momUpdatePrice(mint, price, solAmount) {
- if (state.momPending.has(mint) && solAmount > 0) { momActivateFromPending(mint, price, solAmount); return; }
+ if (state.momPending.has(mint)) {
+   // Solo activar con precio real (solAmount > 0)
+   if (solAmount > 0) momActivateFromPending(mint, price, solAmount);
+   return;
+ }
  const token = state.momMonitored.get(mint);
  if (!token) return;
  token.price = price; token.mc = price * 1_000_000_000;
@@ -643,7 +693,6 @@ async function closeRealTrade(trade, price, reason) {
  saveState();
 }
 
-// ── ACTUALIZAR TRADES — con validación SL en tiempo real (Fuga B) ──
 function updateRealTrades(mint, price, strategy) {
  const now = Date.now();
  const breakeven = strategy === "migration" ? MIG_BREAKEVEN_AT : MOM_BREAKEVEN_AT;
@@ -674,7 +723,6 @@ function updateRealTrades(mint, price, strategy) {
  }
 }
 
-// ── ACTUALIZAR DEMO TRADES — con SL en tiempo real (Fuga B) ───
 function updateDemoTrades(mint, price, strategy) {
  const now = Date.now();
  const tp_pct = strategy === "migration" ? MIG_TP : MOM_TP;
@@ -708,20 +756,16 @@ function updateDemoTrades(mint, price, strategy) {
  }
 }
 
+// ── SL en tiempo real cada 5s (Fuga B) ────────────────────────
 setInterval(() => {
  const now = Date.now();
- // ── Fuga B: revisar SL con precio actual en tiempo real ───────
  for (const trade of state.realTrades) {
    if (trade.status !== "OPEN") continue;
    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
    if (!token) continue;
-   if (now >= trade.expiresAt) {
-     closeRealTrade(trade, token.price, "EXPIRED");
-     continue;
-   }
-   // Forzar evaluación de SL con precio real actual
+   if (now >= trade.expiresAt) { closeRealTrade(trade, token.price, "EXPIRED"); continue; }
    if (token.price <= trade.sl) {
-     addLog(`🚨 SL FORZADO [${trade.strategy}]: ${trade.symbol} precio real ${token.price.toFixed(8)} <= SL ${trade.sl.toFixed(8)}`, "warn");
+     addLog(`🚨 SL FORZADO [${trade.strategy}]: ${trade.symbol}`, "warn");
      closeRealTrade(trade, token.price, "SL");
    }
  }
@@ -734,7 +778,7 @@ setInterval(() => {
      closeDemoTrade(trade, token.price, "EXPIRED", tp_pct);
    }
  }
-}, 5_000); // cada 5s en vez de 30s para capturar caídas rápidas
+}, 5_000);
 
 function openDemoTrade(signal) {
  const duration = signal.strategy === "migration" ? MIG_DURATION_MS : MOM_DURATION_MS;
@@ -782,7 +826,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
      addLog(`❌ LOSS [EXP-][${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss");
    } else {
      trade.result = "EXPIRED"; state.stats[`${prefix}_demoExpired`]++;
-     addLog(`⏱ EXP [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}%`, "expire");
+     addLog(`⏱️ EXP [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct > 0 ? "+" : ""}${trade.pnlPct}%`, "expire");
    }
  }
  state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
@@ -825,7 +869,7 @@ function connectPumpPortal() {
        if (price <= 0) return;
        const sol = data.solAmount || 0;
        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
-       if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
+       if (state.momPending.has(data.mint) || state.momMonitored.has(data.mint)) momUpdatePrice(data.mint, price, sol);
      }
    } catch (e) { console.log("PP:", e.message); }
  });
@@ -862,7 +906,7 @@ app.delete("/api/movement/:id", (req, res) => {
 app.get("/api/state", (req, res) => {
  res.json({
    migWatching: serializeMigWatching(),
-   migMonitored: Array.from(state.migMonitored.values()).map(t => ({ ...t, lastPrices: undefined })),
+   migMonitored: Array.from(state.migMonitored.values()),
    momMonitored: Array.from(state.momMonitored.values()),
    signals: state.signals.slice(0, 50),
    demoTrades: state.demoTrades.slice(0, 200),
@@ -881,7 +925,7 @@ wss.on("connection", (ws) => {
    event: "fullState",
    data: {
      migWatching: serializeMigWatching(),
-     migMonitored: Array.from(state.migMonitored.values()).map(t => ({ ...t, lastPrices: undefined })),
+     migMonitored: Array.from(state.migMonitored.values()),
      momMonitored: Array.from(state.momMonitored.values()),
      signals: state.signals.slice(0, 50),
      demoTrades: state.demoTrades.slice(0, 200),
@@ -896,7 +940,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
- console.log(`🚀 SolScanBot v6.2 — Validación entrada + SL tiempo real`);
+ console.log(`🚀 SolScanBot v6.3 — 5 fixes: MIG validación entrada + MOM precio real + Gecko 429`);
  loadState();
  initWallet();
  connectPumpPortal();
