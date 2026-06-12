@@ -32,7 +32,7 @@ const MIG_BREAKEVEN_AT = 0.22;
 const MIG_BREAKEVEN_MARGIN = 0.03;
 const MIG_LOCK_AT = 0.20;
 const MIG_FOLLOW_PCT = 0.20;
-const MIG_MAX_PRICE_RATIO = 5.0;
+const MIG_MAX_PRICE_RATIO = 1.5;   // saltos de escala residuales quedan filtrados
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_MAX_DROP_IN_DELAY = 0.05;
@@ -197,17 +197,32 @@ function unsubscribeToken(mint) {
   }
 }
 
-// ── calcPrice con supply real ──────────────────────────────────
-// supplyOverride: si se pasa (supply real del token), se usa en vez de 1B fijo
-function calcPrice(data, supplyOverride) {
-  const supply = (supplyOverride && supplyOverride > 0) ? supplyOverride : 1_000_000_000;
-  if (data.marketCapSol && data.marketCapSol > 0) {
-    return (data.marketCapSol * solPriceUSD) / supply;
-  }
+// ── calcPrice: UNA SOLA ESCALA ─────────────────────────────────
+// El precio real de un trade es sol/tok (sin asunciones de supply).
+// marketCapSol solo se usa como fallback con supply CALIBRADO, nunca asumido.
+function calcPrice(data, knownSupply) {
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
-  if (sol > 0 && tok > 0) return (sol / tok) * solPriceUSD;
+  // RAMA PRIMARIA: precio real del trade ejecutado
+  if (sol > 0 && tok > 0) {
+    return (sol / tok) * solPriceUSD;
+  }
+  // RAMA SECUNDARIA: solo si hay supply calibrado fiable
+  if (data.marketCapSol && data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
+    return (data.marketCapSol * solPriceUSD) / knownSupply;
+  }
   return 0;
+}
+
+// Deduce el supply real del primer mensaje que traiga marketCapSol Y sol/tok:
+// marketCapSol = (sol/tok) * supply  =>  supply = marketCapSol / (sol/tok)
+function calibrateSupply(data) {
+  const sol = data.solAmount || 0;
+  const tok = data.tokenAmount || 0;
+  if (data.marketCapSol > 0 && sol > 0 && tok > 0) {
+    return data.marketCapSol / (sol / tok);
+  }
+  return null;
 }
 
 function isPriceValid(newPrice, knownPrice) {
@@ -444,9 +459,7 @@ async function momentumScan() {
 
     const json = await res.json();
     const tokens = json?.data?.items || [];
-    addLog(`🔍 Birdeye devolvió ${tokens.length} tokens (antes de filtrar)`, "info");
 
-    
     if (!Array.isArray(tokens)) {
       addLog(`⚠️ Birdeye respuesta inesperada`, "warn");
       return;
@@ -884,19 +897,25 @@ function connectPumpPortal() {
       if ((data.txType === "buy" || data.txType === "sell") && data.mint) {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
-        // Migración: supply 1B asumido (calcPrice por defecto)
-        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) {
-          const price = calcPrice(data);
+
+        // Supply calibrado desde este mensaje (si trae marketCapSol + sol/tok)
+        const calSupply = calibrateSupply(data);
+
+        // ── MIGRACIÓN: calibrar y usar supply real ────────────────
+        const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
+        if (migEntry) {
+          if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
+          const price = calcPrice(data, migEntry.calSupply);
           if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
         }
-        // Momentum: usar supply real guardado
-        if (state.momPending.has(data.mint)) {
-          const pending = state.momPending.get(data.mint);
-          const price = calcPrice(data, pending.supply);
-          if (price > 0) momUpdatePrice(data.mint, price, data.solAmount || 0);
-        } else if (state.momMonitored.has(data.mint)) {
-          const token = state.momMonitored.get(data.mint);
-          const price = calcPrice(data, token.supply);
+
+        // ── MOMENTUM: calibrar y usar supply real ─────────────────
+        const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
+        if (momEntry) {
+          if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
+          // Prioridad: supply calibrado > supply de Birdeye > nada
+          const supplyToUse = momEntry.calSupply || momEntry.supply;
+          const price = calcPrice(data, supplyToUse);
           if (price > 0) momUpdatePrice(data.mint, price, data.solAmount || 0);
         }
       }
@@ -944,6 +963,31 @@ app.get("/api/state", (req, res) => {
     log: state.log.slice(0, 100),
     stats: state.stats,
   });
+});
+
+// Resetear stats y trades corrompidos (mantiene movimientos manuales)
+app.get("/api/reset-stats", (req, res) => {
+  state.demoTrades = [];
+  state.realTrades = [];
+  state.signals = [];
+  state.stats = {
+    mig_migrations: 0, mig_watched: 0, mig_entered: 0, mig_rejected: 0,
+    mig_aborted: 0,
+    mig_demoWins: 0, mig_demoLosses: 0, mig_demoExpired: 0, mig_demoPnL: 0,
+    mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
+    mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
+    mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
+    mom_scanned: 0, mom_signals: 0, mom_pending: 0, mom_cancelled: 0,
+    mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
+    mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
+    mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
+    mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
+    demoOpen: 0, realOpen: 0, walletBalance: state.stats.walletBalance || 0,
+  };
+  saveState();
+  broadcast({ event: "stats", data: state.stats });
+  addLog("🔄 Stats y trades reseteados", "info");
+  res.json({ ok: true, message: "Stats reseteadas — trades y señales borrados, movimientos conservados" });
 });
 
 const server = createServer(app);
