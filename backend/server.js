@@ -517,6 +517,8 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
  if (solAmount <= 0) return;
  const pending = state.momPending.get(mint);
  if (!pending) return;
+ addLog(`🔍 ratio ${pending?.symbol}: birdeye=${pending?.birdeyePrice?.toFixed(8)} | pp=${entryPrice.toFixed(8)} | ratio=${pending?.birdeyePrice > 0 ? (entryPrice/pending.birdeyePrice).toFixed(4) : "?"}`, "info");
+
 
  // Comprobar límite al activar
  const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
