@@ -198,15 +198,22 @@ function unsubscribeToken(mint) {
   }
 }
 
-// ── calcPrice: UNA SOLA ESCALA ─────────────────────────────────
+// ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
+// marketCapSol/supply es el precio del POOL, estable entre trades.
+// sol/tok es el precio de UNA orden concreta y tiene ruido de
+// slippage (órdenes de distinto tamaño dan sol/tok muy distintos),
+// por eso solo se usa como fallback cuando no hay marketCapSol o
+// el supply aún no está calibrado.
 function calcPrice(data, knownSupply) {
+  // PRINCIPAL: precio derivado del market cap del pool (estable)
+  if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
+    return (data.marketCapSol * solPriceUSD) / knownSupply;
+  }
+  // FALLBACK: sol/tok del trade (ruido de slippage)
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
   if (sol > 0 && tok > 0) {
     return (sol / tok) * solPriceUSD;
-  }
-  if (data.marketCapSol && data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
-    return (data.marketCapSol * solPriceUSD) / knownSupply;
   }
   return 0;
 }
@@ -361,16 +368,15 @@ function migValidateAndEnter(entry) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
-    // Coger el precio REAL más reciente del historial (no el cacheado
-    // en lastPrice, que puede estar congelado si los ticks de la
-    // caída fueron rechazados por isPriceValid durante el delay).
+    // Coger el precio REAL más reciente del historial (ya viene de
+    // marketCapSol/supply gracias a la prioridad de calcPrice).
     const sorted = entry.priceHistory
       .slice()
       .sort((a, b) => b.time - a.time);
     const truePriceNow = sorted.length ? sorted[0].price : priceAtTrigger;
 
     entry.firstPrice = truePriceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (real, no cacheado)`, "accept");
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (precio de mercado)`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -1029,7 +1035,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.3 — instrumentación logs de precio (diagnóstico)`);
+  console.log(`🚀 SolScanBot v7.4 — Fix raíz: precio de mercado (marketCapSol/supply), no sol/tok`);
   loadState();
   initWallet();
   connectPumpPortal();
