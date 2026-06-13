@@ -61,6 +61,10 @@ const MOM_EXPIRED_WIN_PCT = 2;
 const MOM_LAST_TRADE_WINDOW_MS = 10 * 60 * 1000; // solo tokens con trade en últimos 10min
 const MOM_CONFIRM_MS = 5000;       // ventana de confirmación de tendencia antes de entrar
 
+// ── OBSERVACIÓN DE ABORTOS (instrumentación, no toca trading) ──
+const ABORT_WATCH_MS = 5 * 60 * 1000;  // observar 5 min tras abortar
+const ABORT_WIN_THRESHOLD = 0.20;      // +20% = "ganador perdido"
+
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -102,6 +106,7 @@ const state = {
   migMonitored: new Map(),
   momPending: new Map(),
   momMonitored: new Map(),
+  abortWatch: new Map(),   // mint -> {symbol, abortPrice, abortReason, abortTime}
   signals: [],
   demoTrades: [],
   realTrades: [],
@@ -120,6 +125,9 @@ const state = {
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
     mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
     demoOpen: 0, realOpen: 0, walletBalance: 0,
+    abort_correct: 0, abort_missed: 0,
+    abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
+    abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
   },
 };
 
@@ -202,9 +210,6 @@ function unsubscribeToken(mint) {
 }
 
 // ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
-// marketCapSol/supply es el precio del POOL, estable entre trades.
-// sol/tok es el precio de UNA orden concreta y tiene ruido de
-// slippage, por eso solo se usa como fallback.
 function calcPrice(data, knownSupply) {
   if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
     return (data.marketCapSol * solPriceUSD) / knownSupply;
@@ -234,13 +239,41 @@ function isPriceValid(newPrice, knownPrice) {
   return ratio >= (1 / MIG_MAX_PRICE_RATIO) && ratio <= MIG_MAX_PRICE_RATIO;
 }
 
-let solPriceUSD = 150;
+let solPriceUSD = 68;          // default realista; se actualiza por API
+let solPriceReady = false;     // no operar hasta tener un precio real de SOL
 async function updateSolPrice() {
+  // Intento 1: CoinGecko
   try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const r = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+      { signal: AbortSignal.timeout(8000) });
     const d = await r.json();
-    solPriceUSD = d?.solana?.usd ?? 150;
-  } catch {}
+    if (d?.solana?.usd > 0) {
+      solPriceUSD = d.solana.usd;
+      solPriceReady = true;
+      return;
+    }
+  } catch (e) {
+    addLog(`⚠️ SOL price CoinGecko falló: ${e.message}`, "warn");
+  }
+  // Intento 2 (respaldo): Jupiter price API
+  try {
+    const r = await fetch(
+      "https://price.jup.ag/v6/price?ids=SOL",
+      { signal: AbortSignal.timeout(8000) });
+    const d = await r.json();
+    const px = d?.data?.SOL?.price;
+    if (px > 0) {
+      solPriceUSD = px;
+      solPriceReady = true;
+      addLog(`ℹ️ SOL price vía Jupiter (respaldo): $${px}`, "info");
+      return;
+    }
+  } catch (e) {
+    addLog(`⚠️ SOL price Jupiter también falló: ${e.message}`, "warn");
+  }
+  // Ambas fallaron: mantener el valor anterior y AVISAR
+  addLog(`⚠️ SOL price sin actualizar, sigo con $${solPriceUSD}`, "warn");
 }
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
@@ -258,6 +291,10 @@ setInterval(async () => {
 
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
+  if (!solPriceReady) {
+    addLog("⏳ Esperando precio real de SOL antes de operar", "warn");
+    return;
+  }
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
@@ -332,6 +369,19 @@ function migEvaluate(mint) {
   }
 }
 
+// Registra un aborto en observación (instrumentación pura). En vez de
+// desuscribir y borrar al instante, mantiene el token 5 min recibiendo
+// precio para medir si el filtro acertó o costó un ganador.
+function registerAbort(mint, symbol, abortPrice, reason) {
+  state.stats.mig_aborted++;
+  state.abortWatch.set(mint, {
+    symbol, abortPrice: abortPrice || 0, abortReason: reason,
+    abortTime: Date.now(), lastPrice: abortPrice || 0,
+  });
+  addLog(`🔭 MIG ABORTO EN OBSERVACIÓN: ${symbol} @ ${reason} (vigilando 5 min)`, "filter");
+  // NO desuscribir todavía: el token sigue recibiendo precio.
+}
+
 function migValidateAndEnter(entry) {
   const priceAtTrigger = entry.lastPrice;
   setTimeout(() => {
@@ -341,7 +391,7 @@ function migValidateAndEnter(entry) {
       const dropInDelay = (priceAtTrigger - priceNow) / priceAtTrigger;
       if (dropInDelay > MIG_MAX_DROP_IN_DELAY) {
         addLog(`⛔ MIG ABORTADA [delay]: ${entry.symbol} cayó ${(dropInDelay*100).toFixed(1)}% en 3s`, "filter");
-        state.stats.mig_aborted++; unsubscribeToken(entry.mint);
+        registerAbort(entry.mint, entry.symbol, priceNow, "delay");
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
@@ -352,7 +402,7 @@ function migValidateAndEnter(entry) {
       const verticalDrop = (maxRecent - newest) / maxRecent;
       if (verticalDrop > MIG_MAX_DROP_VERTICAL) {
         addLog(`⛔ MIG ABORTADA [vertical]: ${entry.symbol} colapso ${(verticalDrop*100).toFixed(1)}% desde pico`, "filter");
-        state.stats.mig_aborted++; unsubscribeToken(entry.mint);
+        registerAbort(entry.mint, entry.symbol, newest, "vertical");
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
@@ -363,7 +413,7 @@ function migValidateAndEnter(entry) {
       const trend = (priceNowLB - priceAgo) / priceAgo;
       if (trend < 0) {
         addLog(`⛔ MIG ABORTADA [bajista]: ${entry.symbol} tendencia ${(trend*100).toFixed(1)}% en 5s`, "filter");
-        state.stats.mig_aborted++; unsubscribeToken(entry.mint);
+        registerAbort(entry.mint, entry.symbol, priceNowLB, "bajista");
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
@@ -451,6 +501,10 @@ function migUpdatePrice(mint, price, solAmount) {
 async function momentumScan() {
   let totalScanned = 0;
   let totalSignals = 0;
+  if (!solPriceReady) {
+    addLog("⏳ Esperando precio real de SOL antes de escanear momentum", "warn");
+    return;
+  }
   try {
     const minLastTrade = Math.floor((Date.now() - MOM_LAST_TRADE_WINDOW_MS) / 1000);
     const params = new URLSearchParams({
@@ -805,12 +859,7 @@ function updateRealTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
-    // Escalón de beneficio (solo migración): si en algún momento tocó
-    // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
-    // no el beneficio instantáneo, para que el piso se mantenga aunque el
-    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
-    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
-    // como suelo mínimo.
+    // Escalón de beneficio (solo migración): si tocó +20%, piso de +13%.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) trade.sl = +stepStop.toFixed(12);
@@ -887,7 +936,34 @@ setInterval(() => {
       closeDemoTrade(trade, token.price, "EXPIRED", tp_pct);
     }
   }
+  evaluarAbortos();
 }, 5_000);
+
+// Evalúa los abortos en observación: a los 5 min, clasifica si el filtro
+// acertó (token cayó o plano) o costó un ganador (subió +20%).
+function evaluarAbortos() {
+  const now = Date.now();
+  for (const [mint, a] of state.abortWatch.entries()) {
+    if (now - a.abortTime < ABORT_WATCH_MS) continue;
+    const cur = a.lastPrice;
+    if (cur && a.abortPrice > 0) {
+      const change = (cur - a.abortPrice) / a.abortPrice;
+      const r = a.abortReason; // "delay" | "vertical" | "bajista"
+      if (change >= ABORT_WIN_THRESHOLD) {
+        state.stats.abort_missed++;
+        state.stats[`abort_missed_${r}`] = (state.stats[`abort_missed_${r}`] || 0) + 1;
+        addLog(`❌ ABORTO ERRÓNEO: ${a.symbol} subió ${(change*100).toFixed(0)}% tras abortar [${r}]`, "warn");
+      } else {
+        state.stats.abort_correct++;
+        state.stats[`abort_correct_${r}`] = (state.stats[`abort_correct_${r}`] || 0) + 1;
+        addLog(`✅ ABORTO CORRECTO: ${a.symbol} ${(change*100).toFixed(0)}% tras abortar [${r}]`, "filter");
+      }
+    }
+    state.abortWatch.delete(mint);
+    unsubscribeToken(mint);
+    broadcast({ event: "stats", data: state.stats });
+  }
+}
 
 function openDemoTrade(signal) {
   const duration = signal.strategy === "migration" ? MIG_DURATION_MS : MOM_DURATION_MS;
@@ -965,6 +1041,7 @@ function connectPumpPortal() {
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.momMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+    for (const [mint] of state.abortWatch.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
   });
   pumpPortalWs.on("message", async (raw) => {
     try {
@@ -979,8 +1056,17 @@ function connectPumpPortal() {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
 
+        // Supply calibrado desde este mensaje (si trae marketCapSol + sol/tok)
         const calSupply = calibrateSupply(data);
 
+        // ── ABORTOS EN OBSERVACIÓN: solo actualizar último precio ──
+        const aborted = state.abortWatch.get(data.mint);
+        if (aborted) {
+          const price = calcPrice(data, calSupply || 1_000_000_000);
+          if (price > 0) aborted.lastPrice = price;
+        }
+
+        // ── MIGRACIÓN: calibrar y usar supply real ────────────────
         const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
         if (migEntry) {
           if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
@@ -988,6 +1074,7 @@ function connectPumpPortal() {
           if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
         }
 
+        // ── MOMENTUM: calibrar y usar supply real ─────────────────
         const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
         if (momEntry) {
           if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
@@ -1059,6 +1146,9 @@ app.get("/api/reset-stats", (req, res) => {
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
     mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
     demoOpen: 0, realOpen: 0, walletBalance: state.stats.walletBalance || 0,
+    abort_correct: 0, abort_missed: 0,
+    abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
+    abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
   };
   saveState();
   broadcast({ event: "stats", data: state.stats });
@@ -1089,7 +1179,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.5 — Escalón +13% (migración) + confirmación tendencia (momentum)`);
+  console.log(`🚀 SolScanBot v7.6 — Fix precio SOL (CoinGecko+Jupiter+bandera) + abortos observados`);
   loadState();
   initWallet();
   connectPumpPortal();
