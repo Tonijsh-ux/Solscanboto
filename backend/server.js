@@ -268,7 +268,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [],
+    priceHistory: [], calSupply: null,
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -308,7 +308,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * 1_000_000_000,
+    mc: price * (entry.calSupply || 1_000_000_000),
   }});
 }
 
@@ -365,8 +365,16 @@ function migValidateAndEnter(entry) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
-    entry.firstPrice = priceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
+    // Coger el precio REAL más reciente del historial (no el cacheado
+    // en lastPrice, que puede estar congelado si los ticks de la
+    // caída fueron rechazados por isPriceValid durante el delay).
+    const sorted = entry.priceHistory
+      .slice()
+      .sort((a, b) => b.time - a.time);
+    const truePriceNow = sorted.length ? sorted[0].price : priceAtTrigger;
+
+    entry.firstPrice = truePriceNow;
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (real, no cacheado)`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -374,11 +382,12 @@ function migValidateAndEnter(entry) {
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
+  const supply = entry.calSupply || 1_000_000_000;
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price * MIG_TP).toFixed(12), sl: +(price * MIG_SL).toFixed(12),
-    mcUsd: price * 1_000_000_000, volumeUSD: entry.volumeUSD, time: Date.now(),
+    mcUsd: price * supply, volumeUSD: entry.volumeUSD, time: Date.now(),
   };
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
@@ -386,8 +395,8 @@ function migOpenTrades(entry) {
   if (!state.migMonitored.has(entry.mint)) {
     state.migMonitored.set(entry.mint, {
       mint: entry.mint, name: entry.name, symbol: entry.symbol,
-      price, mc: price * 1_000_000_000, priceHigh: price, priceLow: price,
-      downRejectStreak: 0,
+      price, mc: price * supply, priceHigh: price, priceLow: price,
+      calSupply: entry.calSupply, downRejectStreak: 0,
       tradeCount: entry.tradeCount, volumeUSD: entry.volumeUSD,
       detectedAt: entry.startTime, lastUpdate: Date.now(),
     });
@@ -1037,7 +1046,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.1 — Fase 2: fix precio congelado (rug vertical)`);
+  console.log(`🚀 SolScanBot v7.2 — Fix precio de entrada (usa historial real, no lastPrice cacheado)`);
   loadState();
   initWallet();
   connectPumpPortal();
