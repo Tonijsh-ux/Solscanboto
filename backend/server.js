@@ -32,6 +32,8 @@ const MIG_BREAKEVEN_AT = 0.22;
 const MIG_BREAKEVEN_MARGIN = 0.03;
 const MIG_LOCK_AT = 0.20;
 const MIG_FOLLOW_PCT = 0.20;
+const MIG_STEP_TRIGGER = 0.20;     // al tocar +20% de beneficio...
+const MIG_STEP_FLOOR = 0.13;       // ...asegurar piso de +13%
 const MIG_MAX_PRICE_RATIO = 1.5;
 const MIG_REJECT_STREAK = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
@@ -56,7 +58,8 @@ const MOM_FOLLOW_PCT = 0.02;
 const MOM_PENDING_TIMEOUT_MS = 30_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
-const MOM_LAST_TRADE_WINDOW_MS = 10 * 60 * 1000;
+const MOM_LAST_TRADE_WINDOW_MS = 10 * 60 * 1000; // solo tokens con trade en últimos 10min
+const MOM_CONFIRM_MS = 5000;       // ventana de confirmación de tendencia antes de entrar
 
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
@@ -201,15 +204,11 @@ function unsubscribeToken(mint) {
 // ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
 // marketCapSol/supply es el precio del POOL, estable entre trades.
 // sol/tok es el precio de UNA orden concreta y tiene ruido de
-// slippage (órdenes de distinto tamaño dan sol/tok muy distintos),
-// por eso solo se usa como fallback cuando no hay marketCapSol o
-// el supply aún no está calibrado.
+// slippage, por eso solo se usa como fallback.
 function calcPrice(data, knownSupply) {
-  // PRINCIPAL: precio derivado del market cap del pool (estable)
   if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
     return (data.marketCapSol * solPriceUSD) / knownSupply;
   }
-  // FALLBACK: sol/tok del trade (ruido de slippage)
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
   if (sol > 0 && tok > 0) {
@@ -368,8 +367,6 @@ function migValidateAndEnter(entry) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
-    // Coger el precio REAL más reciente del historial (ya viene de
-    // marketCapSol/supply gracias a la prioridad de calcPrice).
     const sorted = entry.priceHistory
       .slice()
       .sort((a, b) => b.time - a.time);
@@ -532,10 +529,12 @@ async function momentumScan() {
       state.momPending.set(mint, {
         mint, symbol, name,
         birdeyePrice: price,
-        supply,
-        calSupply: null,
+        supply,                         // supply real guardado
+        calSupply: null,                // supply calibrado (se rellena con trades)
         mc, vol1h, pct1h,
         pendingSince: Date.now(),
+        priceHistory: [],               // {price, time} durante ventana de confirmación
+        firstTradeAt: null,             // cuándo llegó el primer trade real
       });
       state.stats.mom_pending = state.momPending.size;
 
@@ -585,7 +584,6 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   state.momPending.delete(mint);
   state.stats.mom_pending = state.momPending.size;
 
-  const supply = pending.calSupply || pending.supply;
   const signal = {
     id: `mom-${mint}-${Date.now()}`, strategy: "momentum",
     mint, name: pending.name, symbol: pending.symbol,
@@ -598,8 +596,8 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   broadcast({ event: "newSignal", data: signal });
   state.momMonitored.set(mint, {
     mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
-    supply: pending.supply,
-    calSupply: pending.calSupply,
+    supply: pending.supply,             // supply Birdeye (fallback)
+    calSupply: pending.calSupply,       // supply calibrado si ya se calculó
     priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
     tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
     detectedAt: Date.now(), lastUpdate: Date.now(),
@@ -611,7 +609,16 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
 
 function momUpdatePrice(mint, price, solAmount) {
   if (state.momPending.has(mint)) {
-    if (solAmount > 0) momActivateFromPending(mint, price, solAmount);
+    if (solAmount > 0) {
+      const pending = state.momPending.get(mint);
+      if (!pending.firstTradeAt) pending.firstTradeAt = Date.now();
+      pending.priceHistory.push({ price, time: Date.now() });
+      if (pending.priceHistory.length > 30) pending.priceHistory.shift();
+      // ¿ya pasó la ventana de confirmación de tendencia?
+      if (Date.now() - pending.firstTradeAt >= MOM_CONFIRM_MS) {
+        momTryConfirmEntry(mint);
+      }
+    }
     return;
   }
   const token = state.momMonitored.get(mint);
@@ -625,6 +632,32 @@ function momUpdatePrice(mint, price, solAmount) {
   updateDemoTrades(mint, price, "momentum");
   updateRealTrades(mint, price, "momentum");
   broadcast({ event: "momTokenUpdate", data: token });
+}
+
+// Tras la ventana de confirmación, decide si entrar según la tendencia.
+// Aborta si el precio en la ventana viene plano o bajista (entrada en pico).
+function momTryConfirmEntry(mint) {
+  const pending = state.momPending.get(mint);
+  if (!pending) return;
+  const hist = pending.priceHistory;
+  if (hist.length < 2) return; // esperar algo más de datos
+
+  const first = hist[0].price;
+  const last = hist[hist.length - 1].price;
+  const trend = (last - first) / first;
+
+  if (trend <= 0) {
+    addLog(`⛔ MOM DESCARTADA [tendencia ${(trend*100).toFixed(1)}%]: ${pending.symbol} no sube en ventana`, "filter");
+    state.momPending.delete(mint);
+    state.stats.mom_pending = state.momPending.size;
+    state.stats.mom_cancelled++;
+    unsubscribeToken(mint);
+    broadcast({ event: "stats", data: state.stats });
+    return;
+  }
+
+  addLog(`✅ MOM CONFIRMADA [tendencia +${(trend*100).toFixed(1)}%]: ${pending.symbol}`, "accept");
+  momActivateFromPending(mint, last, 1);
 }
 
 function momCleanup(mint) {
@@ -772,6 +805,16 @@ function updateRealTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
+    // Escalón de beneficio (solo migración): si en algún momento tocó
+    // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
+    // no el beneficio instantáneo, para que el piso se mantenga aunque el
+    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
+    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
+    // como suelo mínimo.
+    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+      const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
+      if (stepStop > trade.sl) trade.sl = +stepStop.toFixed(12);
+    }
     if (price >= trade.tp) closeRealTrade(trade, price, "TP");
     else if (price <= trade.sl) closeRealTrade(trade, price, "SL");
     else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
@@ -804,6 +847,17 @@ function updateDemoTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
       addLog(`⚖️ BREAKEVEN [${strategy}]: ${trade.symbol}`, "trail");
+    }
+    // Escalón de beneficio (solo migración): si tocó +20%, piso de +13%.
+    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+      const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
+      if (stepStop > trade.sl) {
+        if (trade.trailingPhase !== "STEP") {
+          trade.trailingPhase = "STEP";
+          addLog(`🪜 ESCALÓN +13% [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
+        }
+        trade.sl = +stepStop.toFixed(12);
+      }
     }
     if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
     else if (price <= trade.sl) closeDemoTrade(trade, price, "SL", tp_pct);
@@ -1035,7 +1089,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.4 — Fix raíz: precio de mercado (marketCapSol/supply), no sol/tok`);
+  console.log(`🚀 SolScanBot v7.5 — Escalón +13% (migración) + confirmación tendencia (momentum)`);
   loadState();
   initWallet();
   connectPumpPortal();
