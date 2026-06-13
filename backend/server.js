@@ -33,6 +33,7 @@ const MIG_BREAKEVEN_MARGIN = 0.03;
 const MIG_LOCK_AT = 0.20;
 const MIG_FOLLOW_PCT = 0.20;
 const MIG_MAX_PRICE_RATIO = 1.5;   // saltos de escala residuales quedan filtrados
+const MIG_REJECT_STREAK = 2;       // ticks consecutivos a la baja para aceptar caída real
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_MAX_DROP_IN_DELAY = 0.05;
@@ -267,7 +268,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [], calSupply: null,
+    priceHistory: [],
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -307,7 +308,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * (entry.calSupply || 1_000_000_000),
+    mc: price * 1_000_000_000,
   }});
 }
 
@@ -365,7 +366,7 @@ function migValidateAndEnter(entry) {
       }
     }
     entry.firstPrice = priceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * (entry.calSupply || 1_000_000_000))}`, "accept");
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -373,12 +374,11 @@ function migValidateAndEnter(entry) {
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
-  const supply = entry.calSupply || 1_000_000_000;
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price * MIG_TP).toFixed(12), sl: +(price * MIG_SL).toFixed(12),
-    mcUsd: price * supply, volumeUSD: entry.volumeUSD, time: Date.now(),
+    mcUsd: price * 1_000_000_000, volumeUSD: entry.volumeUSD, time: Date.now(),
   };
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
@@ -386,8 +386,8 @@ function migOpenTrades(entry) {
   if (!state.migMonitored.has(entry.mint)) {
     state.migMonitored.set(entry.mint, {
       mint: entry.mint, name: entry.name, symbol: entry.symbol,
-      price, mc: price * supply, priceHigh: price, priceLow: price,
-      calSupply: entry.calSupply,
+      price, mc: price * 1_000_000_000, priceHigh: price, priceLow: price,
+      downRejectStreak: 0,
       tradeCount: entry.tradeCount, volumeUSD: entry.volumeUSD,
       detectedAt: entry.startTime, lastUpdate: Date.now(),
     });
@@ -409,7 +409,24 @@ function migUpdatePrice(mint, price, solAmount) {
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
   const token = state.migMonitored.get(mint);
   if (!token) return;
-  if (!isPriceValid(price, token.price)) return;
+
+  // ── Fix precio congelado (Fase 2) ─────────────────────
+  if (!isPriceValid(price, token.price)) {
+    // ¿el precio rechazado es A LA BAJA respecto al actual?
+    if (price > 0 && price < token.price) {
+      token.downRejectStreak = (token.downRejectStreak || 0) + 1;
+      // varios ticks seguidos a la baja = caída real, aceptar
+      if (token.downRejectStreak < MIG_REJECT_STREAK) return;
+      addLog(`⚠️ MIG caída real aceptada: ${token.symbol} (${token.downRejectStreak} ticks a la baja)`, "warn");
+    } else {
+      // rechazo al alza o glitch suelto: descartar y resetear
+      token.downRejectStreak = 0;
+      return;
+    }
+  } else {
+    token.downRejectStreak = 0;  // tick válido, resetear racha
+  }
+
   const supply = token.calSupply || 1_000_000_000;
   token.price = price; token.mc = price * supply;
   token.priceHigh = Math.max(token.priceHigh, price);
@@ -581,8 +598,8 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   broadcast({ event: "newSignal", data: signal });
   state.momMonitored.set(mint, {
     mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
-    supply: pending.supply,             // supply Birdeye (fallback)
-    calSupply: pending.calSupply,       // supply calibrado si ya se calculó
+    supply: pending.supply,
+    calSupply: pending.calSupply,
     priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
     tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
     detectedAt: Date.now(), lastUpdate: Date.now(),
@@ -1020,7 +1037,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.0 — calcPrice una escala + autocalibración supply + reset stats`);
+  console.log(`🚀 SolScanBot v7.1 — Fase 2: fix precio congelado (rug vertical)`);
   loadState();
   initWallet();
   connectPumpPortal();
