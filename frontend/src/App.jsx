@@ -499,6 +499,10 @@ export default function App() {
  const momWR = (stats.mom_demoWins||0) + (stats.mom_demoLosses||0) > 0 ? Math.round((stats.mom_demoWins||0) / ((stats.mom_demoWins||0) + (stats.mom_demoLosses||0)) * 100) : 0;
  const totalPnlSol = (stats.mig_realPnLSol||0) + (stats.mom_realPnLSol||0);
 
+ // Abortos: totales y % de acierto del filtro
+ const abortTotal = (stats.abort_correct||0) + (stats.abort_missed||0);
+ const abortAccuracy = abortTotal > 0 ? Math.round((stats.abort_correct||0) / abortTotal * 100) : 0;
+
  const filteredDemo = demoTrades.filter(t => {
    const statusOk = demoStatusFilter === "all" ? true : demoStatusFilter === "open" ? t.status === "OPEN" : t.status !== "OPEN";
    const stratOk = demoStratFilter === "all" ? true : t.strategy === demoStratFilter;
@@ -727,9 +731,54 @@ export default function App() {
              <StatsRow label="Pérdida máx media" val={`-${(stats.mig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
            </div>
 
+           {/* ── ABORTOS (instrumentación de filtros de entrada) ── */}
+           <div style={{ background: "#0d1117", border: "1px solid #38bdf833", borderRadius: 10, padding: 14 }}>
+             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#38bdf8", marginBottom: 4, fontWeight: 700 }}>🔭 ABORTOS (filtros de entrada)</div>
+             <div style={{ fontSize: 10, color: "#475569", marginBottom: 10 }}>¿Los filtros aciertan o cuestan ganadores? (5 min de observación tras abortar)</div>
+             {abortTotal === 0 ? (
+               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Sin abortos evaluados todavía</div>
+             ) : (
+               <>
+                 <StatsRow label="✅ Correctos" val={stats.abort_correct||0} color="#22c55e" desc="El token cayó o quedó plano: filtro acertó" />
+                 <StatsRow label="❌ Erróneos" val={stats.abort_missed||0} color="#ef4444" desc="Subió +20% tras abortar: ganador perdido" />
+                 <StatsRow label="Acierto del filtro" val={`${abortAccuracy}%`} color={abortAccuracy >= 70 ? "#22c55e" : abortAccuracy >= 50 ? "#facc15" : "#ef4444"} />
+                 <div style={{ marginTop: 10, padding: "8px 0", borderTop: "1px solid #1e2d40" }}>
+                   <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 8 }}>DESGLOSE POR MOTIVO (correcto / erróneo)</div>
+                   {[
+                     { motivo: "📉 Bajista", c: stats.abort_correct_bajista||0, m: stats.abort_missed_bajista||0, hint: "trend < 0 en 5s" },
+                     { motivo: "⬇️ Vertical", c: stats.abort_correct_vertical||0, m: stats.abort_missed_vertical||0, hint: "colapso >15% desde pico" },
+                     { motivo: "⏱️ Delay", c: stats.abort_correct_delay||0, m: stats.abort_missed_delay||0, hint: "cayó >5% en 3s" },
+                   ].map(r => {
+                     const tot = r.c + r.m;
+                     const badRatio = tot > 0 ? r.m / tot : 0;
+                     return (
+                       <div key={r.motivo} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderBottom: "1px solid #1e2d4044" }}>
+                         <div>
+                           <span style={{ fontSize: 11, color: "#94a3b8" }}>{r.motivo}</span>
+                           <span style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", marginLeft: 6 }}>{r.hint}</span>
+                         </div>
+                         <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 11 }}>
+                           <span style={{ color: "#22c55e" }}>{r.c}</span>
+                           <span style={{ color: "#475569" }}>/</span>
+                           <span style={{ color: r.m > 0 && badRatio >= 0.5 ? "#ef4444" : "#64748b" }}>{r.m}</span>
+                         </div>
+                       </div>
+                     );
+                   })}
+                 </div>
+                 {(stats.abort_missed_bajista||0) > (stats.abort_missed_vertical||0) + (stats.abort_missed_delay||0) && (stats.abort_missed_bajista||0) >= 2 && (
+                   <div style={{ marginTop: 8, padding: "8px 10px", background: "#1f1500", border: "1px solid #facc1533", borderRadius: 8, fontSize: 10, color: "#facc15", lineHeight: 1.5 }}>
+                     ⚠️ El motivo "bajista" domina en los errores. El check trend &lt; 0 puede ser demasiado estricto — considerar relajarlo a trend &lt; -0.03.
+                   </div>
+                 )}
+               </>
+             )}
+           </div>
+
            <div style={{ background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 10, padding: 14 }}>
              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#a78bfa", marginBottom: 10, fontWeight: 700 }}>⚡ MOMENTUM</div>
              <StatsRow label="Señales" val={stats.mom_signals||0} color="#a78bfa" />
+             <StatsRow label="Descartadas/Canceladas" val={stats.mom_cancelled||0} color="#64748b" desc="Tendencia plana/bajista o sin precio real" />
              <StatsRow label="Demo Wins" val={stats.mom_demoWins||0} color="#22c55e" />
              <StatsRow label="Demo Losses" val={stats.mom_demoLosses||0} color="#ef4444" />
              <StatsRow label="Win Rate" val={`${momWR}%`} color={momWR >= 50 ? "#22c55e" : "#ef4444"} />
