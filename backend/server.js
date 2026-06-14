@@ -41,9 +41,11 @@ const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_MAX_DROP_IN_DELAY = 0.05;
 const MIG_MAX_DROP_VERTICAL = 0.15;
 const MIG_TREND_THRESHOLD = -0.03;  // tendencia bajista en 5s: tolera ruido hasta -3% (antes 0)
+const MIG_COLLAPSE_DROP = 0.20;       // stop de colapso: caída >20% desde el pico reciente...
+const MIG_COLLAPSE_WINDOW_MS = 4000;  // ...en <=4s -> cierre inmediato reason=COLLAPSE
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.06;
+const MOM_TP = 1.045;              // 1.06 -> 1.045: TP +4.5%, bajo el techo natural +4-6%
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
@@ -54,7 +56,7 @@ const MOM_MAX_MC = 1_000_000;
 const MOM_MAX_OPEN = 3;
 const MOM_SCAN_MS = 30_000;
 const MOM_BREAKEVEN_AT = 0.04;     // 0.03 -> 0.04: breakeven más tarde, fuera de la zona de ruido
-const MOM_LOCK_AT = 0.05;
+const MOM_LOCK_AT = 0.035;         // 0.05 -> 0.035: trailing arranca antes del TP +4.5%
 const MOM_FOLLOW_PCT = 0.03;       // 0.02 -> 0.03: trailing aguanta el microdip normal
 const MOM_PENDING_TIMEOUT_MS = 30_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
@@ -129,6 +131,7 @@ const state = {
     abort_correct: 0, abort_missed: 0,
     abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
     abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
+    mig_collapse_count: 0, mig_collapse_pnlSum: 0,  // stop de colapso: nº disparos y suma de pnl%
   },
 };
 
@@ -645,7 +648,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
     price: entryPrice, tp: +(entryPrice * MOM_TP).toFixed(12), sl: +(entryPrice * MOM_SL).toFixed(12),
     mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
   };
-  addLog(`⚡ ENTRADA [real PP]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3%`, "accept");
+  addLog(`⚡ ENTRADA [real PP]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +4.5% SL -3%`, "accept");
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
   broadcast({ event: "newSignal", data: signal });
@@ -783,6 +786,7 @@ async function openRealTrade(signal) {
     maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
     expiresAt: Date.now() + duration, sellRetries: 0,
+    recentPrices: [],   // {price, time} de los últimos ~5s, para el stop de colapso
   };
   state.realTrades.unshift(trade);
   if (state.realTrades.length > 200) state.realTrades.pop();
@@ -810,11 +814,17 @@ async function closeRealTrade(trade, price, reason) {
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = trade.strategy === "migration" ? "mig" : "mom";
   const expWinPct = trade.strategy === "migration" ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
-  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
+  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct > 0)) {
     trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
     const tag = reason === "STEP" ? "🪜 ESCALÓN" : trade.strategy;
     addLog(`✅ REAL WIN [${tag}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
+  } else if (reason === "COLLAPSE") {
+    trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
+    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
+    state.stats.mig_collapse_count++;
+    state.stats.mig_collapse_pnlSum += trade.pnlPct;
+    addLog(`🛑 REAL COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "realloss");
   } else if (reason === "SL") {
     trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
@@ -838,6 +848,28 @@ async function closeRealTrade(trade, price, reason) {
   saveState();
 }
 
+// Stop de colapso vertical (solo migración): registra el precio en el
+// mini-historial reciente del trade y devuelve true si el precio actual
+// cayó más de MIG_COLLAPSE_DROP desde el pico de los últimos
+// MIG_COLLAPSE_WINDOW_MS. Es un "trailing rápido" para el caso de pánico:
+// la diferencia con el trailing FOLLOWING (-20% del máximo) es la VELOCIDAD,
+// solo dispara si ese desplome ocurre en la ventana corta. No solapa con
+// FOLLOWING (sin componente temporal) ni con el escalón.
+function detectCollapse(trade, price, now) {
+  if (trade.strategy !== "migration") return false;
+  trade.recentPrices.push({ price, time: now });
+  // podar a ~5s para no acumular
+  while (trade.recentPrices.length && now - trade.recentPrices[0].time > 5000) {
+    trade.recentPrices.shift();
+  }
+  const window = trade.recentPrices.filter(p => now - p.time <= MIG_COLLAPSE_WINDOW_MS);
+  if (window.length < 2) return false;
+  const peak = Math.max(...window.map(p => p.price));
+  if (peak <= 0) return false;
+  const dropFromPeak = (peak - price) / peak;
+  return dropFromPeak > MIG_COLLAPSE_DROP;
+}
+
 function updateRealTrades(mint, price, strategy) {
   const now = Date.now();
   const breakeven = strategy === "migration" ? MIG_BREAKEVEN_AT : MOM_BREAKEVEN_AT;
@@ -850,6 +882,11 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
+    if (detectCollapse(trade, price, now)) {
+      closeRealTrade(trade, price, "COLLAPSE");
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - follow);
@@ -901,6 +938,11 @@ function updateDemoTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
+    if (detectCollapse(trade, price, now)) {
+      closeDemoTrade(trade, price, "COLLAPSE", tp_pct);
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - follow);
@@ -1005,13 +1047,14 @@ function openDemoTrade(signal) {
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
     expiresAt: Date.now() + duration,
+    recentPrices: [],   // {price, time} de los últimos ~5s, para el stop de colapso
   };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  const tpPct = signal.strategy === "migration" ? "+80%" : "+6%";
+  const tpPct = signal.strategy === "migration" ? "+80%" : "+4.5%";
   const slPct = signal.strategy === "migration" ? "-18%" : "-3%";
   addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
@@ -1035,9 +1078,17 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
     addLog(`✅ WIN [🪜 ESCALÓN][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
+  } else if (reason === "COLLAPSE") {
+    // Stop de colapso vertical: cierre por desplome veloz. Cuenta como LOSS
+    // (cierra en negativo) pero se mide aparte para evaluar su efecto.
+    trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++;
+    state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
+    state.stats.mig_collapse_count++;
+    state.stats.mig_collapse_pnlSum += trade.pnlPct;
+    addLog(`🛑 COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "loss");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
-    if (trade.pnlPct >= 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
+    if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
     else { trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
   } else {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
@@ -1181,6 +1232,7 @@ app.get("/api/reset-stats", (req, res) => {
     abort_correct: 0, abort_missed: 0,
     abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
     abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
+    mig_collapse_count: 0, mig_collapse_pnlSum: 0,
   };
   saveState();
   broadcast({ event: "stats", data: state.stats });
@@ -1211,7 +1263,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.9 — Fix escalón (epsilon trigger + cierre al piso + reason STEP)`);
+  console.log(`🚀 SolScanBot v8.1 — Stop de colapso vertical (COLLAPSE -20%/4s, solo migración)`);
   loadState();
   initWallet();
   connectPumpPortal();
