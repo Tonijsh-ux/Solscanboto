@@ -34,12 +34,13 @@ const MIG_LOCK_AT = 0.20;
 const MIG_FOLLOW_PCT = 0.20;
 const MIG_STEP_TRIGGER = 0.20;     // al tocar +20% de beneficio...
 const MIG_STEP_FLOOR = 0.13;       // ...asegurar piso de +13%
-const MIG_MAX_PRICE_RATIO = 1.5;
-const MIG_REJECT_STREAK = 2;
+const MIG_MAX_PRICE_RATIO = 1.5;   // saltos de escala residuales quedan filtrados
+const MIG_REJECT_STREAK = 2;       // ticks consecutivos a la baja para aceptar caída real
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_MAX_DROP_IN_DELAY = 0.05;
 const MIG_MAX_DROP_VERTICAL = 0.15;
+const MIG_TREND_THRESHOLD = -0.03;  // tendencia bajista en 5s: tolera ruido hasta -3% (antes 0)
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
@@ -52,9 +53,9 @@ const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_MAX_OPEN = 3;
 const MOM_SCAN_MS = 30_000;
-const MOM_BREAKEVEN_AT = 0.03;
+const MOM_BREAKEVEN_AT = 0.04;     // 0.03 -> 0.04: breakeven más tarde, fuera de la zona de ruido
 const MOM_LOCK_AT = 0.05;
-const MOM_FOLLOW_PCT = 0.02;
+const MOM_FOLLOW_PCT = 0.03;       // 0.02 -> 0.03: trailing aguanta el microdip normal
 const MOM_PENDING_TIMEOUT_MS = 30_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
@@ -411,7 +412,7 @@ function migValidateAndEnter(entry) {
       const priceAgo = lookback5s[0].price;
       const priceNowLB = lookback5s[lookback5s.length - 1].price;
       const trend = (priceNowLB - priceAgo) / priceAgo;
-      if (trend < 0) {
+      if (trend < MIG_TREND_THRESHOLD) {
         addLog(`⛔ MIG ABORTADA [bajista]: ${entry.symbol} tendencia ${(trend*100).toFixed(1)}% en 5s`, "filter");
         registerAbort(entry.mint, entry.symbol, priceNowLB, "bajista");
         broadcast({ event: "stats", data: state.stats }); return;
@@ -859,7 +860,12 @@ function updateRealTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
-    // Escalón de beneficio (solo migración): si tocó +20%, piso de +13%.
+    // Escalón de beneficio (solo migración): si en algún momento tocó
+    // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
+    // no el beneficio instantáneo, para que el piso se mantenga aunque el
+    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
+    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
+    // como suelo mínimo.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) trade.sl = +stepStop.toFixed(12);
@@ -1056,7 +1062,6 @@ function connectPumpPortal() {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
 
-        // Supply calibrado desde este mensaje (si trae marketCapSol + sol/tok)
         const calSupply = calibrateSupply(data);
 
         // ── ABORTOS EN OBSERVACIÓN: solo actualizar último precio ──
@@ -1066,7 +1071,6 @@ function connectPumpPortal() {
           if (price > 0) aborted.lastPrice = price;
         }
 
-        // ── MIGRACIÓN: calibrar y usar supply real ────────────────
         const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
         if (migEntry) {
           if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
@@ -1074,7 +1078,6 @@ function connectPumpPortal() {
           if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
         }
 
-        // ── MOMENTUM: calibrar y usar supply real ─────────────────
         const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
         if (momEntry) {
           if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
@@ -1179,7 +1182,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.6 — Fix precio SOL (CoinGecko+Jupiter+bandera) + abortos observados`);
+  console.log(`🚀 SolScanBot v7.8 — Deploy A (filtro bajista -3%) + momentum breakeven/trailing`);
   loadState();
   initWallet();
   connectPumpPortal();
