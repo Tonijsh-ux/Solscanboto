@@ -810,10 +810,11 @@ async function closeRealTrade(trade, price, reason) {
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = trade.strategy === "migration" ? "mig" : "mom";
   const expWinPct = trade.strategy === "migration" ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
-  if (reason === "TP" || (reason === "SL" && trade.pnlPct >= 0)) {
+  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
-    addLog(`✅ REAL WIN [${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
+    const tag = reason === "STEP" ? "🪜 ESCALÓN" : trade.strategy;
+    addLog(`✅ REAL WIN [${tag}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
   } else if (reason === "SL") {
     trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
@@ -863,15 +864,25 @@ function updateRealTrades(mint, price, strategy) {
     // Escalón de beneficio (solo migración): si en algún momento tocó
     // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
     // no el beneficio instantáneo, para que el piso se mantenga aunque el
-    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
-    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
-    // como suelo mínimo.
-    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+    // precio caiga luego. El -1e-9 evita que +20.0% exacto se escape por
+    // redondeo de coma flotante. El stop es el MÁS ALTO de los candidatos,
+    // así que el trailing -20% sigue mandando en las grandes y el escalón
+    // actúa solo como suelo mínimo.
+    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-      if (stepStop > trade.sl) trade.sl = +stepStop.toFixed(12);
+      if (stepStop > trade.sl) {
+        if (trade.trailingPhase !== "STEP") trade.trailingPhase = "STEP";
+        trade.sl = +stepStop.toFixed(12);
+      }
     }
     if (price >= trade.tp) closeRealTrade(trade, price, "TP");
-    else if (price <= trade.sl) closeRealTrade(trade, price, "SL");
+    else if (price <= trade.sl) {
+      // En real el cierre se ejecuta al precio real de venta (con su slippage),
+      // NO al nivel teórico del stop. Solo ajustamos el reason para contabilizar
+      // bien: STEP si cerró por el piso del escalón, SL en otro caso.
+      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
+      closeRealTrade(trade, price, reason);
+    }
     else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
     else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
@@ -904,7 +915,8 @@ function updateDemoTrades(mint, price, strategy) {
       addLog(`⚖️ BREAKEVEN [${strategy}]: ${trade.symbol}`, "trail");
     }
     // Escalón de beneficio (solo migración): si tocó +20%, piso de +13%.
-    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+    // El -1e-9 evita que +20.0% exacto se escape por redondeo de coma flotante.
+    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) {
         if (trade.trailingPhase !== "STEP") {
@@ -915,7 +927,18 @@ function updateDemoTrades(mint, price, strategy) {
       }
     }
     if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
-    else if (price <= trade.sl) closeDemoTrade(trade, price, "SL", tp_pct);
+    else if (price <= trade.sl) {
+      // Si el stop protege ganancia (piso del escalón o trailing en positivo),
+      // el cierre se ejecuta AL NIVEL DEL STOP, no al precio del tick que lo cruzó:
+      // el stop es la orden que se habría disparado a ese nivel. En una caída
+      // vertical entre ticks (memecoin), usar el precio del tick infravaloraría
+      // el cierre (cerraba +1.17% en vez del piso +13%). Para el SL inicial bajo
+      // entrada, cerrar al precio real (más honesto en caída sin liquidez).
+      const stopProtegeGanancia = trade.sl >= trade.entryPrice;
+      const closePrice = stopProtegeGanancia ? trade.sl : price;
+      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
+      closeDemoTrade(trade, closePrice, reason, tp_pct);
+    }
     else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
     else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
@@ -929,8 +952,9 @@ setInterval(() => {
     if (!token) continue;
     if (now >= trade.expiresAt) { closeRealTrade(trade, token.price, "EXPIRED"); continue; }
     if (token.price <= trade.sl) {
-      addLog(`🚨 SL FORZADO [${trade.strategy}]: ${trade.symbol}`, "warn");
-      closeRealTrade(trade, token.price, "SL");
+      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
+      addLog(`🚨 ${reason === "STEP" ? "ESCALÓN" : "SL"} FORZADO [${trade.strategy}]: ${trade.symbol}`, "warn");
+      closeRealTrade(trade, token.price, reason);
     }
   }
   for (const trade of state.demoTrades) {
@@ -1006,6 +1030,11 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
     state.stats[`${prefix}_demoPnL`] += (tp_pct - 1) * 100;
     addLog(`✅ WIN [TP][${trade.strategy}]: ${trade.symbol} +${((tp_pct-1)*100).toFixed(0)}% en ${dur}s`, "win");
+  } else if (reason === "STEP") {
+    // Cierre por el piso del escalón (+13%): siempre es win
+    trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
+    state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
+    addLog(`✅ WIN [🪜 ESCALÓN][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
     if (trade.pnlPct >= 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
@@ -1182,7 +1211,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v7.8 — Deploy A (filtro bajista -3%) + momentum breakeven/trailing`);
+  console.log(`🚀 SolScanBot v7.9 — Fix escalón (epsilon trigger + cierre al piso + reason STEP)`);
   loadState();
   initWallet();
   connectPumpPortal();
