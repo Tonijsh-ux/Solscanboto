@@ -985,7 +985,7 @@ function updateRealTrades(mint, price, strategy) {
       closeRealTrade(trade, price, reason);
     }
     else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
-    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
 }
 
@@ -1052,7 +1052,7 @@ function updateDemoTrades(mint, price, strategy) {
       closeDemoTrade(trade, closePrice, reason, tp_pct);
     }
     else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
-    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
 }
 
