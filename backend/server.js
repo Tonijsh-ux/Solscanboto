@@ -678,21 +678,22 @@ function updateRealTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
-    // ── NUEVO v6.2: escalón de beneficio (solo migración) ──
-    // Si en algún momento tocó +20% (usa maxGainPct), el stop nunca baja
-    // de +13%. El stop es el MÁS ALTO de los candidatos, así que el trailing
-    // -20% sigue mandando en las grandes y el escalón actúa solo como suelo.
-    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
-      const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-      if (stepStop > trade.sl) {
-        if (trade.trailingPhase !== "STEP") trade.trailingPhase = "STEP";
-        trade.sl = +stepStop.toFixed(12);
-      }
+    // ── v6.3: escalón como SUELO, no override (solo migración) ──
+    // Si tocó +20% (usa maxGainPct), el stop NUNCA baja de +13%. Pero el
+    // escalón NO secuestra la fase: FOLLOWING sigue actualizando el trailing
+    // arriba (bloque de arriba), y aquí solo elevamos el suelo a +13% si el
+    // trailing aún no lo superó. Así las medianas-altas (+27-43%) dejan de
+    // cortarse en +13%: cuando el trailing -20% supera +13%, manda el trailing.
+    const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
+    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
+    if (stepArmed && stepFloorPrice > trade.sl) {
+      trade.sl = +stepFloorPrice.toFixed(12);
     }
     if (price >= trade.tp) closeRealTrade(trade, price, "TP");
     else if (price <= trade.sl) {
       // En real el cierre se ejecuta al precio real de venta (con slippage).
-      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
+      // reason=STEP solo si el stop que disparó ES el piso (no el trailing).
+      const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
       closeRealTrade(trade, price, reason);
     }
     else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
@@ -756,30 +757,29 @@ function updateDemoTrades(mint, price, strategy) {
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
       addLog(`⚖️ BREAKEVEN [${strategy}]: ${trade.symbol}`, "trail");
     }
-    // ── NUEVO v6.2: escalón de beneficio (solo migración) ──
-    // Si tocó +20%, piso de +13%. El -1e-9 evita que +20.0% exacto se escape
-    // por redondeo de coma flotante.
-    if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
-      const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-      if (stepStop > trade.sl) {
-        if (trade.trailingPhase !== "STEP") {
-          trade.trailingPhase = "STEP";
-          addLog(`🪜 ESCALÓN +13% [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
-        }
-        trade.sl = +stepStop.toFixed(12);
+    // ── v6.3: escalón como SUELO, no override (solo migración) ──
+    // Si tocó +20%, el stop NUNCA baja de +13%, pero el escalón NO secuestra
+    // la fase: FOLLOWING sigue subiendo el trailing. Aquí solo elevamos el
+    // suelo a +13% si el trailing aún no lo superó. Cuando el trailing -20%
+    // supera +13%, manda el trailing (las medianas-altas dejan de cortarse).
+    const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
+    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
+    if (stepArmed && stepFloorPrice > trade.sl) {
+      if (!trade._stepLogged) {
+        trade._stepLogged = true;
+        addLog(`🪜 ESCALÓN +13% suelo [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
       }
+      trade.sl = +stepFloorPrice.toFixed(12);
     }
     if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
     else if (price <= trade.sl) {
-      // ── NUEVO v6.2: cierre al nivel del stop cuando protege ganancia ──
-      // Si el stop protege ganancia (piso del escalón o trailing en positivo),
-      // el cierre se ejecuta AL NIVEL DEL STOP, no al precio del tick que lo
-      // cruzó. En una caída vertical entre ticks (memecoin), usar el precio del
-      // tick infravaloraría el cierre (cerraba +1% en vez del piso +13%). Para
-      // el SL inicial bajo entrada, cerrar al precio real (más honesto).
+      // Cierre al nivel del stop cuando protege ganancia (piso o trailing en
+      // positivo): el stop es la orden que se habría disparado a ese nivel.
+      // En SL inicial bajo entrada, cerrar al precio real (más honesto).
       const stopProtegeGanancia = trade.sl >= trade.entryPrice;
       const closePrice = stopProtegeGanancia ? trade.sl : price;
-      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
+      // reason=STEP solo si el stop que disparó ES el piso (no el trailing).
+      const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
       closeDemoTrade(trade, closePrice, reason, tp_pct);
     }
     else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
@@ -944,7 +944,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.2 — v6.0 + SOL real (Jupiter) + Escalón +20%→+13% | TP +80% | SL -18% | Trailing -20%`);
+  console.log(`🚀 SolScanBot v6.3 — v6.0 + SOL real + Escalón como SUELO (piso +13% cede al trailing) | TP +80% | SL -18% | Trailing -20%`);
   loadState();
   initWallet();
   connectPumpPortal();
