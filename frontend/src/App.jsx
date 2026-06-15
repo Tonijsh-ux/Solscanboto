@@ -114,10 +114,11 @@ function TradeCard({ trade, isReal }) {
        {[
          { label: "Actual", value: `${(trade.currentPct||0)>0?"+":""}${(trade.currentPct||0).toFixed(1)}%`, color: pctColor(trade.currentPct||0) },
          { label: "Max ↑", value: `+${(trade.maxGainPct||0).toFixed(1)}%`, color: "#22c55e" },
+         { label: "Min ↓", value: `${(trade.maxLossPct||0).toFixed(1)}%`, color: "#ef4444" },
          { label: "Trailing", value: trade.trailingPhase||"INITIAL", color: trade.trailingPhase !== "INITIAL" ? "#facc15" : "#64748b" },
          { label: isOpen ? "⏱️" : "Dur", value: isOpen ? elapsed(trade.openTime) : `${Math.round(((trade.closeTime||Date.now())-trade.openTime)/1000)}s`, color: "#94a3b8" },
        ].map((m, i) => (
-         <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 3 ? "1px solid #1e2d40" : "none" }}>
+         <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 4 ? "1px solid #1e2d40" : "none" }}>
            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
            <div style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 700, color: m.color }}>{m.value}</div>
          </div>
