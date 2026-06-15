@@ -49,6 +49,8 @@ const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
+const MOM_MIN_LIQUIDITY = 25_000;     // v6.4: liquidez mínima del pool en USD (reserve_in_usd). Filtra pools finos tipo SPCX (vol alto, liquidez <$1)
+const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
 const MOM_FOLLOW_PCT = 0.02;
@@ -432,6 +434,7 @@ async function momentumScan() {
         const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
         const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
         if (geckoPrice <= 0) continue;
+        const liquidity = parseFloat(attr.reserve_in_usd || 0);  // v6.4: liquidez del pool
         const relationships = pool.relationships || {};
         const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
         if (!mint || mint.length < 32) continue;
@@ -445,6 +448,13 @@ async function momentumScan() {
         }
         if (seenMomPools.has(poolAddr)) continue;
         if (vol1h < MOM_MIN_VOL_1H) continue;
+        // ── v6.4 Fix 1: filtro de liquidez mínima (descarta pools finos tipo SPCX) ──
+        // reserve_in_usd > 0 evita falso 0 si el campo faltara puntualmente: solo
+        // descartamos cuando Gecko reporta liquidez real y baja.
+        if (liquidity > 0 && liquidity < MOM_MIN_LIQUIDITY) {
+          addLog(`⛔ MOM liquidez baja (${formatMC(liquidity)}): ${(attr.name||"").split(" / ")[0] || mint.slice(0,8)}`, "filter");
+          continue;
+        }
         if (pct1h < MOM_MIN_PCT_1H) continue;
         if (pct1h > MOM_MAX_PCT_1H) continue;
         const lastSig = momSignalCooldown.get(mint) || 0;
@@ -704,7 +714,19 @@ function updateRealTrades(mint, price, strategy) {
 setInterval(() => {
   const now = Date.now();
   for (const trade of state.realTrades) {
-    if (trade.status !== "OPEN" || now < trade.expiresAt) continue;
+    if (trade.status !== "OPEN") continue;
+    // ── v6.4 Fix 2: cancelar Momentum real con feed mudo ──
+    if (trade.strategy === "momentum") {
+      const aliveMs = now - trade.openTime;
+      const sinMovimiento = (trade.maxGainPct === 0 && trade.maxLossPct === 0);
+      if (aliveMs >= MOM_MUTE_TIMEOUT_MS && sinMovimiento) {
+        const tk = state.momMonitored.get(trade.mint);
+        addLog(`🔇 MOM FEED MUDO [real]: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
+        closeRealTrade(trade, tk?.price || trade.entryPrice, "EXPIRED");
+        continue;
+      }
+    }
+    if (now < trade.expiresAt) continue;
     const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
     closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
   }
@@ -837,7 +859,23 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
 setInterval(() => {
   const now = Date.now();
   for (const trade of state.demoTrades) {
-    if (trade.status !== "OPEN" || now < trade.expiresAt) continue;
+    if (trade.status !== "OPEN") continue;
+    // ── v6.4 Fix 2: cancelar Momentum con feed mudo ──
+    // Si tras MOM_MUTE_TIMEOUT_MS el precio nunca se movió (max y min en 0),
+    // el feed de PumpPortal no manda trades para ese pool: cancelar y liberar
+    // capital en vez de esperar a los 45 min. Cierra a precio de entrada (P&L 0).
+    if (trade.strategy === "momentum") {
+      const aliveMs = now - trade.openTime;
+      const sinMovimiento = (trade.maxGainPct === 0 && trade.maxLossPct === 0);
+      if (aliveMs >= MOM_MUTE_TIMEOUT_MS && sinMovimiento) {
+        const tk = state.momMonitored.get(trade.mint);
+        addLog(`🔇 MOM FEED MUDO: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
+        closeDemoTrade(trade, tk?.price || trade.entryPrice, "EXPIRED", MOM_TP);
+        continue;
+      }
+    }
+    // Expiración normal (45 min)
+    if (now < trade.expiresAt) continue;
     const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
     const tp_pct = trade.strategy === "migration" ? MIG_TP : MOM_TP;
     closeDemoTrade(trade, token?.price || trade.entryPrice, "EXPIRED", tp_pct);
@@ -944,7 +982,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.3 — v6.0 + SOL real + Escalón como SUELO (piso +13% cede al trailing) | TP +80% | SL -18% | Trailing -20%`);
+  console.log(`🚀 SolScanBot v6.4 — v6.3 + Momentum: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
