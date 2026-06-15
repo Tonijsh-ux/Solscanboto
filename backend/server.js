@@ -43,6 +43,8 @@ const MIG_MAX_DROP_VERTICAL = 0.15;
 const MIG_TREND_THRESHOLD = -0.03;  // tendencia bajista en 5s: tolera ruido hasta -3% (antes 0)
 const MIG_COLLAPSE_DROP = 0.20;       // stop de colapso: caída >20% desde el pico reciente...
 const MIG_COLLAPSE_WINDOW_MS = 4000;  // ...en <=4s -> cierre inmediato reason=COLLAPSE
+const MIG_GRACE_MS = 10000;           // SL de gracia: primeros 10s de vida del trade...
+const MIG_GRACE_SL = 0.75;            // ...permite caer hasta -25% (aguanta el lavado inicial)
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.045;              // 1.06 -> 1.045: TP +4.5%, bajo el techo natural +4-6%
@@ -214,17 +216,10 @@ function unsubscribeToken(mint) {
 }
 
 // ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
-// marketCapSol/supply es el precio del POOL, estable entre trades.
-// sol/tok es el precio de UNA orden concreta y tiene ruido de
-// slippage (órdenes de distinto tamaño dan sol/tok muy distintos),
-// por eso solo se usa como fallback cuando no hay marketCapSol o
-// el supply aún no está calibrado.
 function calcPrice(data, knownSupply) {
-  // PRINCIPAL: precio derivado del market cap del pool (estable)
   if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
     return (data.marketCapSol * solPriceUSD) / knownSupply;
   }
-  // FALLBACK: sol/tok del trade (ruido de slippage)
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
   if (sol > 0 && tok > 0) {
@@ -233,8 +228,6 @@ function calcPrice(data, knownSupply) {
   return 0;
 }
 
-// Deduce el supply real del primer mensaje que traiga marketCapSol Y sol/tok:
-// marketCapSol = (sol/tok) * supply  =>  supply = marketCapSol / (sol/tok)
 function calibrateSupply(data) {
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
@@ -320,7 +313,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [],
+    priceHistory: [], calSupply: null,
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -360,7 +353,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * 1_000_000_000,
+    mc: price * (entry.calSupply || 1_000_000_000),
   }});
 }
 
@@ -430,16 +423,13 @@ function migValidateAndEnter(entry) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
-    // Coger el precio REAL más reciente del historial (no el cacheado
-    // en lastPrice, que puede estar congelado si los ticks de la
-    // caída fueron rechazados por isPriceValid durante el delay).
     const sorted = entry.priceHistory
       .slice()
       .sort((a, b) => b.time - a.time);
     const truePriceNow = sorted.length ? sorted[0].price : priceAtTrigger;
 
     entry.firstPrice = truePriceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (real, no cacheado)`, "accept");
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (precio de mercado)`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -487,19 +477,16 @@ function migUpdatePrice(mint, price, solAmount) {
 
   // ── Fix precio congelado (Fase 2) ─────────────────────
   if (!isPriceValid(price, token.price)) {
-    // ¿el precio rechazado es A LA BAJA respecto al actual?
     if (price > 0 && price < token.price) {
       token.downRejectStreak = (token.downRejectStreak || 0) + 1;
-      // varios ticks seguidos a la baja = caída real, aceptar
       if (token.downRejectStreak < MIG_REJECT_STREAK) return;
       addLog(`⚠️ MIG caída real aceptada: ${token.symbol} (${token.downRejectStreak} ticks a la baja)`, "warn");
     } else {
-      // rechazo al alza o glitch suelto: descartar y resetear
       token.downRejectStreak = 0;
       return;
     }
   } else {
-    token.downRejectStreak = 0;  // tick válido, resetear racha
+    token.downRejectStreak = 0;
   }
 
   const supply = token.calSupply || 1_000_000_000;
@@ -593,7 +580,6 @@ async function momentumScan() {
 
       totalScanned++;
 
-      // Actualizar precio si ya monitorizamos
       if (state.momMonitored.has(mint)) {
         momUpdatePrice(mint, price, 0);
         continue;
@@ -602,7 +588,6 @@ async function momentumScan() {
       const lastSig = momSignalCooldown.get(mint) || 0;
       if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
 
-      // Comprobar límite de abiertas
       const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
       if (momOpen >= MOM_MAX_OPEN) continue;
 
@@ -623,14 +608,12 @@ async function momentumScan() {
       });
       state.stats.mom_pending = state.momPending.size;
 
-      // Suscribir a PumpPortal para precio real
       if (pumpPortalWs?.readyState === WebSocket.OPEN) {
         pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
       }
 
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
-      // Opción A: cancelar si no llega precio real en 30s
       setTimeout(() => {
         if (state.momPending.has(mint)) {
           const pending = state.momPending.get(mint);
@@ -658,7 +641,6 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   const pending = state.momPending.get(mint);
   if (!pending) return;
 
-  // Comprobar límite al activar
   const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
   if (momOpen >= MOM_MAX_OPEN) {
     addLog(`⛔ MOM límite: ya hay ${momOpen} abiertas — cancelando ${pending.symbol}`, "filter");
@@ -744,7 +726,6 @@ function momTryConfirmEntry(mint) {
     return;
   }
 
-  // Tendencia alcista confirmada → entrar con el último precio real
   addLog(`✅ MOM CONFIRMADA [tendencia +${(trend*100).toFixed(1)}%]: ${pending.symbol}`, "accept");
   momActivateFromPending(mint, last, 1);
 }
@@ -888,8 +869,9 @@ async function closeRealTrade(trade, price, reason) {
 // FOLLOWING (sin componente temporal) ni con el escalón.
 function detectCollapse(trade, price, now) {
   if (trade.strategy !== "migration") return false;
+  // El registro del precio reciente ocurre SIEMPRE (aunque COLLAPSE esté
+  // desactivado en la gracia), para tener historial cuando la gracia acabe.
   trade.recentPrices.push({ price, time: now });
-  // podar a ~5s para no acumular
   while (trade.recentPrices.length && now - trade.recentPrices[0].time > 5000) {
     trade.recentPrices.shift();
   }
@@ -899,6 +881,24 @@ function detectCollapse(trade, price, now) {
   if (peak <= 0) return false;
   const dropFromPeak = (peak - price) / peak;
   return dropFromPeak > MIG_COLLAPSE_DROP;
+}
+
+// SL efectivo con ventana de gracia (solo migración): durante los primeros
+// MIG_GRACE_MS de vida del trade, el suelo del stop es más holgado (-25%)
+// para aguantar el lavado inicial — muchas ganadoras caen -15/-20% en la
+// sacudida previa al despegue y el SL -18% las sacaba justo antes de subir.
+// Pasada la ventana, el suelo vuelve a -18%. El trailing/escalón mandan si
+// ya subieron el stop por encima (nunca reducimos protección ganada).
+function effectiveSL(trade, now) {
+  if (trade.strategy !== "migration") return trade.sl;
+  const inGrace = (now - trade.openTime) < MIG_GRACE_MS;
+  if (!inGrace) return trade.sl;
+  const graceFloor = +(trade.entryPrice * MIG_GRACE_SL).toFixed(12);
+  // En la gracia, el stop es el MÁS BAJO entre el SL normal y el suelo de gracia
+  // (damos más margen). Pero si el trailing ya lo subió por encima de la entrada,
+  // ese manda — la gracia solo relaja el SL inicial, no toca ganancias bloqueadas.
+  if (trade.sl >= trade.entryPrice) return trade.sl;
+  return Math.min(trade.sl, graceFloor);
 }
 
 function updateRealTrades(mint, price, strategy) {
@@ -914,7 +914,12 @@ function updateRealTrades(mint, price, strategy) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
     // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
-    if (detectCollapse(trade, price, now)) {
+    // detectCollapse se llama siempre (registra el precio reciente), pero
+    // durante la ventana de gracia ignoramos su disparo: ahí manda el SL de
+    // gracia (-25%), para no sacar ganadoras en el lavado inicial.
+    const inGrace = strategy === "migration" && (now - trade.openTime) < MIG_GRACE_MS;
+    const collapsed = detectCollapse(trade, price, now);
+    if (!inGrace && collapsed) {
       closeRealTrade(trade, price, "COLLAPSE");
       continue;
     }
@@ -932,9 +937,10 @@ function updateRealTrades(mint, price, strategy) {
     // Escalón de beneficio (solo migración): si en algún momento tocó
     // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
     // no el beneficio instantáneo, para que el piso se mantenga aunque el
-    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
-    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
-    // como suelo mínimo.
+    // precio caiga luego. El -1e-9 evita que +20.0% exacto se escape por
+    // redondeo de coma flotante. El stop es el MÁS ALTO de los candidatos,
+    // así que el trailing -20% sigue mandando en las grandes y el escalón
+    // actúa solo como suelo mínimo.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) {
@@ -943,7 +949,7 @@ function updateRealTrades(mint, price, strategy) {
       }
     }
     if (price >= trade.tp) closeRealTrade(trade, price, "TP");
-    else if (price <= trade.sl) {
+    else if (price <= effectiveSL(trade, now)) {
       // En real el cierre se ejecuta al precio real de venta (con su slippage),
       // NO al nivel teórico del stop. Solo ajustamos el reason para contabilizar
       // bien: STEP si cerró por el piso del escalón, SL en otro caso.
@@ -969,7 +975,12 @@ function updateDemoTrades(mint, price, strategy) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
     // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
-    if (detectCollapse(trade, price, now)) {
+    // detectCollapse se llama siempre (registra el precio reciente), pero
+    // durante la ventana de gracia ignoramos su disparo: ahí manda el SL de
+    // gracia (-25%), para no sacar ganadoras en el lavado inicial.
+    const inGrace = strategy === "migration" && (now - trade.openTime) < MIG_GRACE_MS;
+    const collapsed = detectCollapse(trade, price, now);
+    if (!inGrace && collapsed) {
       closeDemoTrade(trade, price, "COLLAPSE", tp_pct);
       continue;
     }
@@ -999,13 +1010,14 @@ function updateDemoTrades(mint, price, strategy) {
       }
     }
     if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
-    else if (price <= trade.sl) {
+    else if (price <= effectiveSL(trade, now)) {
       // Si el stop protege ganancia (piso del escalón o trailing en positivo),
       // el cierre se ejecuta AL NIVEL DEL STOP, no al precio del tick que lo cruzó:
       // el stop es la orden que se habría disparado a ese nivel. En una caída
       // vertical entre ticks (memecoin), usar el precio del tick infravaloraría
       // el cierre (cerraba +1.17% en vez del piso +13%). Para el SL inicial bajo
-      // entrada, cerrar al precio real (más honesto en caída sin liquidez).
+      // entrada (incl. SL de gracia), cerrar al precio real (más honesto en caída
+      // sin liquidez).
       const stopProtegeGanancia = trade.sl >= trade.entryPrice;
       const closePrice = stopProtegeGanancia ? trade.sl : price;
       const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
@@ -1023,7 +1035,7 @@ setInterval(() => {
     const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
     if (!token) continue;
     if (now >= trade.expiresAt) { closeRealTrade(trade, token.price, "EXPIRED"); continue; }
-    if (token.price <= trade.sl) {
+    if (token.price <= effectiveSL(trade, now)) {
       const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
       addLog(`🚨 ${reason === "STEP" ? "ESCALÓN" : "SL"} FORZADO [${trade.strategy}]: ${trade.symbol}`, "warn");
       closeRealTrade(trade, token.price, reason);
@@ -1118,6 +1130,10 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     addLog(`🛑 COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "loss");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
+    if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
+    else { trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
+  } else {
+    state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
     if (trade.pnlPct >= expWinPct) {
       trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
       addLog(`✅ WIN [EXP+][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
@@ -1168,7 +1184,6 @@ function connectPumpPortal() {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
 
-        // Supply calibrado desde este mensaje (si trae marketCapSol + sol/tok)
         const calSupply = calibrateSupply(data);
 
         // ── ABORTOS EN OBSERVACIÓN: solo actualizar último precio ──
@@ -1178,7 +1193,6 @@ function connectPumpPortal() {
           if (price > 0) aborted.lastPrice = price;
         }
 
-        // ── MIGRACIÓN: calibrar y usar supply real ────────────────
         const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
         if (migEntry) {
           if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
@@ -1186,11 +1200,9 @@ function connectPumpPortal() {
           if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
         }
 
-        // ── MOMENTUM: calibrar y usar supply real ─────────────────
         const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
         if (momEntry) {
           if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
-          // Prioridad: supply calibrado > supply de Birdeye > nada
           const supplyToUse = momEntry.calSupply || momEntry.supply;
           const price = calcPrice(data, supplyToUse);
           if (price > 0) momUpdatePrice(data.mint, price, data.solAmount || 0);
@@ -1242,7 +1254,6 @@ app.get("/api/state", (req, res) => {
   });
 });
 
-// Resetear stats y trades corrompidos (mantiene movimientos manuales)
 app.get("/api/reset-stats", (req, res) => {
   state.demoTrades = [];
   state.realTrades = [];
@@ -1294,7 +1305,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.9 — Birdeye Meme List (PumpSwap) + supply real`);
+  console.log(`🚀 SolScanBot v8.3 — SL de gracia (primeros 10s -25%, solo migración)`);
   loadState();
   initWallet();
   connectPumpPortal();
