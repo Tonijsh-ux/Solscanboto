@@ -70,6 +70,13 @@ const MOM_CONFIRM_MS = 5000;       // ventana de confirmación de tendencia ante
 const ABORT_WATCH_MS = 5 * 60 * 1000;  // observar 5 min tras abortar
 const ABORT_WIN_THRESHOLD = 0.20;      // +20% = "ganador perdido"
 
+// ── OBSERVACIÓN POST-CIERRE (instrumentación, no toca trading) ──
+// Misma maquinaria que los abortos pero aplicada a los CIERRES: tras cerrar
+// un trade de migración, observamos 5 min el precio para detectar "ganadores
+// perdidos" (cerró en pérdida pero el token despegó después).
+const POST_CLOSE_WATCH_MS = 5 * 60 * 1000;   // observar 5 min tras cerrar
+const POST_CLOSE_WIN_THRESHOLD = 0.20;       // +20% tras salir = ganador perdido
+
 // ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -112,6 +119,7 @@ const state = {
   momPending: new Map(),
   momMonitored: new Map(),
   abortWatch: new Map(),   // mint -> {symbol, abortPrice, abortReason, abortTime}
+  postCloseWatch: new Map(),  // mint -> {symbol, closePrice, closePnl, closeReason, closeTime, lastPrice}
   signals: [],
   demoTrades: [],
   realTrades: [],
@@ -463,10 +471,27 @@ function migOpenTrades(entry) {
 }
 
 function migCleanup(mint, symbol) {
-  unsubscribeToken(mint);
+  // Si el token está en observación post-cierre, NO desuscribir: necesitamos
+  // que el precio siga llegando 5 min para medir el post5m (igual que abortos).
+  if (!state.postCloseWatch.has(mint)) unsubscribeToken(mint);
   state.migMonitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
   addLog(`🗑️ ${symbol} eliminado`, "info");
+}
+
+// Registra un cierre de migración en observación (instrumentación pura).
+// A los 5 min mide el precio para clasificar el cierre automáticamente:
+// ganador perdido (subió +20% tras salir), muerto, o reversión normal.
+function registerPostClose(mint, symbol, closePrice, closePnl, closeReason) {
+  if (!closePrice || closePrice <= 0) return;
+  state.postCloseWatch.set(mint, {
+    symbol, closePrice, closePnl, closeReason,
+    closeTime: Date.now(), lastPrice: closePrice,
+  });
+  // Mantener suscripción 5 min para recibir precio (la cancela evaluarPostCierres).
+  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
+    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+  }
 }
 
 function migUpdatePrice(mint, price, solAmount) {
@@ -853,6 +878,9 @@ async function closeRealTrade(trade, price, reason) {
   }
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
   state.stats.walletBalance = await getWalletBalance();
+  if (trade.strategy === "migration" && reason !== "TP") {
+    registerPostClose(trade.mint, trade.symbol, price, trade.pnlPct, reason);
+  }
   if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint);
   broadcast({ event: "realTradeClosed", data: trade });
@@ -1051,6 +1079,7 @@ setInterval(() => {
     }
   }
   evaluarAbortos();
+  evaluarPostCierres();
 }, 5_000);
 
 // Evalúa los abortos en observación: a los 5 min, clasifica si el filtro
@@ -1076,6 +1105,35 @@ function evaluarAbortos() {
     state.abortWatch.delete(mint);
     unsubscribeToken(mint);
     broadcast({ event: "stats", data: state.stats });
+  }
+}
+
+// Evalúa los cierres en observación: a los 5 min, clasifica el cierre y lo
+// loguea. Detecta "ganadores perdidos" (cerró en pérdida pero el token
+// despegó +20% después). Instrumentación pura: solo añade datos al log.
+function evaluarPostCierres() {
+  const now = Date.now();
+  for (const [mint, c] of state.postCloseWatch.entries()) {
+    if (now - c.closeTime < POST_CLOSE_WATCH_MS) continue;
+    const cur = c.lastPrice;
+    if (cur && c.closePrice > 0) {
+      const post5m = (cur - c.closePrice) / c.closePrice;  // % desde el precio de salida
+      const post5mPct = (post5m * 100).toFixed(0);
+      // Clasificación automática:
+      let etiqueta;
+      if (post5m >= POST_CLOSE_WIN_THRESHOLD && c.closePnl < 0) {
+        etiqueta = "🔴 GANADOR PERDIDO";  // cerró en pérdida y luego despegó
+      } else if (post5m >= POST_CLOSE_WIN_THRESHOLD) {
+        etiqueta = "🟡 SIGUIÓ SUBIENDO";  // cerró en verde y siguió (dejamos algo en la mesa)
+      } else if (post5m <= -0.20) {
+        etiqueta = "🟢 MUERTO CONFIRMADO"; // siguió cayendo: el cierre acertó
+      } else {
+        etiqueta = "⚪ PLANO/REVERSIÓN";   // ni subió ni se hundió
+      }
+      addLog(`🔭 POST-CIERRE 5m: ${c.symbol} | cerró ${c.closePnl}% [${c.closeReason}] | post5m=${post5m>=0?"+":""}${post5mPct}% | ${etiqueta}`, "filter");
+    }
+    state.postCloseWatch.delete(mint);
+    unsubscribeToken(mint);
   }
 }
 
@@ -1105,7 +1163,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   trade.closePrice = price; trade.closeTime = Date.now(); trade.status = "CLOSED";
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   if (trade.strategy === "migration") {
-    addLog(`🔎 MIG CLOSE DEBUG: ${trade.symbol} | entryPrice=$${trade.entryPrice.toFixed(10)} | closePrice=$${price.toFixed(10)} | pnl=${((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2)}% | reason=${reason}`, "info");
+    addLog(`🔎 MIG CLOSE DEBUG: ${trade.symbol} | entryPrice=$${trade.entryPrice.toFixed(10)} | closePrice=$${price.toFixed(10)} | pnl=${((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2)}% | min=${(trade.maxLossPct||0).toFixed(1)}% | reason=${reason}`, "info");
   }
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
@@ -1151,6 +1209,11 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   state.stats[`${prefix}_closedCount`]++;
   state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
   state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
+  // Observación post-cierre (solo migración, cierres que NO son TP): detecta
+  // ganadores perdidos. Se registra ANTES del cleanup para que no desuscriba.
+  if (trade.strategy === "migration" && reason !== "TP") {
+    registerPostClose(trade.mint, trade.symbol, price, trade.pnlPct, reason);
+  }
   if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint);
   broadcast({ event: "demoTradeClosed", data: trade });
@@ -1170,6 +1233,7 @@ function connectPumpPortal() {
     for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.momMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.abortWatch.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+    for (const [mint] of state.postCloseWatch.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
   });
   pumpPortalWs.on("message", async (raw) => {
     try {
@@ -1191,6 +1255,13 @@ function connectPumpPortal() {
         if (aborted) {
           const price = calcPrice(data, calSupply || 1_000_000_000);
           if (price > 0) aborted.lastPrice = price;
+        }
+
+        // ── POST-CIERRE EN OBSERVACIÓN: solo actualizar último precio ──
+        const postClosed = state.postCloseWatch.get(data.mint);
+        if (postClosed) {
+          const price = calcPrice(data, calSupply || 1_000_000_000);
+          if (price > 0) postClosed.lastPrice = price;
         }
 
         const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
@@ -1305,7 +1376,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v8.3 — SL de gracia (primeros 10s -25%, solo migración)`);
+  console.log(`🚀 SolScanBot v8.4 — Instrumentación: min (MIN ↓) + post-cierre 5min (ganador perdido)`);
   loadState();
   initWallet();
   connectPumpPortal();
