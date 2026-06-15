@@ -48,8 +48,8 @@ const MIG_COLLAPSE_WINDOW_MS = 4000;  // ...en <=4s -> cierre inmediato reason=C
 const MOM_TP = 1.045;              // 1.06 -> 1.045: TP +4.5%, bajo el techo natural +4-6%
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
-const MOM_MIN_PCT_1H = 10;
-const MOM_MAX_PCT_1H = 30;
+const MOM_MIN_PCT_1H = 10;        // (sin uso desde v8.2: la selección es por volumen, no por subida)
+const MOM_MAX_PCT_1H = 30;        // (sin uso desde v8.2: ahora solo se descarta pct1h < -5)
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
@@ -214,10 +214,17 @@ function unsubscribeToken(mint) {
 }
 
 // ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
+// marketCapSol/supply es el precio del POOL, estable entre trades.
+// sol/tok es el precio de UNA orden concreta y tiene ruido de
+// slippage (órdenes de distinto tamaño dan sol/tok muy distintos),
+// por eso solo se usa como fallback cuando no hay marketCapSol o
+// el supply aún no está calibrado.
 function calcPrice(data, knownSupply) {
+  // PRINCIPAL: precio derivado del market cap del pool (estable)
   if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
     return (data.marketCapSol * solPriceUSD) / knownSupply;
   }
+  // FALLBACK: sol/tok del trade (ruido de slippage)
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
   if (sol > 0 && tok > 0) {
@@ -226,6 +233,8 @@ function calcPrice(data, knownSupply) {
   return 0;
 }
 
+// Deduce el supply real del primer mensaje que traiga marketCapSol Y sol/tok:
+// marketCapSol = (sol/tok) * supply  =>  supply = marketCapSol / (sol/tok)
 function calibrateSupply(data) {
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
@@ -311,7 +320,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [], calSupply: null,
+    priceHistory: [],
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -351,7 +360,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * (entry.calSupply || 1_000_000_000),
+    mc: price * 1_000_000_000,
   }});
 }
 
@@ -421,13 +430,16 @@ function migValidateAndEnter(entry) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
     }
+    // Coger el precio REAL más reciente del historial (no el cacheado
+    // en lastPrice, que puede estar congelado si los ticks de la
+    // caída fueron rechazados por isPriceValid durante el delay).
     const sorted = entry.priceHistory
       .slice()
       .sort((a, b) => b.time - a.time);
     const truePriceNow = sorted.length ? sorted[0].price : priceAtTrigger;
 
     entry.firstPrice = truePriceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (precio de mercado)`, "accept");
+    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (real, no cacheado)`, "accept");
     migOpenTrades(entry);
   }, MIG_ENTRY_DELAY_MS);
 }
@@ -475,16 +487,19 @@ function migUpdatePrice(mint, price, solAmount) {
 
   // ── Fix precio congelado (Fase 2) ─────────────────────
   if (!isPriceValid(price, token.price)) {
+    // ¿el precio rechazado es A LA BAJA respecto al actual?
     if (price > 0 && price < token.price) {
       token.downRejectStreak = (token.downRejectStreak || 0) + 1;
+      // varios ticks seguidos a la baja = caída real, aceptar
       if (token.downRejectStreak < MIG_REJECT_STREAK) return;
       addLog(`⚠️ MIG caída real aceptada: ${token.symbol} (${token.downRejectStreak} ticks a la baja)`, "warn");
     } else {
+      // rechazo al alza o glitch suelto: descartar y resetear
       token.downRejectStreak = 0;
       return;
     }
   } else {
-    token.downRejectStreak = 0;
+    token.downRejectStreak = 0;  // tick válido, resetear racha
   }
 
   const supply = token.calSupply || 1_000_000_000;
@@ -511,14 +526,20 @@ async function momentumScan() {
   }
   try {
     const minLastTrade = Math.floor((Date.now() - MOM_LAST_TRADE_WINDOW_MS) / 1000);
+    // Birdeye cuenta graduated + cada min/max como "filtro" y limita a 5 total.
+    // En la query: graduated + 3 min/max (MC min, MC max, volumen) = 4.
+    // El orden es por VOLUMEN 1h (estilo Gecko): selecciona tokens más líquidos
+    // y con actividad sostenida, donde los stops ejecutan limpio. El criterio
+    // anterior (price_change_1h) cogía los más extendidos y volátiles -> entradas
+    // tardías y pérdidas grandes. min_last_trade se filtra en el código (abajo).
     const params = new URLSearchParams({
-      sort_by: "price_change_1h_percent",
+      sort_by: "volume_1h_usd",         // orden por volumen, no por subida
       sort_type: "desc",
-      source: "pump_dot_fun",
-      graduated: "true",
+      source: "pump_dot_fun",          // solo ecosistema pump.fun/PumpSwap
+      graduated: "true",                // solo los ya migrados a PumpSwap
       offset: "0",
       limit: "50",
-      min_price_change_1h_percent: String(MOM_MIN_PCT_1H),
+      min_volume_1h_usd: String(MOM_MIN_VOL_1H),  // el volumen es el filtro rey
       min_market_cap: String(MOM_MIN_MC),
       max_market_cap: String(MOM_MAX_MC),
     });
@@ -561,13 +582,18 @@ async function momentumScan() {
       const name = token.name || symbol;
 
       if (price <= 0) continue;
-      if (pct1h > MOM_MAX_PCT_1H) continue;
-      if (vol1h < MOM_MIN_VOL_1H) continue;
-      if (lastTrade > 0 && lastTrade < minLastTrade) continue;
-      if (liquidity > 0 && liquidity < 10000) continue;
+      // Selección estilo Gecko: el volumen manda, NO el momentum reciente.
+      // Ya no filtramos por "que haya subido +10-30%" (eso causaba entradas
+      // tardías en el pico). Solo descartamos los claramente bajistas.
+      if (pct1h < -5) continue;
+      // Filtros movidos de la query al código (límite de 5 filtros en Birdeye):
+      if (vol1h < MOM_MIN_VOL_1H) continue;                       // volumen 1h mínimo
+      if (lastTrade > 0 && lastTrade < minLastTrade) continue;    // trade en últimos 10min
+      if (liquidity > 0 && liquidity < 30000) continue;           // liquidez mínima (10k->30k: SL ejecuta limpio)
 
       totalScanned++;
 
+      // Actualizar precio si ya monitorizamos
       if (state.momMonitored.has(mint)) {
         momUpdatePrice(mint, price, 0);
         continue;
@@ -576,6 +602,7 @@ async function momentumScan() {
       const lastSig = momSignalCooldown.get(mint) || 0;
       if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
 
+      // Comprobar límite de abiertas
       const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
       if (momOpen >= MOM_MAX_OPEN) continue;
 
@@ -596,12 +623,14 @@ async function momentumScan() {
       });
       state.stats.mom_pending = state.momPending.size;
 
+      // Suscribir a PumpPortal para precio real
       if (pumpPortalWs?.readyState === WebSocket.OPEN) {
         pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
       }
 
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
 
+      // Opción A: cancelar si no llega precio real en 30s
       setTimeout(() => {
         if (state.momPending.has(mint)) {
           const pending = state.momPending.get(mint);
@@ -629,6 +658,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
   const pending = state.momPending.get(mint);
   if (!pending) return;
 
+  // Comprobar límite al activar
   const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
   if (momOpen >= MOM_MAX_OPEN) {
     addLog(`⛔ MOM límite: ya hay ${momOpen} abiertas — cancelando ${pending.symbol}`, "filter");
@@ -714,6 +744,7 @@ function momTryConfirmEntry(mint) {
     return;
   }
 
+  // Tendencia alcista confirmada → entrar con el último precio real
   addLog(`✅ MOM CONFIRMADA [tendencia +${(trend*100).toFixed(1)}%]: ${pending.symbol}`, "accept");
   momActivateFromPending(mint, last, 1);
 }
@@ -901,10 +932,9 @@ function updateRealTrades(mint, price, strategy) {
     // Escalón de beneficio (solo migración): si en algún momento tocó
     // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
     // no el beneficio instantáneo, para que el piso se mantenga aunque el
-    // precio caiga luego. El -1e-9 evita que +20.0% exacto se escape por
-    // redondeo de coma flotante. El stop es el MÁS ALTO de los candidatos,
-    // así que el trailing -20% sigue mandando en las grandes y el escalón
-    // actúa solo como suelo mínimo.
+    // precio caiga luego. El stop es el MÁS ALTO de los candidatos, así que
+    // el trailing -20% sigue mandando en las grandes y el escalón actúa solo
+    // como suelo mínimo.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) {
@@ -1088,10 +1118,6 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     addLog(`🛑 COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "loss");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
-    if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
-    else { trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
-  } else {
-    state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
     if (trade.pnlPct >= expWinPct) {
       trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
       addLog(`✅ WIN [EXP+][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
@@ -1142,6 +1168,7 @@ function connectPumpPortal() {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
 
+        // Supply calibrado desde este mensaje (si trae marketCapSol + sol/tok)
         const calSupply = calibrateSupply(data);
 
         // ── ABORTOS EN OBSERVACIÓN: solo actualizar último precio ──
@@ -1151,6 +1178,7 @@ function connectPumpPortal() {
           if (price > 0) aborted.lastPrice = price;
         }
 
+        // ── MIGRACIÓN: calibrar y usar supply real ────────────────
         const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
         if (migEntry) {
           if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
@@ -1158,9 +1186,11 @@ function connectPumpPortal() {
           if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
         }
 
+        // ── MOMENTUM: calibrar y usar supply real ─────────────────
         const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
         if (momEntry) {
           if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
+          // Prioridad: supply calibrado > supply de Birdeye > nada
           const supplyToUse = momEntry.calSupply || momEntry.supply;
           const price = calcPrice(data, supplyToUse);
           if (price > 0) momUpdatePrice(data.mint, price, data.solAmount || 0);
@@ -1212,6 +1242,7 @@ app.get("/api/state", (req, res) => {
   });
 });
 
+// Resetear stats y trades corrompidos (mantiene movimientos manuales)
 app.get("/api/reset-stats", (req, res) => {
   state.demoTrades = [];
   state.realTrades = [];
@@ -1263,7 +1294,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v8.1 — Stop de colapso vertical (COLLAPSE -20%/4s, solo migración)`);
+  console.log(`🚀 SolScanBot v6.9 — Birdeye Meme List (PumpSwap) + supply real`);
   loadState();
   initWallet();
   connectPumpPortal();
