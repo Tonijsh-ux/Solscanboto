@@ -19,70 +19,47 @@ const MAX_REAL_TRADES = 0;
 const STATE_FILE = "/tmp/solscanbot_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 1.80;
-const MIG_SL = 0.82;
-const MIG_DURATION_MS = 15 * 60 * 1000;
+const MIG_TP = 1.80;              // +80%
+const MIG_SL = 0.82;              // -18%
+const MIG_DURATION_MS = 15 * 60 * 1000; // 15 min — más tiempo para el movimiento
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 2_000;
 const MIG_MIN_VOL_SLOW = 5_000;
 const MIG_FAST_WINDOW_MS = 20_000;
 const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
-const MIG_BREAKEVEN_AT = 0.22;
-const MIG_BREAKEVEN_MARGIN = 0.03;
-const MIG_LOCK_AT = 0.20;
-const MIG_FOLLOW_PCT = 0.20;
-const MIG_STEP_TRIGGER = 0.20;     // al tocar +20% de beneficio...
-const MIG_STEP_FLOOR = 0.13;       // ...asegurar piso de +13%
-const MIG_MAX_PRICE_RATIO = 1.5;   // saltos de escala residuales quedan filtrados
-const MIG_REJECT_STREAK = 2;       // ticks consecutivos a la baja para aceptar caída real
+const MIG_BREAKEVEN_AT = 0.22;    // breakeven a +22%
+const MIG_BREAKEVEN_MARGIN = 0.03; // SL en breakeven = entrada -3%
+const MIG_LOCK_AT = 0.20;         // following a +20%
+const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
+const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_EXPIRED_WIN_PCT = 2;
-const MIG_ENTRY_DELAY_MS = 3_000;
-const MIG_MAX_DROP_IN_DELAY = 0.05;
-const MIG_MAX_DROP_VERTICAL = 0.15;
-const MIG_TREND_THRESHOLD = -0.03;  // tendencia bajista en 5s: tolera ruido hasta -3% (antes 0)
-const MIG_COLLAPSE_DROP = 0.20;       // stop de colapso: caída >20% desde el pico reciente...
-const MIG_COLLAPSE_WINDOW_MS = 4000;  // ...en <=4s -> cierre inmediato reason=COLLAPSE
-const MIG_GRACE_MS = 10000;           // SL de gracia: primeros 10s de vida del trade...
-const MIG_GRACE_SL = 0.75;            // ...permite caer hasta -25% (aguanta el lavado inicial)
+const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar
+// ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
+const MIG_STEP_TRIGGER = 0.20;    // al tocar +20% de beneficio...
+const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.045;              // 1.06 -> 1.045: TP +4.5%, bajo el techo natural +4-6%
+const MOM_TP = 1.06;
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
-const MOM_MIN_PCT_1H = 10;        // (sin uso desde v8.2: la selección es por volumen, no por subida)
-const MOM_MAX_PCT_1H = 30;        // (sin uso desde v8.2: ahora solo se descarta pct1h < -5)
+const MOM_MIN_PCT_1H = 10;
+const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
-const MOM_MAX_OPEN = 3;
 const MOM_SCAN_MS = 30_000;
-const MOM_BREAKEVEN_AT = 0.04;     // 0.03 -> 0.04: breakeven más tarde, fuera de la zona de ruido
-const MOM_LOCK_AT = 0.035;         // 0.05 -> 0.035: trailing arranca antes del TP +4.5%
-const MOM_FOLLOW_PCT = 0.03;       // 0.02 -> 0.03: trailing aguanta el microdip normal
+const MOM_BREAKEVEN_AT = 0.03;
+const MOM_LOCK_AT = 0.05;
+const MOM_FOLLOW_PCT = 0.02;
 const MOM_PENDING_TIMEOUT_MS = 30_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
-const MOM_LAST_TRADE_WINDOW_MS = 10 * 60 * 1000; // solo tokens con trade en últimos 10min
-const MOM_CONFIRM_MS = 5000;       // ventana de confirmación de tendencia antes de entrar
 
-// ── OBSERVACIÓN DE ABORTOS (instrumentación, no toca trading) ──
-const ABORT_WATCH_MS = 5 * 60 * 1000;  // observar 5 min tras abortar
-const ABORT_WIN_THRESHOLD = 0.20;      // +20% = "ganador perdido"
-
-// ── OBSERVACIÓN POST-CIERRE (instrumentación, no toca trading) ──
-// Misma maquinaria que los abortos pero aplicada a los CIERRES: tras cerrar
-// un trade de migración, observamos 5 min el precio para detectar "ganadores
-// perdidos" (cerró en pérdida pero el token despegó después).
-const POST_CLOSE_WATCH_MS = 5 * 60 * 1000;   // observar 5 min tras cerrar
-const POST_CLOSE_WIN_THRESHOLD = 0.20;       // +20% tras salir = ganador perdido
-
-// ── APIs ───────────────────────────────────────────────────────
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data?api-key=e12mybvnahb5cx2uahup8y1rahn4ewbp99rn4j2u6h6mmy37f1c7cdakf5432kbkcctmmwkcdd37cgke718qey9ne96mpy1mdncmjmut6crkeeb5f5n7ac1gf137auudd56m4u1tcwyku6h130u3m9164cdad99rmuxjpd8b9qq4d3bddu76wu7ad270k2h7155gnbm5x0kuf8";
-const BIRDEYE_API_KEY = "cffc98f5aed04ad3ae4115c5e900ddbd";
-const BIRDEYE_MEME_URL = "https://public-api.birdeye.so/defi/v3/token/meme/list";
+const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
 
 let wallet = null;
 let connection = null;
@@ -118,8 +95,6 @@ const state = {
   migMonitored: new Map(),
   momPending: new Map(),
   momMonitored: new Map(),
-  abortWatch: new Map(),   // mint -> {symbol, abortPrice, abortReason, abortTime}
-  postCloseWatch: new Map(),  // mint -> {symbol, closePrice, closePnl, closeReason, closeTime, lastPrice}
   signals: [],
   demoTrades: [],
   realTrades: [],
@@ -127,21 +102,16 @@ const state = {
   log: [],
   stats: {
     mig_migrations: 0, mig_watched: 0, mig_entered: 0, mig_rejected: 0,
-    mig_aborted: 0,
     mig_demoWins: 0, mig_demoLosses: 0, mig_demoExpired: 0, mig_demoPnL: 0,
     mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
     mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
     mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
-    mom_scanned: 0, mom_signals: 0, mom_pending: 0, mom_cancelled: 0,
+    mom_scanned: 0, mom_signals: 0, mom_pending: 0,
     mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
     mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
     mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
     demoOpen: 0, realOpen: 0, walletBalance: 0,
-    abort_correct: 0, abort_missed: 0,
-    abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
-    abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
-    mig_collapse_count: 0, mig_collapse_pnlSum: 0,  // stop de colapso: nº disparos y suma de pnl%
   },
 };
 
@@ -192,6 +162,7 @@ function loadState() {
 
 const frontendClients = new Set();
 const seenMigMints = new Set();
+const seenMomPools = new Set();
 const momSignalCooldown = new Map();
 
 function addLog(msg, type = "info") {
@@ -223,28 +194,15 @@ function unsubscribeToken(mint) {
   }
 }
 
-// ── calcPrice: PRECIO DE MERCADO (marketCapSol/supply) ─────────
-function calcPrice(data, knownSupply) {
-  if (data.marketCapSol > 0 && knownSupply && knownSupply > 0) {
-    return (data.marketCapSol * solPriceUSD) / knownSupply;
+// ── calcPrice (v6.0 intacto): supply FIJO 1e9 ──────────────────
+function calcPrice(data) {
+  if (data.marketCapSol && data.marketCapSol > 0) {
+    return (data.marketCapSol * solPriceUSD) / 1_000_000_000;
   }
   const sol = data.solAmount || 0;
   const tok = data.tokenAmount || 0;
-  if (sol > 0 && tok > 0) {
-    return (sol / tok) * solPriceUSD;
-  }
+  if (sol > 0 && tok > 0) return (sol / tok) * solPriceUSD;
   return 0;
-}
-
-function calibrateSupply(data) {
-  const sol = data.solAmount || 0;
-  const tok = data.tokenAmount || 0;
-  if (data.marketCapSol > 0 && sol > 0 && tok > 0) {
-    const supply = data.marketCapSol / (sol / tok);
-    addLog(`🔎 CALIBRA SUPPLY: mcSol=${data.marketCapSol} sol=${sol} tok=${tok} => supply=${supply.toFixed(0)}`, "info");
-    return supply;
-  }
-  return null;
 }
 
 function isPriceValid(newPrice, knownPrice) {
@@ -253,6 +211,11 @@ function isPriceValid(newPrice, knownPrice) {
   return ratio >= (1 / MIG_MAX_PRICE_RATIO) && ratio <= MIG_MAX_PRICE_RATIO;
 }
 
+// ── NUEVO v6.2: SOL price real (de v8.4) ───────────────────────
+// CoinGecko + respaldo Jupiter. solPriceReady evita operar sin precio real.
+// NOTA: cambiar SOL de 150 fijo a precio real NO altera el trading (TP/SL son
+// % sobre el precio de entrada, que escala igual con cualquier SOL); solo hace
+// que los MC mostrados en logs sean reales.
 let solPriceUSD = 68;          // default realista; se actualiza por API
 let solPriceReady = false;     // no operar hasta tener un precio real de SOL
 async function updateSolPrice() {
@@ -305,6 +268,7 @@ setInterval(async () => {
 
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
+  // ── NUEVO v6.2: no operar hasta tener precio real de SOL ──
   if (!solPriceReady) {
     addLog("⏳ Esperando precio real de SOL antes de operar", "warn");
     return;
@@ -321,7 +285,6 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    priceHistory: [], calSupply: null,
     timer: null, entered: false,
   };
   state.migWatching.set(coin.mint, entry);
@@ -336,32 +299,36 @@ function migStartWatching(coin) {
 
 function migUpdateWatching(mint, price, solAmount, entry) {
   if (entry.entered) return;
-  if (price > 0) {
-    entry.priceHistory.push({ price, time: Date.now() });
-    if (entry.priceHistory.length > 30) entry.priceHistory.shift();
-  }
   if (!isPriceValid(price, entry.lastPrice)) return;
   entry.volumeUSD += solAmount * solPriceUSD;
   entry.tradeCount++;
   entry.lastPrice = price;
   if (!entry.firstPrice && price > 0) entry.firstPrice = price;
   const elapsed = Date.now() - entry.startTime;
+
+  // ── Entrada rápida: $2K en <20s ───────────────────────────
   if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_MIN_VOL_FAST) {
     clearTimeout(entry.timer);
     entry.entered = true;
     state.migWatching.delete(mint);
-    addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — validando...`, "accept");
+    addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — delay 3s`, "accept");
     state.stats.mig_entered++;
     broadcast({ event: "stats", data: state.stats });
-    migValidateAndEnter(entry);
+    // ── Delay 3s antes de entrar ──────────────────────────
+    setTimeout(() => {
+      entry.firstPrice = entry.lastPrice;
+      addLog(`⚡ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entry.lastPrice * 1_000_000_000)}`, "accept");
+      migOpenTrades(entry);
+    }, MIG_ENTRY_DELAY_MS);
     return;
   }
+
   broadcast({ event: "migWatchUpdate", data: {
     mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD,
     tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_MIN_VOL_FAST : MIG_MIN_VOL_SLOW,
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
-    mc: price * (entry.calSupply || 1_000_000_000),
+    mc: price * 1_000_000_000,
   }});
 }
 
@@ -371,10 +338,15 @@ function migEvaluate(mint) {
   state.migWatching.delete(mint);
   const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
   if (entry.volumeUSD >= MIG_MIN_VOL_SLOW && entry.lastPrice) {
-    addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — validando...`, "accept");
+    addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — delay 3s`, "accept");
     state.stats.mig_entered++;
     broadcast({ event: "stats", data: state.stats });
-    migValidateAndEnter(entry);
+    // ── Delay 3s antes de entrar ──────────────────────────
+    setTimeout(() => {
+      entry.firstPrice = entry.lastPrice;
+      addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entry.lastPrice * 1_000_000_000)}`, "accept");
+      migOpenTrades(entry);
+    }, MIG_ENTRY_DELAY_MS);
   } else {
     unsubscribeToken(mint);
     addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
@@ -383,84 +355,24 @@ function migEvaluate(mint) {
   }
 }
 
-// Registra un aborto en observación (instrumentación pura). En vez de
-// desuscribir y borrar al instante, mantiene el token 5 min recibiendo
-// precio para medir si el filtro acertó o costó un ganador.
-function registerAbort(mint, symbol, abortPrice, reason) {
-  state.stats.mig_aborted++;
-  state.abortWatch.set(mint, {
-    symbol, abortPrice: abortPrice || 0, abortReason: reason,
-    abortTime: Date.now(), lastPrice: abortPrice || 0,
-  });
-  addLog(`🔭 MIG ABORTO EN OBSERVACIÓN: ${symbol} @ ${reason} (vigilando 5 min)`, "filter");
-  // NO desuscribir todavía: el token sigue recibiendo precio.
-}
-
-function migValidateAndEnter(entry) {
-  const priceAtTrigger = entry.lastPrice;
-  setTimeout(() => {
-    const now = Date.now();
-    const priceNow = entry.lastPrice || priceAtTrigger;
-    if (priceAtTrigger > 0 && priceNow > 0) {
-      const dropInDelay = (priceAtTrigger - priceNow) / priceAtTrigger;
-      if (dropInDelay > MIG_MAX_DROP_IN_DELAY) {
-        addLog(`⛔ MIG ABORTADA [delay]: ${entry.symbol} cayó ${(dropInDelay*100).toFixed(1)}% en 3s`, "filter");
-        registerAbort(entry.mint, entry.symbol, priceNow, "delay");
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-    }
-    const recent3s = entry.priceHistory.filter(p => now - p.time <= 3000);
-    if (recent3s.length >= 2) {
-      const maxRecent = Math.max(...recent3s.map(p => p.price));
-      const newest = recent3s[recent3s.length - 1].price;
-      const verticalDrop = (maxRecent - newest) / maxRecent;
-      if (verticalDrop > MIG_MAX_DROP_VERTICAL) {
-        addLog(`⛔ MIG ABORTADA [vertical]: ${entry.symbol} colapso ${(verticalDrop*100).toFixed(1)}% desde pico`, "filter");
-        registerAbort(entry.mint, entry.symbol, newest, "vertical");
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-    }
-    const lookback5s = entry.priceHistory.filter(p => now - p.time <= 5000);
-    if (lookback5s.length >= 2) {
-      const priceAgo = lookback5s[0].price;
-      const priceNowLB = lookback5s[lookback5s.length - 1].price;
-      const trend = (priceNowLB - priceAgo) / priceAgo;
-      if (trend < MIG_TREND_THRESHOLD) {
-        addLog(`⛔ MIG ABORTADA [bajista]: ${entry.symbol} tendencia ${(trend*100).toFixed(1)}% en 5s`, "filter");
-        registerAbort(entry.mint, entry.symbol, priceNowLB, "bajista");
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-    }
-    const sorted = entry.priceHistory
-      .slice()
-      .sort((a, b) => b.time - a.time);
-    const truePriceNow = sorted.length ? sorted[0].price : priceAtTrigger;
-
-    entry.firstPrice = truePriceNow;
-    addLog(`✅ MIG ENTRADA VALIDADA: ${entry.symbol} @ MC ${formatMC(truePriceNow * (entry.calSupply || 1_000_000_000))} (precio de mercado)`, "accept");
-    migOpenTrades(entry);
-  }, MIG_ENTRY_DELAY_MS);
-}
-
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
-  const supply = entry.calSupply || 1_000_000_000;
   const signal = {
-    id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
+    id: `mig-${entry.mint}-${Date.now()}`,
+    strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price * MIG_TP).toFixed(12), sl: +(price * MIG_SL).toFixed(12),
-    mcUsd: price * supply, volumeUSD: entry.volumeUSD, time: Date.now(),
+    mcUsd: price * 1_000_000_000, volumeUSD: entry.volumeUSD, time: Date.now(),
   };
-  addLog(`🔎 MIG ENTRY DEBUG: ${entry.symbol} | entryPrice=$${price.toFixed(10)} | calSupply=${entry.calSupply ?? "NO-CALIBRADO(1e9)"} | mcCalc=${formatMC(price * supply)}`, "info");
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
   broadcast({ event: "newSignal", data: signal });
   if (!state.migMonitored.has(entry.mint)) {
     state.migMonitored.set(entry.mint, {
       mint: entry.mint, name: entry.name, symbol: entry.symbol,
-      price, mc: price * supply, priceHigh: price, priceLow: price,
-      calSupply: entry.calSupply, downRejectStreak: 0,
+      price, mc: price * 1_000_000_000,
+      priceHigh: price, priceLow: price,
       tradeCount: entry.tradeCount, volumeUSD: entry.volumeUSD,
       detectedAt: entry.startTime, lastUpdate: Date.now(),
     });
@@ -471,27 +383,10 @@ function migOpenTrades(entry) {
 }
 
 function migCleanup(mint, symbol) {
-  // Si el token está en observación post-cierre, NO desuscribir: necesitamos
-  // que el precio siga llegando 5 min para medir el post5m (igual que abortos).
-  if (!state.postCloseWatch.has(mint)) unsubscribeToken(mint);
+  unsubscribeToken(mint);
   state.migMonitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
   addLog(`🗑️ ${symbol} eliminado`, "info");
-}
-
-// Registra un cierre de migración en observación (instrumentación pura).
-// A los 5 min mide el precio para clasificar el cierre automáticamente:
-// ganador perdido (subió +20% tras salir), muerto, o reversión normal.
-function registerPostClose(mint, symbol, closePrice, closePnl, closeReason) {
-  if (!closePrice || closePrice <= 0) return;
-  state.postCloseWatch.set(mint, {
-    symbol, closePrice, closePnl, closeReason,
-    closeTime: Date.now(), lastPrice: closePrice,
-  });
-  // Mantener suscripción 5 min para recibir precio (la cancela evaluarPostCierres).
-  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-  }
 }
 
 function migUpdatePrice(mint, price, solAmount) {
@@ -499,23 +394,8 @@ function migUpdatePrice(mint, price, solAmount) {
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
   const token = state.migMonitored.get(mint);
   if (!token) return;
-
-  // ── Fix precio congelado (Fase 2) ─────────────────────
-  if (!isPriceValid(price, token.price)) {
-    if (price > 0 && price < token.price) {
-      token.downRejectStreak = (token.downRejectStreak || 0) + 1;
-      if (token.downRejectStreak < MIG_REJECT_STREAK) return;
-      addLog(`⚠️ MIG caída real aceptada: ${token.symbol} (${token.downRejectStreak} ticks a la baja)`, "warn");
-    } else {
-      token.downRejectStreak = 0;
-      return;
-    }
-  } else {
-    token.downRejectStreak = 0;
-  }
-
-  const supply = token.calSupply || 1_000_000_000;
-  token.price = price; token.mc = price * supply;
+  if (!isPriceValid(price, token.price)) return;
+  token.price = price; token.mc = price * 1_000_000_000;
   token.priceHigh = Math.max(token.priceHigh, price);
   token.priceLow = Math.min(token.priceLow, price);
   token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD;
@@ -526,135 +406,74 @@ function migUpdatePrice(mint, price, solAmount) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// ESTRATEGIA 2: MOMENTUM — Birdeye Meme List (PumpSwap) + supply real
+// ESTRATEGIA 2: MOMENTUM (v6.0 intacto: Gecko + subida 10-30%, TP +6%)
 // ════════════════════════════════════════════════════════════════
 
 async function momentumScan() {
+  seenMomPools.clear();
   let totalScanned = 0;
   let totalSignals = 0;
-  if (!solPriceReady) {
-    addLog("⏳ Esperando precio real de SOL antes de escanear momentum", "warn");
-    return;
-  }
   try {
-    const minLastTrade = Math.floor((Date.now() - MOM_LAST_TRADE_WINDOW_MS) / 1000);
-    // Birdeye cuenta graduated + cada min/max como "filtro" y limita a 5 total.
-    // En la query: graduated + 3 min/max (MC min, MC max, volumen) = 4.
-    // El orden es por VOLUMEN 1h (estilo Gecko): selecciona tokens más líquidos
-    // y con actividad sostenida, donde los stops ejecutan limpio. El criterio
-    // anterior (price_change_1h) cogía los más extendidos y volátiles -> entradas
-    // tardías y pérdidas grandes. min_last_trade se filtra en el código (abajo).
-    const params = new URLSearchParams({
-      sort_by: "volume_1h_usd",         // orden por volumen, no por subida
-      sort_type: "desc",
-      source: "pump_dot_fun",          // solo ecosistema pump.fun/PumpSwap
-      graduated: "true",                // solo los ya migrados a PumpSwap
-      offset: "0",
-      limit: "50",
-      min_volume_1h_usd: String(MOM_MIN_VOL_1H),  // el volumen es el filtro rey
-      min_market_cap: String(MOM_MIN_MC),
-      max_market_cap: String(MOM_MAX_MC),
-    });
-
-    const res = await fetch(`${BIRDEYE_MEME_URL}?${params}`, {
-      headers: {
-        "X-API-KEY": BIRDEYE_API_KEY,
-        "x-chain": "solana",
-        "accept": "application/json",
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      addLog(`⚠️ Birdeye error: ${res.status} — ${errText.slice(0, 120)}`, "warn");
-      return;
-    }
-
-    const json = await res.json();
-    const tokens = json?.data?.items || [];
-
-    if (!Array.isArray(tokens)) {
-      addLog(`⚠️ Birdeye respuesta inesperada`, "warn");
-      return;
-    }
-
-    for (const token of tokens) {
-      const mint = token.address;
-      if (!mint || mint.length < 32) continue;
-
-      const mc = token.market_cap || token.fdv || 0;
-      const vol1h = token.volume_1h_usd || 0;
-      const pct1h = token.price_change_1h_percent || 0;
-      const price = token.price || 0;
-      const supply = token.total_supply || token.circulating_supply || 1_000_000_000;
-      const liquidity = token.liquidity || 0;
-      const lastTrade = token.last_trade_unix_time || 0;
-      const symbol = token.symbol || mint.slice(0, 8);
-      const name = token.name || symbol;
-
-      if (price <= 0) continue;
-      // Selección estilo Gecko: el volumen manda, NO el momentum reciente.
-      // Ya no filtramos por "que haya subido +10-30%" (eso causaba entradas
-      // tardías en el pico). Solo descartamos los claramente bajistas.
-      if (pct1h < -5) continue;
-      // Filtros movidos de la query al código (límite de 5 filtros en Birdeye):
-      if (vol1h < MOM_MIN_VOL_1H) continue;                       // volumen 1h mínimo
-      if (lastTrade > 0 && lastTrade < minLastTrade) continue;    // trade en últimos 10min
-      if (liquidity > 0 && liquidity < 30000) continue;           // liquidez mínima (10k->30k: SL ejecuta limpio)
-
-      totalScanned++;
-
-      if (state.momMonitored.has(mint)) {
-        momUpdatePrice(mint, price, 0);
-        continue;
-      }
-
-      const lastSig = momSignalCooldown.get(mint) || 0;
-      if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
-
-      const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
-      if (momOpen >= MOM_MAX_OPEN) continue;
-
-      state.stats.mom_scanned++;
-      momSignalCooldown.set(mint, Date.now());
-      state.stats.mom_signals++;
-      totalSignals++;
-
-      state.momPending.set(mint, {
-        mint, symbol, name,
-        birdeyePrice: price,
-        supply,                         // supply real guardado
-        calSupply: null,                // supply calibrado (se rellena con trades)
-        mc, vol1h, pct1h,
-        pendingSince: Date.now(),
-        priceHistory: [],               // {price, time} durante ventana de confirmación
-        firstTradeAt: null,             // cuándo llegó el primer trade real
-      });
-      state.stats.mom_pending = state.momPending.size;
-
-      if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-        pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-      }
-
-      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-
-      setTimeout(() => {
-        if (state.momPending.has(mint)) {
-          const pending = state.momPending.get(mint);
-          addLog(`⛔ MOM CANCELADA [timeout]: ${pending.symbol} — sin precio real en 30s`, "filter");
-          state.momPending.delete(mint);
-          state.stats.mom_pending = state.momPending.size;
-          state.stats.mom_cancelled++;
-          unsubscribeToken(mint);
-          broadcast({ event: "stats", data: state.stats });
+    for (let page = 1; page <= 3; page++) {
+      const res = await fetch(
+        `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
+        { headers: { "Accept": "application/json;version=20230302" }, signal: AbortSignal.timeout(10000) }
+      );
+      if (!res.ok) break;
+      const json = await res.json();
+      const pools = json?.data || [];
+      for (const pool of pools) {
+        const attr = pool.attributes || {};
+        const poolAddr = attr.address || pool.id?.replace("solana_", "");
+        if (!poolAddr) continue;
+        const mc = parseFloat(attr.fdv_usd || 0);
+        if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
+        const vol1h = parseFloat(attr.volume_usd?.h1 || 0);
+        const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
+        const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
+        if (geckoPrice <= 0) continue;
+        const relationships = pool.relationships || {};
+        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
+        if (!mint || mint.length < 32) continue;
+        totalScanned++;
+        if (state.momMonitored.has(mint)) {
+          const token = state.momMonitored.get(mint);
+          token.vol1h = vol1h; token.pct1h = pct1h;
+          if (geckoPrice > 0) momUpdatePrice(mint, geckoPrice, 0);
+          seenMomPools.add(poolAddr);
+          continue;
         }
-      }, MOM_PENDING_TIMEOUT_MS);
-
-      broadcast({ event: "stats", data: state.stats });
+        if (seenMomPools.has(poolAddr)) continue;
+        if (vol1h < MOM_MIN_VOL_1H) continue;
+        if (pct1h < MOM_MIN_PCT_1H) continue;
+        if (pct1h > MOM_MAX_PCT_1H) continue;
+        const lastSig = momSignalCooldown.get(mint) || 0;
+        if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
+        seenMomPools.add(poolAddr);
+        state.stats.mom_scanned++;
+        const symbol = (attr.name || "").split(" / ")[0] || mint.slice(0, 8);
+        momSignalCooldown.set(mint, Date.now());
+        state.stats.mom_signals++;
+        totalSignals++;
+        state.momPending.set(mint, {
+          mint, symbol, name: symbol,
+          geckoPrice, mc, vol1h, pct1h,
+          pendingSince: Date.now(),
+        });
+        state.stats.mom_pending = state.momPending.size;
+        addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+        setTimeout(() => {
+          if (state.momPending.has(mint)) {
+            const pending = state.momPending.get(mint);
+            addLog(`⚡ ENTRADA gecko: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
+            momActivateFromPending(mint, pending.geckoPrice, 0);
+          }
+        }, MOM_PENDING_TIMEOUT_MS);
+        broadcast({ event: "stats", data: state.stats });
+      }
+      await new Promise(r => setTimeout(r, 500));
     }
-
-    addLog(`⚡ Birdeye scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
+    addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
     broadcast({ event: "stats", data: state.stats });
   } catch (e) {
     addLog(`❌ Momentum scan error: ${e.message}`, "error");
@@ -662,39 +481,32 @@ async function momentumScan() {
 }
 
 function momActivateFromPending(mint, entryPrice, solAmount) {
-  if (solAmount <= 0) return;
   const pending = state.momPending.get(mint);
   if (!pending) return;
-
-  const momOpen = state.demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
-  if (momOpen >= MOM_MAX_OPEN) {
-    addLog(`⛔ MOM límite: ya hay ${momOpen} abiertas — cancelando ${pending.symbol}`, "filter");
-    state.momPending.delete(mint);
-    state.stats.mom_pending = state.momPending.size;
-    unsubscribeToken(mint);
-    broadcast({ event: "stats", data: state.stats });
-    return;
-  }
-
   state.momPending.delete(mint);
   state.stats.mom_pending = state.momPending.size;
-
   const signal = {
-    id: `mom-${mint}-${Date.now()}`, strategy: "momentum",
+    id: `mom-${mint}-${Date.now()}`,
+    strategy: "momentum",
     mint, name: pending.name, symbol: pending.symbol,
-    price: entryPrice, tp: +(entryPrice * MOM_TP).toFixed(12), sl: +(entryPrice * MOM_SL).toFixed(12),
-    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
+    price: entryPrice,
+    tp: +(entryPrice * MOM_TP).toFixed(12),
+    sl: +(entryPrice * MOM_SL).toFixed(12),
+    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h,
+    time: Date.now(),
   };
-  addLog(`⚡ ENTRADA [real PP]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +4.5% SL -3%`, "accept");
+  const source = solAmount > 0 ? "real" : "gecko";
+  addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3% | 45min`, "accept");
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
   broadcast({ event: "newSignal", data: signal });
   state.momMonitored.set(mint, {
-    mint, symbol: pending.symbol, name: pending.name, mc: pending.mc, price: entryPrice,
-    supply: pending.supply,             // supply Birdeye (fallback)
-    calSupply: pending.calSupply,       // supply calibrado si ya se calculó
-    priceHigh: entryPrice, priceLow: entryPrice, pct1h: pending.pct1h, vol1h: pending.vol1h,
-    tradeCount: 1, volumeUSD: solAmount * solPriceUSD,
+    mint, symbol: pending.symbol, name: pending.name,
+    mc: pending.mc, price: entryPrice,
+    priceHigh: entryPrice, priceLow: entryPrice,
+    pct1h: pending.pct1h, vol1h: pending.vol1h,
+    tradeCount: solAmount > 0 ? 1 : 0,
+    volumeUSD: solAmount * solPriceUSD,
     detectedAt: Date.now(), lastUpdate: Date.now(),
   });
   broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
@@ -703,23 +515,13 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
 }
 
 function momUpdatePrice(mint, price, solAmount) {
-  if (state.momPending.has(mint)) {
-    if (solAmount > 0) {
-      const pending = state.momPending.get(mint);
-      if (!pending.firstTradeAt) pending.firstTradeAt = Date.now();
-      pending.priceHistory.push({ price, time: Date.now() });
-      if (pending.priceHistory.length > 30) pending.priceHistory.shift();
-      // ¿ya pasó la ventana de confirmación de tendencia?
-      if (Date.now() - pending.firstTradeAt >= MOM_CONFIRM_MS) {
-        momTryConfirmEntry(mint);
-      }
-    }
+  if (state.momPending.has(mint) && solAmount > 0) {
+    momActivateFromPending(mint, price, solAmount);
     return;
   }
   const token = state.momMonitored.get(mint);
   if (!token) return;
-  const supply = token.calSupply || token.supply || 1_000_000_000;
-  token.price = price; token.mc = price * supply;
+  token.price = price; token.mc = price * 1_000_000_000;
   token.priceHigh = Math.max(token.priceHigh, price);
   token.priceLow = Math.min(token.priceLow, price);
   if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
@@ -729,33 +531,7 @@ function momUpdatePrice(mint, price, solAmount) {
   broadcast({ event: "momTokenUpdate", data: token });
 }
 
-// Tras la ventana de confirmación, decide si entrar según la tendencia.
-// Aborta si el precio en la ventana viene plano o bajista (entrada en pico).
-function momTryConfirmEntry(mint) {
-  const pending = state.momPending.get(mint);
-  if (!pending) return;
-  const hist = pending.priceHistory;
-  if (hist.length < 2) return; // esperar algo más de datos
-
-  const first = hist[0].price;
-  const last = hist[hist.length - 1].price;
-  const trend = (last - first) / first;
-
-  if (trend <= 0) {
-    addLog(`⛔ MOM DESCARTADA [tendencia ${(trend*100).toFixed(1)}%]: ${pending.symbol} no sube en ventana`, "filter");
-    state.momPending.delete(mint);
-    state.stats.mom_pending = state.momPending.size;
-    state.stats.mom_cancelled++;
-    unsubscribeToken(mint);
-    broadcast({ event: "stats", data: state.stats });
-    return;
-  }
-
-  addLog(`✅ MOM CONFIRMADA [tendencia +${(trend*100).toFixed(1)}%]: ${pending.symbol}`, "accept");
-  momActivateFromPending(mint, last, 1);
-}
-
-function momCleanup(mint) {
+function momCleanup(mint, symbol) {
   state.momMonitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
 }
@@ -823,7 +599,6 @@ async function openRealTrade(signal) {
     maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
     expiresAt: Date.now() + duration, sellRetries: 0,
-    recentPrices: [],   // {price, time} de los últimos ~5s, para el stop de colapso
   };
   state.realTrades.unshift(trade);
   if (state.realTrades.length > 200) state.realTrades.pop();
@@ -851,17 +626,12 @@ async function closeRealTrade(trade, price, reason) {
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = trade.strategy === "migration" ? "mig" : "mom";
   const expWinPct = trade.strategy === "migration" ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
-  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct > 0)) {
+  // ── v6.2: STEP cuenta como WIN (igual que TP) ──
+  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
     const tag = reason === "STEP" ? "🪜 ESCALÓN" : trade.strategy;
     addLog(`✅ REAL WIN [${tag}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
-  } else if (reason === "COLLAPSE") {
-    trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
-    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
-    state.stats.mig_collapse_count++;
-    state.stats.mig_collapse_pnlSum += trade.pnlPct;
-    addLog(`🛑 REAL COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "realloss");
   } else if (reason === "SL") {
     trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
     state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
@@ -878,55 +648,11 @@ async function closeRealTrade(trade, price, reason) {
   }
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
   state.stats.walletBalance = await getWalletBalance();
-  if (trade.strategy === "migration" && reason !== "TP") {
-    registerPostClose(trade.mint, trade.symbol, price, trade.pnlPct, reason);
-  }
   if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
-  if (trade.strategy === "momentum") momCleanup(trade.mint);
+  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "realTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
   saveState();
-}
-
-// Stop de colapso vertical (solo migración): registra el precio en el
-// mini-historial reciente del trade y devuelve true si el precio actual
-// cayó más de MIG_COLLAPSE_DROP desde el pico de los últimos
-// MIG_COLLAPSE_WINDOW_MS. Es un "trailing rápido" para el caso de pánico:
-// la diferencia con el trailing FOLLOWING (-20% del máximo) es la VELOCIDAD,
-// solo dispara si ese desplome ocurre en la ventana corta. No solapa con
-// FOLLOWING (sin componente temporal) ni con el escalón.
-function detectCollapse(trade, price, now) {
-  if (trade.strategy !== "migration") return false;
-  // El registro del precio reciente ocurre SIEMPRE (aunque COLLAPSE esté
-  // desactivado en la gracia), para tener historial cuando la gracia acabe.
-  trade.recentPrices.push({ price, time: now });
-  while (trade.recentPrices.length && now - trade.recentPrices[0].time > 5000) {
-    trade.recentPrices.shift();
-  }
-  const window = trade.recentPrices.filter(p => now - p.time <= MIG_COLLAPSE_WINDOW_MS);
-  if (window.length < 2) return false;
-  const peak = Math.max(...window.map(p => p.price));
-  if (peak <= 0) return false;
-  const dropFromPeak = (peak - price) / peak;
-  return dropFromPeak > MIG_COLLAPSE_DROP;
-}
-
-// SL efectivo con ventana de gracia (solo migración): durante los primeros
-// MIG_GRACE_MS de vida del trade, el suelo del stop es más holgado (-25%)
-// para aguantar el lavado inicial — muchas ganadoras caen -15/-20% en la
-// sacudida previa al despegue y el SL -18% las sacaba justo antes de subir.
-// Pasada la ventana, el suelo vuelve a -18%. El trailing/escalón mandan si
-// ya subieron el stop por encima (nunca reducimos protección ganada).
-function effectiveSL(trade, now) {
-  if (trade.strategy !== "migration") return trade.sl;
-  const inGrace = (now - trade.openTime) < MIG_GRACE_MS;
-  if (!inGrace) return trade.sl;
-  const graceFloor = +(trade.entryPrice * MIG_GRACE_SL).toFixed(12);
-  // En la gracia, el stop es el MÁS BAJO entre el SL normal y el suelo de gracia
-  // (damos más margen). Pero si el trailing ya lo subió por encima de la entrada,
-  // ese manda — la gracia solo relaja el SL inicial, no toca ganancias bloqueadas.
-  if (trade.sl >= trade.entryPrice) return trade.sl;
-  return Math.min(trade.sl, graceFloor);
 }
 
 function updateRealTrades(mint, price, strategy) {
@@ -941,16 +667,6 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
-    // detectCollapse se llama siempre (registra el precio reciente), pero
-    // durante la ventana de gracia ignoramos su disparo: ahí manda el SL de
-    // gracia (-25%), para no sacar ganadoras en el lavado inicial.
-    const inGrace = strategy === "migration" && (now - trade.openTime) < MIG_GRACE_MS;
-    const collapsed = detectCollapse(trade, price, now);
-    if (!inGrace && collapsed) {
-      closeRealTrade(trade, price, "COLLAPSE");
-      continue;
-    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - follow);
@@ -962,13 +678,10 @@ function updateRealTrades(mint, price, strategy) {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
-    // Escalón de beneficio (solo migración): si en algún momento tocó
-    // +20%, el stop nunca baja de +13%. Usa maxGainPct (máximo alcanzado),
-    // no el beneficio instantáneo, para que el piso se mantenga aunque el
-    // precio caiga luego. El -1e-9 evita que +20.0% exacto se escape por
-    // redondeo de coma flotante. El stop es el MÁS ALTO de los candidatos,
-    // así que el trailing -20% sigue mandando en las grandes y el escalón
-    // actúa solo como suelo mínimo.
+    // ── NUEVO v6.2: escalón de beneficio (solo migración) ──
+    // Si en algún momento tocó +20% (usa maxGainPct), el stop nunca baja
+    // de +13%. El stop es el MÁS ALTO de los candidatos, así que el trailing
+    // -20% sigue mandando en las grandes y el escalón actúa solo como suelo.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) {
@@ -977,16 +690,44 @@ function updateRealTrades(mint, price, strategy) {
       }
     }
     if (price >= trade.tp) closeRealTrade(trade, price, "TP");
-    else if (price <= effectiveSL(trade, now)) {
-      // En real el cierre se ejecuta al precio real de venta (con su slippage),
-      // NO al nivel teórico del stop. Solo ajustamos el reason para contabilizar
-      // bien: STEP si cerró por el piso del escalón, SL en otro caso.
+    else if (price <= trade.sl) {
+      // En real el cierre se ejecuta al precio real de venta (con slippage).
       const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
       closeRealTrade(trade, price, reason);
     }
     else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
-    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const trade of state.realTrades) {
+    if (trade.status !== "OPEN" || now < trade.expiresAt) continue;
+    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
+    closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
+  }
+}, 30_000);
+
+function openDemoTrade(signal) {
+  const duration = signal.strategy === "migration" ? MIG_DURATION_MS : MOM_DURATION_MS;
+  const trade = {
+    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+    strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
+    entryPrice: signal.price, tp: signal.tp, sl: signal.sl,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    trailingPhase: "INITIAL", status: "OPEN",
+    expiresAt: Date.now() + duration,
+  };
+  state.demoTrades.unshift(trade);
+  if (state.demoTrades.length > 500) state.demoTrades.pop();
+  state.stats.demoOpen++;
+  broadcast({ event: "newDemoTrade", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+  const tpPct = signal.strategy === "migration" ? "+80%" : "+6%";
+  const slPct = signal.strategy === "migration" ? "-18%" : "-3%";
+  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
 
 function updateDemoTrades(mint, price, strategy) {
@@ -1002,16 +743,6 @@ function updateDemoTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    // Stop de colapso vertical (el más rápido): si dispara, cierra ya.
-    // detectCollapse se llama siempre (registra el precio reciente), pero
-    // durante la ventana de gracia ignoramos su disparo: ahí manda el SL de
-    // gracia (-25%), para no sacar ganadoras en el lavado inicial.
-    const inGrace = strategy === "migration" && (now - trade.openTime) < MIG_GRACE_MS;
-    const collapsed = detectCollapse(trade, price, now);
-    if (!inGrace && collapsed) {
-      closeDemoTrade(trade, price, "COLLAPSE", tp_pct);
-      continue;
-    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - follow);
@@ -1025,8 +756,9 @@ function updateDemoTrades(mint, price, strategy) {
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
       addLog(`⚖️ BREAKEVEN [${strategy}]: ${trade.symbol}`, "trail");
     }
-    // Escalón de beneficio (solo migración): si tocó +20%, piso de +13%.
-    // El -1e-9 evita que +20.0% exacto se escape por redondeo de coma flotante.
+    // ── NUEVO v6.2: escalón de beneficio (solo migración) ──
+    // Si tocó +20%, piso de +13%. El -1e-9 evita que +20.0% exacto se escape
+    // por redondeo de coma flotante.
     if (strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9) {
       const stepStop = trade.entryPrice * (1 + MIG_STEP_FLOOR);
       if (stepStop > trade.sl) {
@@ -1038,133 +770,26 @@ function updateDemoTrades(mint, price, strategy) {
       }
     }
     if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
-    else if (price <= effectiveSL(trade, now)) {
+    else if (price <= trade.sl) {
+      // ── NUEVO v6.2: cierre al nivel del stop cuando protege ganancia ──
       // Si el stop protege ganancia (piso del escalón o trailing en positivo),
-      // el cierre se ejecuta AL NIVEL DEL STOP, no al precio del tick que lo cruzó:
-      // el stop es la orden que se habría disparado a ese nivel. En una caída
-      // vertical entre ticks (memecoin), usar el precio del tick infravaloraría
-      // el cierre (cerraba +1.17% en vez del piso +13%). Para el SL inicial bajo
-      // entrada (incl. SL de gracia), cerrar al precio real (más honesto en caída
-      // sin liquidez).
+      // el cierre se ejecuta AL NIVEL DEL STOP, no al precio del tick que lo
+      // cruzó. En una caída vertical entre ticks (memecoin), usar el precio del
+      // tick infravaloraría el cierre (cerraba +1% en vez del piso +13%). Para
+      // el SL inicial bajo entrada, cerrar al precio real (más honesto).
       const stopProtegeGanancia = trade.sl >= trade.entryPrice;
       const closePrice = stopProtegeGanancia ? trade.sl : price;
       const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
       closeDemoTrade(trade, closePrice, reason, tp_pct);
     }
     else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
-    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, maxLossPct: trade.maxLossPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
   }
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const trade of state.realTrades) {
-    if (trade.status !== "OPEN") continue;
-    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
-    if (!token) continue;
-    if (now >= trade.expiresAt) { closeRealTrade(trade, token.price, "EXPIRED"); continue; }
-    if (token.price <= effectiveSL(trade, now)) {
-      const reason = trade.trailingPhase === "STEP" ? "STEP" : "SL";
-      addLog(`🚨 ${reason === "STEP" ? "ESCALÓN" : "SL"} FORZADO [${trade.strategy}]: ${trade.symbol}`, "warn");
-      closeRealTrade(trade, token.price, reason);
-    }
-  }
-  for (const trade of state.demoTrades) {
-    if (trade.status !== "OPEN") continue;
-    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
-    if (!token) continue;
-    if (now >= trade.expiresAt) {
-      const tp_pct = trade.strategy === "migration" ? MIG_TP : MOM_TP;
-      closeDemoTrade(trade, token.price, "EXPIRED", tp_pct);
-    }
-  }
-  evaluarAbortos();
-  evaluarPostCierres();
-}, 5_000);
-
-// Evalúa los abortos en observación: a los 5 min, clasifica si el filtro
-// acertó (token cayó o plano) o costó un ganador (subió +20%).
-function evaluarAbortos() {
-  const now = Date.now();
-  for (const [mint, a] of state.abortWatch.entries()) {
-    if (now - a.abortTime < ABORT_WATCH_MS) continue;
-    const cur = a.lastPrice;
-    if (cur && a.abortPrice > 0) {
-      const change = (cur - a.abortPrice) / a.abortPrice;
-      const r = a.abortReason; // "delay" | "vertical" | "bajista"
-      if (change >= ABORT_WIN_THRESHOLD) {
-        state.stats.abort_missed++;
-        state.stats[`abort_missed_${r}`] = (state.stats[`abort_missed_${r}`] || 0) + 1;
-        addLog(`❌ ABORTO ERRÓNEO: ${a.symbol} subió ${(change*100).toFixed(0)}% tras abortar [${r}]`, "warn");
-      } else {
-        state.stats.abort_correct++;
-        state.stats[`abort_correct_${r}`] = (state.stats[`abort_correct_${r}`] || 0) + 1;
-        addLog(`✅ ABORTO CORRECTO: ${a.symbol} ${(change*100).toFixed(0)}% tras abortar [${r}]`, "filter");
-      }
-    }
-    state.abortWatch.delete(mint);
-    unsubscribeToken(mint);
-    broadcast({ event: "stats", data: state.stats });
-  }
-}
-
-// Evalúa los cierres en observación: a los 5 min, clasifica el cierre y lo
-// loguea. Detecta "ganadores perdidos" (cerró en pérdida pero el token
-// despegó +20% después). Instrumentación pura: solo añade datos al log.
-function evaluarPostCierres() {
-  const now = Date.now();
-  for (const [mint, c] of state.postCloseWatch.entries()) {
-    if (now - c.closeTime < POST_CLOSE_WATCH_MS) continue;
-    const cur = c.lastPrice;
-    if (cur && c.closePrice > 0) {
-      const post5m = (cur - c.closePrice) / c.closePrice;  // % desde el precio de salida
-      const post5mPct = (post5m * 100).toFixed(0);
-      // Clasificación automática:
-      let etiqueta;
-      if (post5m >= POST_CLOSE_WIN_THRESHOLD && c.closePnl < 0) {
-        etiqueta = "🔴 GANADOR PERDIDO";  // cerró en pérdida y luego despegó
-      } else if (post5m >= POST_CLOSE_WIN_THRESHOLD) {
-        etiqueta = "🟡 SIGUIÓ SUBIENDO";  // cerró en verde y siguió (dejamos algo en la mesa)
-      } else if (post5m <= -0.20) {
-        etiqueta = "🟢 MUERTO CONFIRMADO"; // siguió cayendo: el cierre acertó
-      } else {
-        etiqueta = "⚪ PLANO/REVERSIÓN";   // ni subió ni se hundió
-      }
-      addLog(`🔭 POST-CIERRE 5m: ${c.symbol} | cerró ${c.closePnl}% [${c.closeReason}] | post5m=${post5m>=0?"+":""}${post5mPct}% | ${etiqueta}`, "filter");
-    }
-    state.postCloseWatch.delete(mint);
-    unsubscribeToken(mint);
-  }
-}
-
-function openDemoTrade(signal) {
-  const duration = signal.strategy === "migration" ? MIG_DURATION_MS : MOM_DURATION_MS;
-  const trade = {
-    id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
-    strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
-    entryPrice: signal.price, tp: signal.tp, sl: signal.sl,
-    openTime: Date.now(), closeTime: null, closePrice: null,
-    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
-    trailingPhase: "INITIAL", status: "OPEN",
-    expiresAt: Date.now() + duration,
-    recentPrices: [],   // {price, time} de los últimos ~5s, para el stop de colapso
-  };
-  state.demoTrades.unshift(trade);
-  if (state.demoTrades.length > 500) state.demoTrades.pop();
-  state.stats.demoOpen++;
-  broadcast({ event: "newDemoTrade", data: trade });
-  broadcast({ event: "stats", data: state.stats });
-  const tpPct = signal.strategy === "migration" ? "+80%" : "+4.5%";
-  const slPct = signal.strategy === "migration" ? "-18%" : "-3%";
-  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
 
 function closeDemoTrade(trade, price, reason, tp_pct) {
   trade.closePrice = price; trade.closeTime = Date.now(); trade.status = "CLOSED";
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
-  if (trade.strategy === "migration") {
-    addLog(`🔎 MIG CLOSE DEBUG: ${trade.symbol} | entryPrice=$${trade.entryPrice.toFixed(10)} | closePrice=$${price.toFixed(10)} | pnl=${((price - trade.entryPrice) / trade.entryPrice * 100).toFixed(2)}% | min=${(trade.maxLossPct||0).toFixed(1)}% | reason=${reason}`, "info");
-  }
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
   const prefix = trade.strategy === "migration" ? "mig" : "mom";
@@ -1174,21 +799,14 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     state.stats[`${prefix}_demoPnL`] += (tp_pct - 1) * 100;
     addLog(`✅ WIN [TP][${trade.strategy}]: ${trade.symbol} +${((tp_pct-1)*100).toFixed(0)}% en ${dur}s`, "win");
   } else if (reason === "STEP") {
-    // Cierre por el piso del escalón (+13%): siempre es win
+    // ── NUEVO v6.2: cierre por el piso del escalón (+13%): siempre WIN ──
     trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
     addLog(`✅ WIN [🪜 ESCALÓN][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
-  } else if (reason === "COLLAPSE") {
-    // Stop de colapso vertical: cierre por desplome veloz. Cuenta como LOSS
-    // (cierra en negativo) pero se mide aparte para evaluar su efecto.
-    trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++;
-    state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
-    state.stats.mig_collapse_count++;
-    state.stats.mig_collapse_pnlSum += trade.pnlPct;
-    addLog(`🛑 COLLAPSE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s (desplome veloz)`, "loss");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
-    if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
+    // v6.0 contaba pnl>=0 como WIN. Mantengo v6.0 aquí (incluye 0% plano como WIN).
+    if (trade.pnlPct >= 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
     else { trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
   } else {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
@@ -1209,17 +827,22 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   state.stats[`${prefix}_closedCount`]++;
   state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
   state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
-  // Observación post-cierre (solo migración, cierres que NO son TP): detecta
-  // ganadores perdidos. Se registra ANTES del cleanup para que no desuscriba.
-  if (trade.strategy === "migration" && reason !== "TP") {
-    registerPostClose(trade.mint, trade.symbol, price, trade.pnlPct, reason);
-  }
   if (trade.strategy === "migration") migCleanup(trade.mint, trade.symbol);
-  if (trade.strategy === "momentum") momCleanup(trade.mint);
+  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "demoTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
   saveState();
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const trade of state.demoTrades) {
+    if (trade.status !== "OPEN" || now < trade.expiresAt) continue;
+    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
+    const tp_pct = trade.strategy === "migration" ? MIG_TP : MOM_TP;
+    closeDemoTrade(trade, token?.price || trade.entryPrice, "EXPIRED", tp_pct);
+  }
+}, 30_000);
 
 // ── PUMPPORTAL WS ──────────────────────────────────────────────
 function connectPumpPortal() {
@@ -1231,9 +854,6 @@ function connectPumpPortal() {
     for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-    for (const [mint] of state.momMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-    for (const [mint] of state.abortWatch.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-    for (const [mint] of state.postCloseWatch.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
   });
   pumpPortalWs.on("message", async (raw) => {
     try {
@@ -1247,37 +867,11 @@ function connectPumpPortal() {
       if ((data.txType === "buy" || data.txType === "sell") && data.mint) {
         const walletPubkey = wallet?.publicKey?.toString();
         if (walletPubkey && data.traderPublicKey === walletPubkey) return;
-
-        const calSupply = calibrateSupply(data);
-
-        // ── ABORTOS EN OBSERVACIÓN: solo actualizar último precio ──
-        const aborted = state.abortWatch.get(data.mint);
-        if (aborted) {
-          const price = calcPrice(data, calSupply || 1_000_000_000);
-          if (price > 0) aborted.lastPrice = price;
-        }
-
-        // ── POST-CIERRE EN OBSERVACIÓN: solo actualizar último precio ──
-        const postClosed = state.postCloseWatch.get(data.mint);
-        if (postClosed) {
-          const price = calcPrice(data, calSupply || 1_000_000_000);
-          if (price > 0) postClosed.lastPrice = price;
-        }
-
-        const migEntry = state.migWatching.get(data.mint) || state.migMonitored.get(data.mint);
-        if (migEntry) {
-          if (calSupply && !migEntry.calSupply) migEntry.calSupply = calSupply;
-          const price = calcPrice(data, migEntry.calSupply);
-          if (price > 0) migUpdatePrice(data.mint, price, data.solAmount || 0);
-        }
-
-        const momEntry = state.momPending.get(data.mint) || state.momMonitored.get(data.mint);
-        if (momEntry) {
-          if (calSupply && !momEntry.calSupply) momEntry.calSupply = calSupply;
-          const supplyToUse = momEntry.calSupply || momEntry.supply;
-          const price = calcPrice(data, supplyToUse);
-          if (price > 0) momUpdatePrice(data.mint, price, data.solAmount || 0);
-        }
+        const price = calcPrice(data);
+        if (price <= 0) return;
+        const sol = data.solAmount || 0;
+        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
+        if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
       }
     } catch (e) { console.log("PP:", e.message); }
   });
@@ -1285,8 +879,9 @@ function connectPumpPortal() {
   pumpPortalWs.on("close", () => { addLog("🔄 PumpPortal reconectando...", "warn"); setTimeout(connectPumpPortal, 5000); });
 }
 
+// ── HELIUS — desactivado ───────────────────────────────────────
 function connectHelius() {
-  addLog("ℹ️ Helius desactivado — precios via PumpPortal", "info");
+  addLog("ℹ️ Helius desactivado — precios via PumpPortal + Gecko", "info");
 }
 
 // ── EXPRESS + WS ───────────────────────────────────────────────
@@ -1294,6 +889,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── MOVIMIENTOS MANUALES (de v6.1) ─────────────────────────────
 app.post("/api/movement", (req, res) => {
   const { date, amount, type, note } = req.body;
   if (!date || amount === undefined || !type) return res.status(400).json({ error: "Faltan campos" });
@@ -1325,34 +921,6 @@ app.get("/api/state", (req, res) => {
   });
 });
 
-app.get("/api/reset-stats", (req, res) => {
-  state.demoTrades = [];
-  state.realTrades = [];
-  state.signals = [];
-  state.stats = {
-    mig_migrations: 0, mig_watched: 0, mig_entered: 0, mig_rejected: 0,
-    mig_aborted: 0,
-    mig_demoWins: 0, mig_demoLosses: 0, mig_demoExpired: 0, mig_demoPnL: 0,
-    mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
-    mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
-    mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
-    mom_scanned: 0, mom_signals: 0, mom_pending: 0, mom_cancelled: 0,
-    mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
-    mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
-    mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
-    mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
-    demoOpen: 0, realOpen: 0, walletBalance: state.stats.walletBalance || 0,
-    abort_correct: 0, abort_missed: 0,
-    abort_correct_bajista: 0, abort_correct_vertical: 0, abort_correct_delay: 0,
-    abort_missed_bajista: 0, abort_missed_vertical: 0, abort_missed_delay: 0,
-    mig_collapse_count: 0, mig_collapse_pnlSum: 0,
-  };
-  saveState();
-  broadcast({ event: "stats", data: state.stats });
-  addLog("🔄 Stats y trades reseteados", "info");
-  res.json({ ok: true, message: "Stats reseteadas — trades y señales borrados, movimientos conservados" });
-});
-
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
@@ -1376,7 +944,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v8.4 — Instrumentación: min (MIN ↓) + post-cierre 5min (ganador perdido)`);
+  console.log(`🚀 SolScanBot v6.2 — v6.0 + SOL real (Jupiter) + Escalón +20%→+13% | TP +80% | SL -18% | Trailing -20%`);
   loadState();
   initWallet();
   connectPumpPortal();
