@@ -38,6 +38,7 @@ const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar
 // ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
 const MIG_STEP_TRIGGER = 0.20;    // al tocar +20% de beneficio...
 const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
+const MIG_FOLLOW_PCT_STEP = 0.15; // v6.5: trailing ceñido (-15%) cuando el escalón está armado (maxGain>=+20%). El trailing supera el piso +13% a partir de +15.3% (vs +41% con -20%), capturando las medianas-altas +25-40% que antes se cortaban en +13%
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
@@ -678,24 +679,27 @@ function updateRealTrades(mint, price, strategy) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
+    // ── v6.5: trailing ceñido cuando el escalón está armado ──
+    // Si la migración ya tocó +20%, el trailing pasa de -20% a -15% para que
+    // supere el piso +13% antes (a partir de +15.3% de MAX en vez de +41%) y
+    // capture las medianas-altas. Para el resto, trailing normal.
+    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
+    const followEff = (strategy === "migration" && stepArmed) ? MIG_FOLLOW_PCT_STEP : follow;
     if (trade.trailingPhase === "FOLLOWING") {
-      const newSl = price * (1 - follow);
+      const newSl = price * (1 - followEff);
       if (newSl > trade.sl) trade.sl = +newSl.toFixed(12);
     } else if (gainPct >= lock) {
       trade.trailingPhase = "FOLLOWING";
-      trade.sl = +Math.max(trade.sl, price * (1 - follow)).toFixed(12);
+      trade.sl = +Math.max(trade.sl, price * (1 - followEff)).toFixed(12);
     } else if (gainPct >= breakeven && trade.trailingPhase === "INITIAL") {
       trade.trailingPhase = "BREAKEVEN";
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
     // ── v6.3: escalón como SUELO, no override (solo migración) ──
-    // Si tocó +20% (usa maxGainPct), el stop NUNCA baja de +13%. Pero el
-    // escalón NO secuestra la fase: FOLLOWING sigue actualizando el trailing
-    // arriba (bloque de arriba), y aquí solo elevamos el suelo a +13% si el
-    // trailing aún no lo superó. Así las medianas-altas (+27-43%) dejan de
-    // cortarse en +13%: cuando el trailing -20% supera +13%, manda el trailing.
+    // El stop NUNCA baja de +13% una vez armado, pero el escalón NO secuestra
+    // la fase: FOLLOWING sigue actualizando el trailing arriba. Aquí solo
+    // elevamos el suelo a +13% si el trailing ceñido aún no lo superó.
     const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
     if (stepArmed && stepFloorPrice > trade.sl) {
       trade.sl = +stepFloorPrice.toFixed(12);
     }
@@ -767,12 +771,15 @@ function updateDemoTrades(mint, price, strategy) {
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
+    // ── v6.5: trailing ceñido (-15%) cuando el escalón está armado ──
+    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
+    const followEff = (strategy === "migration" && stepArmed) ? MIG_FOLLOW_PCT_STEP : follow;
     if (trade.trailingPhase === "FOLLOWING") {
-      const newSl = price * (1 - follow);
+      const newSl = price * (1 - followEff);
       if (newSl > trade.sl) trade.sl = +newSl.toFixed(12);
     } else if (gainPct >= lock) {
       trade.trailingPhase = "FOLLOWING";
-      trade.sl = +Math.max(trade.sl, price * (1 - follow)).toFixed(12);
+      trade.sl = +Math.max(trade.sl, price * (1 - followEff)).toFixed(12);
       addLog(`🔄 FOLLOWING [${strategy}]: ${trade.symbol}`, "trail");
     } else if (gainPct >= breakeven && trade.trailingPhase === "INITIAL") {
       trade.trailingPhase = "BREAKEVEN";
@@ -781,11 +788,9 @@ function updateDemoTrades(mint, price, strategy) {
     }
     // ── v6.3: escalón como SUELO, no override (solo migración) ──
     // Si tocó +20%, el stop NUNCA baja de +13%, pero el escalón NO secuestra
-    // la fase: FOLLOWING sigue subiendo el trailing. Aquí solo elevamos el
-    // suelo a +13% si el trailing aún no lo superó. Cuando el trailing -20%
-    // supera +13%, manda el trailing (las medianas-altas dejan de cortarse).
+    // la fase: FOLLOWING sigue subiendo el trailing (ahora ceñido -15%). Aquí
+    // solo elevamos el suelo a +13% si el trailing aún no lo superó.
     const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-    const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
     if (stepArmed && stepFloorPrice > trade.sl) {
       if (!trade._stepLogged) {
         trade._stepLogged = true;
@@ -982,7 +987,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.4 — v6.3 + Momentum: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.5 — v6.4 + trailing ceñido -15% con escalón armado | Momentum: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
