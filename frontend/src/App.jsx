@@ -108,7 +108,7 @@ function TradeCard({ trade, isReal }) {
          <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>{statusLabel}</span>
          <StrategyBadge strategy={trade.strategy} />
        </div>
-       <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}</span>
+       <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{formatTime(trade.openTime)}{!isOpen && trade.closeTime ? ` → ${formatTime(trade.closeTime)}` : ""}</span>
      </div>
      <div style={{ display: "flex", gap: 0, border: "1px solid #1e2d40", borderRadius: 8, overflow: "hidden", marginBottom: 6 }}>
        {[
