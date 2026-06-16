@@ -33,6 +33,7 @@ const MIG_BREAKEVEN_MARGIN = 0.03; // SL en breakeven = entrada -3%
 const MIG_LOCK_AT = 0.20;         // following a +20%
 const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
 const MIG_MAX_PRICE_RATIO = 2.0;
+const MIG_SL_CONFIRM_TICKS = 2;   // v6.7: nº de ticks consecutivos bajo el SL inicial necesarios para cerrar. Un tick basura aislado (DUR 0-2s, -47% imposible) no se confirma; una caída real sí. Solo aplica al SL bajo entrada, no al piso/trailing en positivo
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar
 // ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
@@ -52,6 +53,7 @@ const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
 const MOM_MIN_LIQUIDITY = 25_000;     // v6.4: liquidez mínima del pool en USD (reserve_in_usd). Filtra pools finos tipo SPCX (vol alto, liquidez <$1)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
+const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
 const MOM_FOLLOW_PCT = 0.02;
@@ -685,6 +687,12 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // ── v6.8: cap loss duro (solo Momentum) ──
+    if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
+      addLog(`🛑 CAP LOSS [momentum real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
+      closeRealTrade(trade, price, "SL");
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     // ── v6.5: trailing ceñido cuando el escalón está armado ──
     // Si la migración ya tocó +20%, el trailing pasa de -20% a -15% para que
@@ -710,15 +718,28 @@ function updateRealTrades(mint, price, strategy) {
     if (stepArmed && stepFloorPrice > trade.sl) {
       trade.sl = +stepFloorPrice.toFixed(12);
     }
-    if (price >= trade.tp) closeRealTrade(trade, price, "TP");
+    if (price >= trade.tp) { trade._slBelowCount = 0; closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
-      // En real el cierre se ejecuta al precio real de venta (con slippage).
-      // reason=STEP solo si el stop que disparó ES el piso (no el trailing).
-      const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
-      closeRealTrade(trade, price, reason);
+      const stopProtegeGanancia = trade.sl >= trade.entryPrice;
+      if (stopProtegeGanancia) {
+        // Piso o trailing en positivo: cierre inmediato (sin filtro de tick).
+        const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
+        closeRealTrade(trade, price, reason);
+      } else {
+        // ── v6.7: SL inicial bajo entrada → confirmación de 2 ticks ──
+        trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+        if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) {
+          closeRealTrade(trade, price, "SL");
+        } else {
+          addLog(`⏳ SL sin confirmar [real] (${trade._slBelowCount}/${MIG_SL_CONFIRM_TICKS}): ${trade.symbol}`, "trail");
+          broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+        }
+      }
     }
-    else if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
-    else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else { trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
+      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
   }
 }
 
@@ -777,6 +798,15 @@ function updateDemoTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // ── v6.8: cap loss duro (solo Momentum) ──
+    // Red ADICIONAL para caídas verticales en pools ilíquidos donde el SL -3%
+    // no se ejecuta (el precio salta por encima del nivel entre ticks). Cierre
+    // INMEDIATO al precio actual. reason="SL" => cuenta como LOSS (pnl <= -10%).
+    if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
+      addLog(`🛑 CAP LOSS [momentum]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MOM_HARD_CAP_LOSS}%)`, "loss");
+      closeDemoTrade(trade, price, "SL", tp_pct);
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     // ── v6.5: trailing ceñido (-15%) cuando el escalón está armado ──
     const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
@@ -805,19 +835,32 @@ function updateDemoTrades(mint, price, strategy) {
       }
       trade.sl = +stepFloorPrice.toFixed(12);
     }
-    if (price >= trade.tp) closeDemoTrade(trade, price, "TP", tp_pct);
+    if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
     else if (price <= trade.sl) {
-      // Cierre al nivel del stop cuando protege ganancia (piso o trailing en
-      // positivo): el stop es la orden que se habría disparado a ese nivel.
-      // En SL inicial bajo entrada, cerrar al precio real (más honesto).
       const stopProtegeGanancia = trade.sl >= trade.entryPrice;
-      const closePrice = stopProtegeGanancia ? trade.sl : price;
-      // reason=STEP solo si el stop que disparó ES el piso (no el trailing).
-      const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
-      closeDemoTrade(trade, closePrice, reason, tp_pct);
+      if (stopProtegeGanancia) {
+        // Piso o trailing en positivo: cierre inmediato al nivel del stop.
+        // Aquí NO hay tick basura que filtrar y retrasar perdería ganancia.
+        const reason = (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL";
+        closeDemoTrade(trade, trade.sl, reason, tp_pct);
+      } else {
+        // ── v6.7: SL inicial bajo entrada → confirmación de 2 ticks ──
+        // Un tick basura aislado (-47% imposible en DUR 0-2s) no se confirma:
+        // el siguiente tick vuelve arriba y reseteamos. Una caída real sí
+        // confirma (dos ticks consecutivos bajo el SL) y cierra a precio real.
+        trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+        if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) {
+          closeDemoTrade(trade, price, "SL", tp_pct);
+        } else {
+          addLog(`⏳ SL sin confirmar (${trade._slBelowCount}/${MIG_SL_CONFIRM_TICKS}): ${trade.symbol} @ ${(trade.currentPct||0).toFixed(1)}%`, "trail");
+          broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+        }
+      }
     }
-    else if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
-    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else { trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
+      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
   }
 }
 
@@ -994,7 +1037,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.6 — v6.5 + scan momentum por Birdeye (adiós 429 de Gecko): filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.8 — v6.7 + cap loss duro momentum (-10%) para caídas verticales: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
