@@ -63,6 +63,9 @@ const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data?api-key=e12mybvnahb5cx2uahup8y1rahn4ewbp99rn4j2u6h6mmy37f1c7cdakf5432kbkcctmmwkcdd37cgke718qey9ne96mpy1mdncmjmut6crkeeb5f5n7ac1gf137auudd56m4u1tcwyku6h130u3m9164cdad99rmuxjpd8b9qq4d3bddu76wu7ad270k2h7155gnbm5x0kuf8";
 const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
+// v6.6: scan de momentum por Birdeye (API key, no sufre el 429 de IP compartida de Gecko)
+const BIRDEYE_API_KEY = "cffc98f5aed04ad3ae4115c5e900ddbd";
+const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 
 let wallet = null;
 let connection = null;
@@ -417,72 +420,76 @@ async function momentumScan() {
   let totalScanned = 0;
   let totalSignals = 0;
   try {
-    for (let page = 1; page <= 3; page++) {
-      const res = await fetch(
-        `${GECKO_PUMPSWAP}?page=${page}&order=h24_volume_usd_desc`,
-        { headers: { "Accept": "application/json;version=20230302" }, signal: AbortSignal.timeout(10000) }
-      );
-      if (!res.ok) break;
-      const json = await res.json();
-      const pools = json?.data || [];
-      for (const pool of pools) {
-        const attr = pool.attributes || {};
-        const poolAddr = attr.address || pool.id?.replace("solana_", "");
-        if (!poolAddr) continue;
-        const mc = parseFloat(attr.fdv_usd || 0);
-        if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
-        const vol1h = parseFloat(attr.volume_usd?.h1 || 0);
-        const pct1h = parseFloat(attr.price_change_percentage?.h1 || 0);
-        const geckoPrice = parseFloat(attr.base_token_price_usd || 0);
-        if (geckoPrice <= 0) continue;
-        const liquidity = parseFloat(attr.reserve_in_usd || 0);  // v6.4: liquidez del pool
-        const relationships = pool.relationships || {};
-        const mint = (relationships.base_token?.data?.id || "").replace("solana_", "");
-        if (!mint || mint.length < 32) continue;
-        totalScanned++;
-        if (state.momMonitored.has(mint)) {
-          const token = state.momMonitored.get(mint);
-          token.vol1h = vol1h; token.pct1h = pct1h;
-          if (geckoPrice > 0) momUpdatePrice(mint, geckoPrice, 0);
-          seenMomPools.add(poolAddr);
-          continue;
-        }
-        if (seenMomPools.has(poolAddr)) continue;
-        if (vol1h < MOM_MIN_VOL_1H) continue;
-        // ── v6.4 Fix 1: filtro de liquidez mínima (descarta pools finos tipo SPCX) ──
-        // reserve_in_usd > 0 evita falso 0 si el campo faltara puntualmente: solo
-        // descartamos cuando Gecko reporta liquidez real y baja.
-        if (liquidity > 0 && liquidity < MOM_MIN_LIQUIDITY) {
-          addLog(`⛔ MOM liquidez baja (${formatMC(liquidity)}): ${(attr.name||"").split(" / ")[0] || mint.slice(0,8)}`, "filter");
-          continue;
-        }
-        if (pct1h < MOM_MIN_PCT_1H) continue;
-        if (pct1h > MOM_MAX_PCT_1H) continue;
-        const lastSig = momSignalCooldown.get(mint) || 0;
-        if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
+    // v6.6: una sola llamada a Birdeye (Token List V3) ordenada por volumen 1h.
+    // Sustituye las 3 páginas de Gecko (que daban 429 por IP compartida de Railway).
+    // Birdeye identifica por API key, no por IP. limit:50 = 1 petición por scan.
+    const url = `${BIRDEYE_TOKEN_LIST}?sort_by=volume_1h_usd&sort_type=desc`
+      + `&min_liquidity=${MOM_MIN_LIQUIDITY}`
+      + `&min_market_cap=${MOM_MIN_MC}&max_market_cap=${MOM_MAX_MC}`
+      + `&offset=0&limit=50`;
+    const res = await fetch(url, {
+      headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      addLog(`❌ Birdeye scan HTTP ${res.status}`, "error");
+      return;
+    }
+    const json = await res.json();
+    const tokens = json?.data?.items || json?.data?.tokens || [];
+    for (const tok of tokens) {
+      const mint = tok.address || "";
+      if (!mint || mint.length < 32) continue;
+      const poolAddr = mint; // en Birdeye agrupamos por token (no por pool)
+      const mc = parseFloat(tok.market_cap || tok.fdv || 0);
+      if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
+      const vol1h = parseFloat(tok.volume_1h_usd || 0);
+      const pct1h = parseFloat(tok.price_change_1h_percent || 0);
+      const bePrice = parseFloat(tok.price || 0);
+      if (bePrice <= 0) continue;
+      const liquidity = parseFloat(tok.liquidity || 0);
+      totalScanned++;
+      if (state.momMonitored.has(mint)) {
+        const token = state.momMonitored.get(mint);
+        token.vol1h = vol1h; token.pct1h = pct1h;
+        if (bePrice > 0) momUpdatePrice(mint, bePrice, 0);
         seenMomPools.add(poolAddr);
-        state.stats.mom_scanned++;
-        const symbol = (attr.name || "").split(" / ")[0] || mint.slice(0, 8);
-        momSignalCooldown.set(mint, Date.now());
-        state.stats.mom_signals++;
-        totalSignals++;
-        state.momPending.set(mint, {
-          mint, symbol, name: symbol,
-          geckoPrice, mc, vol1h, pct1h,
-          pendingSince: Date.now(),
-        });
-        state.stats.mom_pending = state.momPending.size;
-        addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-        setTimeout(() => {
-          if (state.momPending.has(mint)) {
-            const pending = state.momPending.get(mint);
-            addLog(`⚡ ENTRADA gecko: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
-            momActivateFromPending(mint, pending.geckoPrice, 0);
-          }
-        }, MOM_PENDING_TIMEOUT_MS);
-        broadcast({ event: "stats", data: state.stats });
+        continue;
       }
-      await new Promise(r => setTimeout(r, 500));
+      if (seenMomPools.has(poolAddr)) continue;
+      if (vol1h < MOM_MIN_VOL_1H) continue;
+      // ── v6.4 Fix 1: filtro de liquidez mínima (descarta pools finos tipo SPCX) ──
+      // liquidity > 0 evita falso 0 si el campo faltara puntualmente: solo
+      // descartamos cuando Birdeye reporta liquidez real y baja.
+      if (liquidity > 0 && liquidity < MOM_MIN_LIQUIDITY) {
+        addLog(`⛔ MOM liquidez baja (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
+        continue;
+      }
+      if (pct1h < MOM_MIN_PCT_1H) continue;
+      if (pct1h > MOM_MAX_PCT_1H) continue;
+      const lastSig = momSignalCooldown.get(mint) || 0;
+      if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
+      seenMomPools.add(poolAddr);
+      state.stats.mom_scanned++;
+      const symbol = tok.symbol || mint.slice(0, 8);
+      momSignalCooldown.set(mint, Date.now());
+      state.stats.mom_signals++;
+      totalSignals++;
+      state.momPending.set(mint, {
+        mint, symbol, name: symbol,
+        geckoPrice: bePrice, mc, vol1h, pct1h,
+        pendingSince: Date.now(),
+      });
+      state.stats.mom_pending = state.momPending.size;
+      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+      setTimeout(() => {
+        if (state.momPending.has(mint)) {
+          const pending = state.momPending.get(mint);
+          addLog(`⚡ ENTRADA birdeye: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
+          momActivateFromPending(mint, pending.geckoPrice, 0);
+        }
+      }, MOM_PENDING_TIMEOUT_MS);
+      broadcast({ event: "stats", data: state.stats });
     }
     addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
     broadcast({ event: "stats", data: state.stats });
@@ -987,7 +994,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.5 — v6.4 + trailing ceñido -15% con escalón armado | Momentum: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.6 — v6.5 + scan momentum por Birdeye (adiós 429 de Gecko): filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
