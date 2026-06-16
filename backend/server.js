@@ -35,7 +35,8 @@ const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;   // v6.7: nº de ticks consecutivos bajo el SL inicial necesarios para cerrar. Un tick basura aislado (DUR 0-2s, -47% imposible) no se confirma; una caída real sí. Solo aplica al SL bajo entrada, no al piso/trailing en positivo
 const MIG_EXPIRED_WIN_PCT = 2;
-const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar
+const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar (ahora ventana de confirmación, v6.9)
+const MIG_MAX_CAIDA_DELAY = 0.25; // v6.9: si el precio cae >25% durante la ventana de 3s, NO entrar (el token se desploma justo al abrir). Precio de entrada = precio REAL tras el delay, no el congelado
 // ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
 const MIG_STEP_TRIGGER = 0.20;    // al tocar +20% de beneficio...
 const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
@@ -293,7 +294,7 @@ function migStartWatching(coin) {
     mint: coin.mint, name: coin.name || "Unknown", symbol: coin.symbol || "???",
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
-    timer: null, entered: false,
+    timer: null, entered: false, pendingEntry: false,
   };
   state.migWatching.set(coin.mint, entry);
   state.stats.mig_watched++;
@@ -306,8 +307,16 @@ function migStartWatching(coin) {
 }
 
 function migUpdateWatching(mint, price, solAmount, entry) {
+  // v6.9: si ya abrimos la operación, dejar de seguir. Pero si estamos en la
+  // ventana de confirmación (pendingEntry), SEGUIR actualizando lastPrice para
+  // capturar el precio REAL tras el delay (antes quedaba congelado: bug raíz).
   if (entry.entered) return;
   if (!isPriceValid(price, entry.lastPrice)) return;
+  if (entry.pendingEntry) {
+    // En ventana de confirmación: solo actualizamos precio, no re-disparamos entrada.
+    entry.lastPrice = price;
+    return;
+  }
   entry.volumeUSD += solAmount * solPriceUSD;
   entry.tradeCount++;
   entry.lastPrice = price;
@@ -317,15 +326,27 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   // ── Entrada rápida: $2K en <20s ───────────────────────────
   if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_MIN_VOL_FAST) {
     clearTimeout(entry.timer);
-    entry.entered = true;
-    state.migWatching.delete(mint);
-    addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — delay 3s`, "accept");
-    state.stats.mig_entered++;
+    entry.pendingEntry = true;   // v6.9: en ventana de confirmación (no abierto aún)
+    const precioA = entry.lastPrice;  // precio al decidir entrar
+    addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — confirmando 3s`, "accept");
     broadcast({ event: "stats", data: state.stats });
-    // ── Delay 3s antes de entrar ──────────────────────────
     setTimeout(() => {
-      entry.firstPrice = entry.lastPrice;
-      addLog(`⚡ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entry.lastPrice * 1_000_000_000)}`, "accept");
+      const precioB = entry.lastPrice;  // precio REAL tras el delay (ya no congelado)
+      // v6.9: si cayó >25% durante la ventana, NO entrar (volcado en curso)
+      if (precioB < precioA * (1 - MIG_MAX_CAIDA_DELAY)) {
+        const caida = ((precioB / precioA - 1) * 100).toFixed(1);
+        addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}% en la ventana (precio fantasma evitado)`, "filter");
+        state.stats.mig_rejected++;
+        state.migWatching.delete(mint);
+        unsubscribeToken(mint);
+        broadcast({ event: "stats", data: state.stats });
+        return;
+      }
+      entry.entered = true;
+      state.stats.mig_entered++;
+      state.migWatching.delete(mint);
+      entry.firstPrice = precioB;   // precio de entrada = REAL tras el delay
+      addLog(`⚡ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
       migOpenTrades(entry);
     }, MIG_ENTRY_DELAY_MS);
     return;
@@ -342,20 +363,35 @@ function migUpdateWatching(mint, price, solAmount, entry) {
 
 function migEvaluate(mint) {
   const entry = state.migWatching.get(mint);
-  if (!entry || entry.entered) return;
-  state.migWatching.delete(mint);
+  if (!entry || entry.entered || entry.pendingEntry) return;
   const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
   if (entry.volumeUSD >= MIG_MIN_VOL_SLOW && entry.lastPrice) {
-    addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — delay 3s`, "accept");
-    state.stats.mig_entered++;
+    // v6.9: NO borrar de migWatching aún — necesitamos seguir recibiendo ticks
+    // durante la ventana de confirmación para capturar el precio real.
+    entry.pendingEntry = true;
+    const precioA = entry.lastPrice;
+    addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — confirmando 3s`, "accept");
     broadcast({ event: "stats", data: state.stats });
-    // ── Delay 3s antes de entrar ──────────────────────────
     setTimeout(() => {
-      entry.firstPrice = entry.lastPrice;
-      addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entry.lastPrice * 1_000_000_000)}`, "accept");
+      const precioB = entry.lastPrice;
+      if (precioB < precioA * (1 - MIG_MAX_CAIDA_DELAY)) {
+        const caida = ((precioB / precioA - 1) * 100).toFixed(1);
+        addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}% en la ventana (precio fantasma evitado)`, "filter");
+        state.stats.mig_rejected++;
+        state.migWatching.delete(mint);
+        unsubscribeToken(mint);
+        broadcast({ event: "stats", data: state.stats });
+        return;
+      }
+      state.stats.mig_entered++;
+      entry.entered = true;
+      state.migWatching.delete(mint);
+      entry.firstPrice = precioB;
+      addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
       migOpenTrades(entry);
     }, MIG_ENTRY_DELAY_MS);
   } else {
+    state.migWatching.delete(mint);
     unsubscribeToken(mint);
     addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
     state.stats.mig_rejected++;
@@ -1037,7 +1073,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.8 — v6.7 + cap loss duro momentum (-10%) para caídas verticales: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.9 — v6.8 + fix precio entrada (ventana confirmación, aborta si cae >25% en delay): filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
