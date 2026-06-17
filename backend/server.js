@@ -19,7 +19,7 @@ const MAX_REAL_TRADES = 0;
 const STATE_FILE = "/tmp/solscanbot_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 1.80;              // +80%
+const MIG_TP = 2.50;              // v6.10: +150% (red de seguridad alta; el trailing escalonado gestiona las grandes antes)
 const MIG_SL = 0.82;              // -18%
 const MIG_DURATION_MS = 15 * 60 * 1000; // 15 min — más tiempo para el movimiento
 const MIG_WINDOW_MS = 60_000;
@@ -41,6 +41,15 @@ const MIG_MAX_CAIDA_DELAY = 0.25; // v6.9: si el precio cae >25% durante la vent
 const MIG_STEP_TRIGGER = 0.20;    // al tocar +20% de beneficio...
 const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
 const MIG_FOLLOW_PCT_STEP = 0.15; // v6.5: trailing ceñido (-15%) cuando el escalón está armado (maxGain>=+20%). El trailing supera el piso +13% a partir de +15.3% (vs +41% con -20%), capturando las medianas-altas +25-40% que antes se cortaban en +13%
+// ── v6.10: cap loss duro + trailing escalonado por tramos ──
+const MIG_HARD_CAP_LOSS = -20;    // tope de pérdida duro (%). Cierre inmediato sin confirmación. Corta las caídas reales rápidas (-23/-30%) que la confirmación de 2 ticks deja ejecutar más profundo. Deja vivir los lavados de -16/-19% que se recuperan
+// Trailing escalonado: se ciñe cuanto más alto el MAX. Tramos por maxGainPct (%).
+const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;  // +20-40% → -15%
+const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.12;  // +40-60% → -12% (matiz 2: suaviza el salto)
+const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.08;  // +60-100% → -8%
+const MIG_TRAIL_P4 = 0.05;                            // +100%+ → -5%
+const MIG_TOP_FLOOR_TRIGGER = 100; // al tocar +100%...
+const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege el tramo -5% de caídas verticales que saltan ticks)
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
@@ -711,6 +720,16 @@ async function closeRealTrade(trade, price, reason) {
   saveState();
 }
 
+// v6.10: trailing escalonado para migración. Devuelve el % de trailing según
+// el MAX alcanzado: cuanto más alto, más ceñido (captura más de las grandes).
+// Solo migración; momentum y el resto usan su follow normal.
+function migTrailingPct(maxGainPct) {
+  if (maxGainPct >= MIG_TRAIL_T3) return MIG_TRAIL_P4;   // +100%+ → -5%
+  if (maxGainPct >= MIG_TRAIL_T2) return MIG_TRAIL_P3;   // +60-100% → -8%
+  if (maxGainPct >= MIG_TRAIL_T1) return MIG_TRAIL_P2;   // +40-60% → -12%
+  return MIG_FOLLOW_PCT_STEP;                            // +20-40% → -15%
+}
+
 function updateRealTrades(mint, price, strategy) {
   const now = Date.now();
   const breakeven = strategy === "migration" ? MIG_BREAKEVEN_AT : MOM_BREAKEVEN_AT;
@@ -729,13 +748,18 @@ function updateRealTrades(mint, price, strategy) {
       closeRealTrade(trade, price, "SL");
       continue;
     }
+    // ── v6.10: cap loss duro (solo Migración, -20%) ──
+    // Corta las caídas reales rápidas que la confirmación de 2 ticks deja
+    // ejecutar más profundo (-23/-30%). Cierre inmediato, sin confirmar.
+    if (strategy === "migration" && currentPct <= MIG_HARD_CAP_LOSS) {
+      addLog(`🛑 CAP LOSS [migration real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
+      closeRealTrade(trade, price, "SL");
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
-    // ── v6.5: trailing ceñido cuando el escalón está armado ──
-    // Si la migración ya tocó +20%, el trailing pasa de -20% a -15% para que
-    // supere el piso +13% antes (a partir de +15.3% de MAX en vez de +41%) y
-    // capture las medianas-altas. Para el resto, trailing normal.
+    // ── v6.5/v6.10: trailing escalonado por tramos cuando el escalón está armado ──
     const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
-    const followEff = (strategy === "migration" && stepArmed) ? MIG_FOLLOW_PCT_STEP : follow;
+    const followEff = (strategy === "migration" && stepArmed) ? migTrailingPct(trade.maxGainPct) : follow;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - followEff);
       if (newSl > trade.sl) trade.sl = +newSl.toFixed(12);
@@ -754,7 +778,13 @@ function updateRealTrades(mint, price, strategy) {
     if (stepArmed && stepFloorPrice > trade.sl) {
       trade.sl = +stepFloorPrice.toFixed(12);
     }
-    if (price >= trade.tp) { trade._slBelowCount = 0; closeRealTrade(trade, price, "TP"); }
+    // ── v6.10 (matiz 3): suelo +65% una vez tocado +100% ──
+    // Protege el tramo -5% de un desplome vertical que salte ticks: aunque el
+    // trailing no reaccione, nunca cerramos por debajo de +65% en una super-grande.
+    if (strategy === "migration" && trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
+      const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
+      if (topFloorPrice > trade.sl) trade.sl = +topFloorPrice.toFixed(12);
+    }
     else if (price <= trade.sl) {
       const stopProtegeGanancia = trade.sl >= trade.entryPrice;
       if (stopProtegeGanancia) {
@@ -816,7 +846,7 @@ function openDemoTrade(signal) {
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  const tpPct = signal.strategy === "migration" ? "+80%" : "+6%";
+  const tpPct = signal.strategy === "migration" ? "+150%" : "+6%";
   const slPct = signal.strategy === "migration" ? "-18%" : "-3%";
   addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
 }
@@ -843,10 +873,16 @@ function updateDemoTrades(mint, price, strategy) {
       closeDemoTrade(trade, price, "SL", tp_pct);
       continue;
     }
+    // ── v6.10: cap loss duro (solo Migración, -20%) ──
+    if (strategy === "migration" && currentPct <= MIG_HARD_CAP_LOSS) {
+      addLog(`🛑 CAP LOSS [migration]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MIG_HARD_CAP_LOSS}%)`, "loss");
+      closeDemoTrade(trade, price, "SL", tp_pct);
+      continue;
+    }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
-    // ── v6.5: trailing ceñido (-15%) cuando el escalón está armado ──
+    // ── v6.5/v6.10: trailing escalonado por tramos cuando el escalón está armado ──
     const stepArmed = strategy === "migration" && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
-    const followEff = (strategy === "migration" && stepArmed) ? MIG_FOLLOW_PCT_STEP : follow;
+    const followEff = (strategy === "migration" && stepArmed) ? migTrailingPct(trade.maxGainPct) : follow;
     if (trade.trailingPhase === "FOLLOWING") {
       const newSl = price * (1 - followEff);
       if (newSl > trade.sl) trade.sl = +newSl.toFixed(12);
@@ -870,6 +906,17 @@ function updateDemoTrades(mint, price, strategy) {
         addLog(`🪜 ESCALÓN +13% suelo [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
       }
       trade.sl = +stepFloorPrice.toFixed(12);
+    }
+    // ── v6.10 (matiz 3): suelo +65% una vez tocado +100% ──
+    if (strategy === "migration" && trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
+      const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
+      if (topFloorPrice > trade.sl) {
+        if (!trade._topFloorLogged) {
+          trade._topFloorLogged = true;
+          addLog(`🏔️ SUELO +65% [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
+        }
+        trade.sl = +topFloorPrice.toFixed(12);
+      }
     }
     if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
     else if (price <= trade.sl) {
@@ -1073,7 +1120,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.9 — v6.8 + fix precio entrada (ventana confirmación, aborta si cae >25% en delay): filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.10 — v6.9 + cap loss migración -20% + trailing escalonado (-15/-12/-8/-5) + suelo +65% | TP red +150%: filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
