@@ -88,7 +88,6 @@ function useBackend() {
 function StrategyBadge({ strategy }) {
  const map = {
    migration:   { label: "🌉 MIG",   color: "#facc15", bg: "#3b2f00" },
-   remigration: { label: "🔄 REMIG", color: "#fb923c", bg: "#3b1d00" },
    momentum:    { label: "⚡ MOM",   color: "#a78bfa", bg: "#2d1b69" },
  };
  const s = map[strategy] || map.momentum;
@@ -160,7 +159,7 @@ function FilterBar({ statusFilter, setStatusFilter, stratFilter, setStratFilter,
        ))}
      </div>
      <div style={{ display: "flex", gap: 6 }}>
-       {[{ id: "all", label: "Todas" }, { id: "migration", label: "🌉" }, { id: "remigration", label: "🔄" }, { id: "momentum", label: "⚡" }].map(f => (
+       {[{ id: "all", label: "Todas" }, { id: "migration", label: "🌉" }, { id: "momentum", label: "⚡" }].map(f => (
          <button key={f.id} onClick={() => setStratFilter(f.id)} style={{ flex: 1, padding: "5px", border: `1px solid ${stratFilter === f.id ? "#94a3b8" : "#1e2d40"}`, borderRadius: 8, background: stratFilter === f.id ? "#1e2d4055" : "none", color: stratFilter === f.id ? "#f1f5f9" : "#64748b", fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>
            {f.label}
          </button>
@@ -503,7 +502,6 @@ export default function App() {
 
  const migWR = (stats.mig_demoWins||0) + (stats.mig_demoLosses||0) > 0 ? Math.round((stats.mig_demoWins||0) / ((stats.mig_demoWins||0) + (stats.mig_demoLosses||0)) * 100) : 0;
  const momWR = (stats.mom_demoWins||0) + (stats.mom_demoLosses||0) > 0 ? Math.round((stats.mom_demoWins||0) / ((stats.mom_demoWins||0) + (stats.mom_demoLosses||0)) * 100) : 0;
- const remigWR = (stats.remig_demoWins||0) + (stats.remig_demoLosses||0) > 0 ? Math.round((stats.remig_demoWins||0) / ((stats.remig_demoWins||0) + (stats.remig_demoLosses||0)) * 100) : 0;
  const totalPnlSol = (stats.mig_realPnLSol||0) + (stats.mom_realPnLSol||0);
 
  // Abortos: totales y % de acierto del filtro
@@ -736,18 +734,6 @@ export default function App() {
              <StatsRow label="P&L Demo" val={`${(stats.mig_demoPnL||0)>=0?"+":""}${Math.round(stats.mig_demoPnL||0)}%`} color={pctColor(stats.mig_demoPnL||0)} />
              <StatsRow label="Ganancia máx media" val={`+${(stats.mig_avgMaxGain||0).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
              <StatsRow label="Pérdida máx media" val={`-${(stats.mig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
-           </div>
-
-           {/* ── RE-MIGRACIÓN (3ª estrategia, v6.11) ── */}
-           <div style={{ background: "#0d1117", border: "1px solid #fb923c33", borderRadius: 10, padding: 14 }}>
-             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#fb923c", marginBottom: 10, fontWeight: 700 }}>🔄 RE-MIGRACIÓN</div>
-             <StatsRow label="Entradas" val={stats.remig_entered||0} color="#22c55e" />
-             <StatsRow label="Demo Wins" val={stats.remig_demoWins||0} color="#22c55e" />
-             <StatsRow label="Demo Losses" val={stats.remig_demoLosses||0} color="#ef4444" />
-             <StatsRow label="Win Rate" val={`${remigWR}%`} color={remigWR >= 50 ? "#22c55e" : "#ef4444"} />
-             <StatsRow label="P&L Demo" val={`${(stats.remig_demoPnL||0)>=0?"+":""}${Math.round(stats.remig_demoPnL||0)}%`} color={pctColor(stats.remig_demoPnL||0)} />
-             <StatsRow label="Ganancia máx media" val={`+${(stats.remig_avgMaxGain||0).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
-             <StatsRow label="Pérdida máx media" val={`-${(stats.remig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
            </div>
 
            {/* ── ABORTOS (instrumentación de filtros de entrada) ── */}
