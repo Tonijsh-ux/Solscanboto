@@ -56,16 +56,6 @@ const MIG_TRAIL_P4 = 0.05;                            // +100%+ → -5%
 const MIG_TOP_FLOOR_TRIGGER = 100; // al tocar +100%...
 const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege el tramo -5% de caídas verticales que saltan ticks)
 
-// ── v6.11: RE-ENTRADA por continuación (APAGADA por defecto) ──────
-// Tras cerrar una operación de migración, vigila el token MIG_REENTRY_WINDOW_MS.
-// Si el precio supera el máximo previo + margen (ruptura confirmada), abre una
-// segunda operación con la MISMA lógica de migración. Una sola re-entrada por token.
-// Todo el código existe pero NO hace nada mientras MIG_REENTRY_ENABLED = false.
-const MIG_REENTRY_ENABLED = true;        // ⬅️ poner true para activar y medir
-const MIG_REENTRY_WINDOW_MS = 5 * 60_000; // 5 min de vigilancia tras cerrar
-const MIG_REENTRY_BREAK_MARGIN = 0.05;    // ruptura = superar el máximo previo +5%
-const MIG_REENTRY_MAX = 1;                // máximo de re-entradas por token
-
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
 const MOM_SL = 0.97;
@@ -129,7 +119,6 @@ async function getTokenBalance(mint) {
 const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
-  migReentryWatch: new Map(),  // v6.11: tokens en vigilancia de re-entrada tras cerrar (mint → {symbol, entryPrice, maxPricePrev, watchUntil, reentries})
   momPending: new Map(),
   momMonitored: new Map(),
   signals: [],
@@ -148,12 +137,6 @@ const state = {
     mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
     mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
-    // v6.11: re-migración (contabilidad propia, separada de migración)
-    remig_entered: 0,
-    remig_demoWins: 0, remig_demoLosses: 0, remig_demoExpired: 0, remig_demoPnL: 0,
-    remig_realWins: 0, remig_realLosses: 0, remig_realPnL: 0, remig_realPnLSol: 0,
-    remig_closedCount: 0, remig_maxGainSum: 0, remig_maxLossSum: 0,
-    remig_avgMaxGain: 0, remig_avgMaxLoss: 0,
     demoOpen: 0, realOpen: 0, walletBalance: 0,
   },
 };
@@ -462,11 +445,7 @@ function migOpenTrades(entry) {
 }
 
 function migCleanup(mint, symbol) {
-  // v6.11: si el token quedó en vigilancia de re-entrada, mantener la suscripción
-  // de precios viva (la desuscripción la hará checkReentry al expirar la ventana).
-  if (!(MIG_REENTRY_ENABLED && state.migReentryWatch.has(mint))) {
-    unsubscribeToken(mint);
-  }
+  unsubscribeToken(mint);
   state.migMonitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
   addLog(`🗑️ ${symbol} eliminado`, "info");
@@ -475,11 +454,6 @@ function migCleanup(mint, symbol) {
 function migUpdatePrice(mint, price, solAmount) {
   const entry = state.migWatching.get(mint);
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
-  // v6.11: si el token está en vigilancia de re-entrada, comprobar ruptura.
-  if (MIG_REENTRY_ENABLED && state.migReentryWatch.has(mint)) {
-    checkReentry(mint, price);
-    // no return: si además sigue en migMonitored (no debería), que actualice abajo
-  }
   const token = state.migMonitored.get(mint);
   if (!token) return;
   if (!isPriceValid(price, token.price)) return;
@@ -490,68 +464,7 @@ function migUpdatePrice(mint, price, solAmount) {
   token.lastUpdate = Date.now();
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
-  // v6.11: si hay operaciones de re-migración sobre este mint, procesarlas también.
-  updateDemoTrades(mint, price, "remigration");
-  updateRealTrades(mint, price, "remigration");
   broadcast({ event: "migTokenUpdate", data: token });
-}
-
-// ── v6.11: RE-ENTRADA por continuación (esqueleto, apagado por defecto) ──
-// Registra un token para vigilancia tras cerrar su operación de migración.
-function registrarReentry(mint, symbol, entryPrice, maxPricePrev) {
-  const prev = state.migReentryWatch.get(mint);
-  const reentries = prev ? prev.reentries : 0;
-  if (reentries >= MIG_REENTRY_MAX) return;  // ya agotó las re-entradas
-  state.migReentryWatch.set(mint, {
-    mint, symbol, entryPrice, maxPricePrev,
-    watchUntil: Date.now() + MIG_REENTRY_WINDOW_MS,
-    reentries,
-  });
-  // Mantener la suscripción de precios viva durante la ventana (NO desuscribir).
-  addLog(`👁️ RE-ENTRADA vigilando: ${symbol} — ruptura si supera +${((maxPricePrev/entryPrice-1)*100*(1+MIG_REENTRY_BREAK_MARGIN)).toFixed(0)}% en ${MIG_REENTRY_WINDOW_MS/60000}min`, "info");
-}
-
-// Comprueba en cada tick si el token rompe el máximo previo + margen.
-function checkReentry(mint, price) {
-  const w = state.migReentryWatch.get(mint);
-  if (!w) return;
-  // Ventana expirada: soltar el token (y desuscribir, ya no hace falta).
-  if (Date.now() > w.watchUntil) {
-    state.migReentryWatch.delete(mint);
-    unsubscribeToken(mint);
-    addLog(`👁️ RE-ENTRADA expirada (sin ruptura): ${w.symbol}`, "info");
-    return;
-  }
-  // Ruptura confirmada: precio supera el máximo previo + margen.
-  const breakPrice = w.maxPricePrev * (1 + MIG_REENTRY_BREAK_MARGIN);
-  if (price >= breakPrice) {
-    addLog(`🚀 RE-ENTRADA disparada: ${w.symbol} rompió máximo +${MIG_REENTRY_BREAK_MARGIN*100}% @ MC ${formatMC(price * 1_000_000_000)}`, "accept");
-    w.reentries++;
-    state.migReentryWatch.delete(mint);
-    // Abrir segunda operación con la MISMA lógica de migración (reusa openDemoTrade
-    // vía migMonitored). Marca isReentry para no encadenar re-entradas infinitas.
-    abrirReentry(w, price);
-  }
-}
-
-// Abre la re-entrada reusando la maquinaria de migración (migMonitored + demo trade).
-function abrirReentry(w, price) {
-  // Re-registrar el token en migMonitored para que reciba precios y se gestione igual.
-  if (!state.migMonitored.has(w.mint)) {
-    state.migMonitored.set(w.mint, {
-      mint: w.mint, symbol: w.symbol, price,
-      mc: price * 1_000_000_000, priceHigh: price, priceLow: price,
-      tradeCount: 0, volumeUSD: 0, detectedAt: Date.now(), lastUpdate: Date.now(),
-    });
-    broadcast({ event: "newMigToken", data: state.migMonitored.get(w.mint) });
-  }
-  const signal = {
-    strategy: "remigration", mint: w.mint, symbol: w.symbol, name: w.symbol,
-    price, tp: +(price * MIG_TP).toFixed(12), sl: +(price * MIG_SL).toFixed(12),
-    isReentry: true,
-  };
-  state.stats.remig_entered++;
-  openDemoTrade(signal);
 }
 
 
@@ -862,10 +775,7 @@ function migTrailingPct(maxGainPct) {
   return MIG_FOLLOW_PCT_STEP;                            // +20-40% → -15%
 }
 
-// v6.11: la re-migración ("remigration") usa la MISMA lógica de trading que
-// migración. isMig() agrupa ambas para los stops/trailing/cap. El prefix de
-// stats SÍ las separa (mig / remig / mom) para contabilidad independiente.
-function isMig(strategy) { return strategy === "migration" || strategy === "remigration"; }
+function isMig(strategy) { return strategy === "migration"; }
 // v6.12 Palanca 1: detecta volcado vertical. True si el precio cae > MIG_VELO_DROP
 // en < MIG_VELO_MS, PERO solo si la operación está bajo entrada y sin escalón
 // armado (nunca toca ganadoras: una ganadora que cae rápido desde su pico la
@@ -887,7 +797,6 @@ function veloDropTriggered(trade, price, strategy) {
 }
 function stratPrefix(strategy) {
   if (strategy === "migration") return "mig";
-  if (strategy === "remigration") return "remig";
   return "mom";
 }
 
@@ -1008,7 +917,6 @@ function openDemoTrade(signal) {
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
     expiresAt: Date.now() + duration,
-    isReentry: !!signal.isReentry,  // v6.11: marca para no encadenar re-entradas
   };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
@@ -1162,16 +1070,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   state.stats[`${prefix}_closedCount`]++;
   state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
   state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
-  if (isMig(trade.strategy)) {
-    // v6.11: registrar vigilancia de re-entrada solo si está activada y esta
-    // operación NO era ya una re-entrada (la re-migración tiene isReentry=true,
-    // así que no encadena). Las migraciones normales sí registran.
-    if (MIG_REENTRY_ENABLED && !trade.isReentry) {
-      const maxPricePrev = trade.entryPrice * (1 + (trade.maxGainPct || 0) / 100);
-      registrarReentry(trade.mint, trade.symbol, trade.entryPrice, maxPricePrev);
-    }
-    migCleanup(trade.mint, trade.symbol);
-  }
+  if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
   saveState();
@@ -1202,17 +1101,6 @@ setInterval(() => {
     const tp_pct = isMig(trade.strategy) ? MIG_TP : MOM_TP;
     closeDemoTrade(trade, token?.price || trade.entryPrice, "EXPIRED", tp_pct);
   }
-  // v6.11: barrer re-entradas cuya ventana expiró sin recibir más ticks (feed mudo),
-  // para no dejar tokens colgados suscritos. checkReentry ya las suelta si llegan ticks.
-  if (MIG_REENTRY_ENABLED) {
-    for (const [mint, w] of state.migReentryWatch.entries()) {
-      if (now > w.watchUntil) {
-        state.migReentryWatch.delete(mint);
-        unsubscribeToken(mint);
-        addLog(`👁️ RE-ENTRADA expirada (sin ruptura): ${w.symbol}`, "info");
-      }
-    }
-  }
 }, 30_000);
 
 // ── PUMPPORTAL WS ──────────────────────────────────────────────
@@ -1241,7 +1129,7 @@ function connectPumpPortal() {
         const price = calcPrice(data);
         if (price <= 0) return;
         const sol = data.solAmount || 0;
-        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint) || (MIG_REENTRY_ENABLED && state.migReentryWatch.has(data.mint))) migUpdatePrice(data.mint, price, sol);
+        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
         if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
       }
     } catch (e) { console.log("PP:", e.message); }
@@ -1315,7 +1203,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.12 — v6.11 + momentum precio fresco+drift+cooldown mudo + migración salida por velocidad | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.12 — v6.10 + momentum precio fresco+drift+cooldown mudo + migración salida por velocidad (re-migración retirada) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
