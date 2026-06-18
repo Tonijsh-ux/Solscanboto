@@ -61,7 +61,7 @@ const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege
 // Si el precio supera el máximo previo + margen (ruptura confirmada), abre una
 // segunda operación con la MISMA lógica de migración. Una sola re-entrada por token.
 // Todo el código existe pero NO hace nada mientras MIG_REENTRY_ENABLED = false.
-const MIG_REENTRY_ENABLED = false;        // ⬅️ poner true para activar y medir
+const MIG_REENTRY_ENABLED = true;        // ⬅️ poner true para activar y medir
 const MIG_REENTRY_WINDOW_MS = 5 * 60_000; // 5 min de vigilancia tras cerrar
 const MIG_REENTRY_BREAK_MARGIN = 0.05;    // ruptura = superar el máximo previo +5%
 const MIG_REENTRY_MAX = 1;                // máximo de re-entradas por token
