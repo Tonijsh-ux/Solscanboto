@@ -66,11 +66,13 @@ const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
-const MOM_MIN_LIQUIDITY = 25_000;     // v6.4: liquidez mínima del pool en USD (reserve_in_usd). Filtra pools finos tipo SPCX (vol alto, liquidez <$1)
+const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
 const MOM_MAX_ENTRY_DRIFT = 0.04;     // v6.12: si el precio fresco se alejó >4% del de la señal, NO entrar (la vela ya se movió)
 const MOM_MUTE_COOLDOWN_MS = 15 * 60_000; // v6.12: 15 min sin reentrar un token que expiró mudo
+const MOM_MUTE_CHECK_MS = 5_000;      // v6.13 Capa 2: separación entre las dos lecturas de precio en la entrada
+const MOM_MUTE_MIN_MOVE = 0.003;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
@@ -515,11 +517,13 @@ async function momentumScan() {
       }
       if (seenMomPools.has(poolAddr)) continue;
       if (vol1h < MOM_MIN_VOL_1H) continue;
-      // ── v6.4 Fix 1: filtro de liquidez mínima (descarta pools finos tipo SPCX) ──
-      // liquidity > 0 evita falso 0 si el campo faltara puntualmente: solo
-      // descartamos cuando Birdeye reporta liquidez real y baja.
-      if (liquidity > 0 && liquidity < MOM_MIN_LIQUIDITY) {
-        addLog(`⛔ MOM liquidez baja (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
+      // ── v6.13 Capa 1: filtro de liquidez (descarta 0, ausente O baja) ──
+      // ANTES: `liquidity > 0 && liquidity < MIN` dejaba colar liquidez 0/ausente
+      // (WORLDCUP con liquidez <$1 pasaba). Ahora descarta también 0/desconocida.
+      // Umbral bajo (20K) a propósito: el peso del filtrado lo lleva la Capa 2
+      // (movimiento real de precio), porque la liquidez de Birdeye no es fiable.
+      if (!liquidity || liquidity < MOM_MIN_LIQUIDITY) {
+        addLog(`⛔ MOM liquidez baja/desconocida (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
         continue;
       }
       if (pct1h < MOM_MIN_PCT_1H) continue;
@@ -562,8 +566,26 @@ async function momentumScan() {
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
-        addLog(`⚡ ENTRADA [fresco]: ${pending.symbol} @ $${freshPrice.toFixed(8)} (drift ${(drift*100).toFixed(1)}%)`, "accept");
-        momActivateFromPending(mint, freshPrice, 0);   // entra con el FRESCO, no el viejo
+        // ── v6.13 Capa 2: confirmar que el precio se MUEVE (no está mudo) ──
+        // No fiarse de la liquidez que reporta Birdeye: medir directamente. Segunda
+        // lectura tras unos segundos; si apenas cambió, el pool está congelado → fuera.
+        await new Promise(r => setTimeout(r, MOM_MUTE_CHECK_MS));
+        if (!state.momPending.has(mint)) return;
+        const secondPrice = await birdeyeFreshPrice(mint);
+        if (!secondPrice) {
+          addLog(`⛔ MOM 2ª lectura sin precio: ${pending.symbol} — no entra`, "filter");
+          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
+          return;
+        }
+        const move = Math.abs(secondPrice - freshPrice) / freshPrice;
+        if (move < MOM_MUTE_MIN_MOVE) {
+          addLog(`🔇 MOM MUDO en entrada: ${pending.symbol} — precio movió ${(move*100).toFixed(2)}% en ${MOM_MUTE_CHECK_MS/1000}s, NO entra`, "filter");
+          momMuteCooldown.set(mint, Date.now());   // no reintentarlo enseguida
+          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
+          return;
+        }
+        addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${secondPrice.toFixed(8)} (movió ${(move*100).toFixed(2)}%)`, "accept");
+        momActivateFromPending(mint, secondPrice, 0);   // entra con la lectura más reciente
       }, MOM_PENDING_TIMEOUT_MS);
       broadcast({ event: "stats", data: state.stats });
     }
@@ -1203,7 +1225,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.12 — v6.10 + momentum precio fresco+drift+cooldown mudo + migración salida por velocidad (re-migración retirada) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos (liquidez fix + doble lectura precio) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
