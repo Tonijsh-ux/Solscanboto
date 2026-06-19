@@ -135,6 +135,12 @@ const state = {
     mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
     mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
     mom_scanned: 0, mom_signals: 0, mom_pending: 0,
+    // v6.13: contadores de filtrado de entrada (para medir qué frena cada capa)
+    mom_entered: 0,           // señales que pasaron TODO y abrieron operación
+    mom_disc_liquidity: 0,    // Capa 1: descartadas en scan por liquidez baja/desconocida
+    mom_disc_drift: 0,        // descartadas por drift (precio ya movido)
+    mom_disc_mute: 0,         // Capa 2: descartadas por precio mudo en entrada
+    mom_disc_noprice: 0,      // descartadas por no obtener precio fresco
     mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
     mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
@@ -524,6 +530,7 @@ async function momentumScan() {
       // (movimiento real de precio), porque la liquidez de Birdeye no es fiable.
       if (!liquidity || liquidity < MOM_MIN_LIQUIDITY) {
         addLog(`⛔ MOM liquidez baja/desconocida (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
+        state.stats.mom_disc_liquidity++;
         continue;
       }
       if (pct1h < MOM_MIN_PCT_1H) continue;
@@ -557,12 +564,14 @@ async function momentumScan() {
         const freshPrice = await birdeyeFreshPrice(mint);
         if (!freshPrice) {
           addLog(`⛔ MOM sin precio fresco: ${pending.symbol} — no entra`, "filter");
+          state.stats.mom_disc_noprice++;
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
         const drift = Math.abs(freshPrice - pending.geckoPrice) / pending.geckoPrice;
         if (drift > MOM_MAX_ENTRY_DRIFT) {
           addLog(`⛔ MOM drift ${(drift*100).toFixed(1)}% (${pending.symbol}) — la vela ya se movió, NO entra`, "filter");
+          state.stats.mom_disc_drift++;
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
@@ -574,17 +583,20 @@ async function momentumScan() {
         const secondPrice = await birdeyeFreshPrice(mint);
         if (!secondPrice) {
           addLog(`⛔ MOM 2ª lectura sin precio: ${pending.symbol} — no entra`, "filter");
+          state.stats.mom_disc_noprice++;
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
         const move = Math.abs(secondPrice - freshPrice) / freshPrice;
         if (move < MOM_MUTE_MIN_MOVE) {
           addLog(`🔇 MOM MUDO en entrada: ${pending.symbol} — precio movió ${(move*100).toFixed(2)}% en ${MOM_MUTE_CHECK_MS/1000}s, NO entra`, "filter");
+          state.stats.mom_disc_mute++;
           momMuteCooldown.set(mint, Date.now());   // no reintentarlo enseguida
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
         addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${secondPrice.toFixed(8)} (movió ${(move*100).toFixed(2)}%)`, "accept");
+        state.stats.mom_entered++;
         momActivateFromPending(mint, secondPrice, 0);   // entra con la lectura más reciente
       }, MOM_PENDING_TIMEOUT_MS);
       broadcast({ event: "stats", data: state.stats });
@@ -1225,7 +1237,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos (liquidez fix + doble lectura precio) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos (liquidez fix + doble lectura precio) + contadores de filtrado | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
