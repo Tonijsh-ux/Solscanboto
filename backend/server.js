@@ -990,6 +990,9 @@ function updateDemoTrades(mint, price, strategy) {
       if (trade.mov1s === null && sinceOpen >= 1000) trade.mov1s = +currentPct.toFixed(2);
       if (trade.mov2s === null && sinceOpen >= 2000) trade.mov2s = +currentPct.toFixed(2);
     }
+    // ── v6.12 Palanca 1: salida por velocidad (volcado vertical, solo migración) ──
+    if (veloDropTriggered(trade, price, strategy)) {
+      addLog(`⚡🛑 VELO-EXIT [${strategy}]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}% — vendiendo ya`, "loss");
       closeDemoTrade(trade, price, "SL", tp_pct);
       continue;
     }
