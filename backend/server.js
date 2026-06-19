@@ -31,8 +31,8 @@ const MIG_MIN_VOL_SLOW = 5_000;
 const MIG_FAST_WINDOW_MS = 20_000;
 const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
-const MIG_BREAKEVEN_AT = 0.22;    // breakeven a +22%
-const MIG_BREAKEVEN_MARGIN = 0.03; // SL en breakeven = entrada -3%
+const MIG_BREAKEVEN_AT = 0.22;    // DESACTIVADO en migración: MIG_LOCK_AT (+20%) < este (+22%), así que el trade entra en FOLLOWING antes de llegar aquí y la rama breakeven nunca se alcanza. La rama existe para momentum (allí LOCK +5% > BREAKEVEN +3%, sí funciona). No tocar sin revisar ambas estrategias.
+const MIG_BREAKEVEN_MARGIN = 0.03; // (solo aplicaría si el breakeven de migración estuviera activo, que no lo está)
 const MIG_LOCK_AT = 0.20;         // following a +20%
 const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
 const MIG_MAX_PRICE_RATIO = 2.0;
@@ -72,7 +72,7 @@ const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si cur
 const MOM_MAX_ENTRY_DRIFT = 0.04;     // v6.12: si el precio fresco se alejó >4% del de la señal, NO entrar (la vela ya se movió)
 const MOM_MUTE_COOLDOWN_MS = 15 * 60_000; // v6.12: 15 min sin reentrar un token que expiró mudo
 const MOM_MUTE_CHECK_MS = 5_000;      // v6.13 Capa 2: separación entre las dos lecturas de precio en la entrada
-const MOM_MUTE_MIN_MOVE = 0.0015;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
+const MOM_MUTE_MIN_MOVE = 0.003;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
@@ -141,6 +141,11 @@ const state = {
     mom_disc_drift: 0,        // descartadas por drift (precio ya movido)
     mom_disc_mute: 0,         // Capa 2: descartadas por precio mudo en entrada
     mom_disc_noprice: 0,      // descartadas por no obtener precio fresco
+    // v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración.
+    // Para validar si la dirección temprana predice el resultado (hallazgo del doc).
+    mig_mov_up_win: 0,    mig_mov_up_loss: 0,    // mov2s > 0 (subió en 2s)
+    mig_mov_flat_win: 0,  mig_mov_flat_loss: 0,  // mov2s ~0 (plano)
+    mig_mov_down_win: 0,  mig_mov_down_loss: 0,  // mov2s < 0 (bajó en 2s)
     mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
     mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
@@ -951,6 +956,9 @@ function openDemoTrade(signal) {
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
     expiresAt: Date.now() + duration,
+    // v6.13 paso 2: instrumentación del primer movimiento (solo migración).
+    // Se rellenan en updateDemoTrades al pasar 1s y 2s desde la entrada.
+    mov1s: null, mov2s: null,
   };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
@@ -975,9 +983,13 @@ function updateDemoTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    // ── v6.12 Palanca 1: salida por velocidad (volcado vertical, solo migración) ──
-    if (veloDropTriggered(trade, price, strategy)) {
-      addLog(`⚡🛑 VELO-EXIT [${strategy}]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}% — vendiendo ya`, "loss");
+    // ── v6.13 paso 2: registrar primer movimiento a 1s y 2s (solo migración) ──
+    // Dato en vivo para construir luego el filtro de fuerza temprana sobre evidencia.
+    if (isMig(strategy)) {
+      const sinceOpen = now - trade.openTime;
+      if (trade.mov1s === null && sinceOpen >= 1000) trade.mov1s = +currentPct.toFixed(2);
+      if (trade.mov2s === null && sinceOpen >= 2000) trade.mov2s = +currentPct.toFixed(2);
+    }
       closeDemoTrade(trade, price, "SL", tp_pct);
       continue;
     }
@@ -1104,6 +1116,14 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   state.stats[`${prefix}_closedCount`]++;
   state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
   state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
+  // ── v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración ──
+  // Mide si la dirección temprana predice el resultado (hallazgo del doc: las que
+  // nacen sin fuerza mueren). EXPIRED no cuenta como win ni loss aquí.
+  if (isMig(trade.strategy) && trade.mov2s !== null && trade.result !== "EXPIRED") {
+    const bucket = trade.mov2s > 1 ? "up" : (trade.mov2s < -1 ? "down" : "flat");
+    const wl = trade.result === "WIN" ? "win" : "loss";
+    state.stats[`mig_mov_${bucket}_${wl}`]++;
+  }
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
@@ -1237,7 +1257,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos (liquidez fix + doble lectura precio) + contadores de filtrado | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos + contadores filtrado + instrumentación primer movimiento migración (paso 2) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
