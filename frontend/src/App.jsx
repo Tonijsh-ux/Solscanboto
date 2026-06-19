@@ -502,6 +502,11 @@ export default function App() {
 
  const migWR = (stats.mig_demoWins||0) + (stats.mig_demoLosses||0) > 0 ? Math.round((stats.mig_demoWins||0) / ((stats.mig_demoWins||0) + (stats.mig_demoLosses||0)) * 100) : 0;
  const momWR = (stats.mom_demoWins||0) + (stats.mom_demoLosses||0) > 0 ? Math.round((stats.mom_demoWins||0) / ((stats.mom_demoWins||0) + (stats.mom_demoLosses||0)) * 100) : 0;
+ const movWR = (w, l) => (w + l) > 0 ? Math.round(w / (w + l) * 100) : null;
+ const movUpWR = movWR(stats.mig_mov_up_win||0, stats.mig_mov_up_loss||0);
+ const movFlatWR = movWR(stats.mig_mov_flat_win||0, stats.mig_mov_flat_loss||0);
+ const movDownWR = movWR(stats.mig_mov_down_win||0, stats.mig_mov_down_loss||0);
+ const movTotal = (stats.mig_mov_up_win||0)+(stats.mig_mov_up_loss||0)+(stats.mig_mov_flat_win||0)+(stats.mig_mov_flat_loss||0)+(stats.mig_mov_down_win||0)+(stats.mig_mov_down_loss||0);
  const totalPnlSol = (stats.mig_realPnLSol||0) + (stats.mom_realPnLSol||0);
 
  // Abortos: totales y % de acierto del filtro
@@ -774,6 +779,41 @@ export default function App() {
                  {(stats.abort_missed_bajista||0) > (stats.abort_missed_vertical||0) + (stats.abort_missed_delay||0) && (stats.abort_missed_bajista||0) >= 2 && (
                    <div style={{ marginTop: 8, padding: "8px 10px", background: "#1f1500", border: "1px solid #facc1533", borderRadius: 8, fontSize: 10, color: "#facc15", lineHeight: 1.5 }}>
                      ⚠️ El motivo "bajista" domina en los errores. El check trend &lt; 0 puede ser demasiado estricto — considerar relajarlo a trend &lt; -0.03.
+                   </div>
+                 )}
+               </>
+             )}
+           </div>
+
+           {/* ── PRIMER MOVIMIENTO (instrumentación entrada migración, v6.13 paso 2) ── */}
+           <div style={{ background: "#0d1117", border: "1px solid #facc1533", borderRadius: 10, padding: 14 }}>
+             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", marginBottom: 4, fontWeight: 700 }}>🔬 PRIMER MOVIMIENTO (migración)</div>
+             <div style={{ fontSize: 10, color: "#475569", marginBottom: 10 }}>¿La dirección del precio a 2s predice el resultado? (W/L por dirección temprana)</div>
+             {movTotal === 0 ? (
+               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Recogiendo datos…</div>
+             ) : (
+               <>
+                 {[
+                   { label: "⬆️ Subió en 2s", w: stats.mig_mov_up_win||0, l: stats.mig_mov_up_loss||0, wr: movUpWR, hint: ">+1%" },
+                   { label: "➡️ Plano en 2s", w: stats.mig_mov_flat_win||0, l: stats.mig_mov_flat_loss||0, wr: movFlatWR, hint: "-1% a +1%" },
+                   { label: "⬇️ Bajó en 2s", w: stats.mig_mov_down_win||0, l: stats.mig_mov_down_loss||0, wr: movDownWR, hint: "<-1%" },
+                 ].map(r => (
+                   <div key={r.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "1px solid #1e2d4044" }}>
+                     <div>
+                       <span style={{ fontSize: 11, color: "#94a3b8" }}>{r.label}</span>
+                       <span style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", marginLeft: 6 }}>{r.hint}</span>
+                     </div>
+                     <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 11, alignItems: "center" }}>
+                       <span style={{ color: "#22c55e" }}>{r.w}W</span>
+                       <span style={{ color: "#ef4444" }}>{r.l}L</span>
+                       <span style={{ color: r.wr === null ? "#475569" : r.wr >= 50 ? "#22c55e" : "#ef4444", minWidth: 34, textAlign: "right" }}>{r.wr === null ? "—" : `${r.wr}%`}</span>
+                     </div>
+                   </div>
+                 ))}
+                 <div style={{ marginTop: 8, fontSize: 10, color: "#475569", fontFamily: "monospace" }}>Total clasificadas: {movTotal}</div>
+                 {movDownWR !== null && movUpWR !== null && (movDownWR + 15) < movUpWR && movTotal >= 20 && (
+                   <div style={{ marginTop: 8, padding: "8px 10px", background: "#1f1500", border: "1px solid #facc1533", borderRadius: 8, fontSize: 10, color: "#facc15", lineHeight: 1.5 }}>
+                     💡 Las que bajan en 2s ganan mucho menos que las que suben. Confirma el hallazgo: la dirección temprana predice. Con más datos, base para el filtro de entrada.
                    </div>
                  )}
                </>
