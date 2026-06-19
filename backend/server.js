@@ -72,7 +72,7 @@ const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si cur
 const MOM_MAX_ENTRY_DRIFT = 0.04;     // v6.12: si el precio fresco se alejó >4% del de la señal, NO entrar (la vela ya se movió)
 const MOM_MUTE_COOLDOWN_MS = 15 * 60_000; // v6.12: 15 min sin reentrar un token que expiró mudo
 const MOM_MUTE_CHECK_MS = 5_000;      // v6.13 Capa 2: separación entre las dos lecturas de precio en la entrada
-const MOM_MUTE_MIN_MOVE = 0.003;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
+const MOM_MUTE_MIN_MOVE = 0.0015;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
