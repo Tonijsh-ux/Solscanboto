@@ -783,7 +783,12 @@ export default function App() {
            <div style={{ background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 10, padding: 14 }}>
              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#a78bfa", marginBottom: 10, fontWeight: 700 }}>⚡ MOMENTUM</div>
              <StatsRow label="Señales" val={stats.mom_signals||0} color="#a78bfa" />
-             <StatsRow label="Descartadas/Canceladas" val={stats.mom_cancelled||0} color="#64748b" desc="Tendencia plana/bajista o sin precio real" />
+             <StatsRow label="Entradas reales" val={stats.mom_entered||0} color="#22c55e" desc="Pasaron todos los filtros y abrieron operación" />
+             <StatsRow label="↳ Descartadas liquidez" val={stats.mom_disc_liquidity||0} color="#64748b" desc="Capa 1: liquidez baja/desconocida" />
+             <StatsRow label="↳ Descartadas drift" val={stats.mom_disc_drift||0} color="#64748b" desc="Precio ya movido >4% al entrar" />
+             <StatsRow label="↳ Descartadas mudo" val={stats.mom_disc_mute||0} color="#64748b" desc="Capa 2: precio congelado en entrada" />
+             <StatsRow label="↳ Sin precio" val={stats.mom_disc_noprice||0} color="#64748b" desc="Birdeye no devolvió precio" />
+             <StatsRow label="Expiradas mudas" val={stats.mom_demoExpired||0} color="#eab308" desc="Entraron pero murieron a 0.0%" />
              <StatsRow label="Demo Wins" val={stats.mom_demoWins||0} color="#22c55e" />
              <StatsRow label="Demo Losses" val={stats.mom_demoLosses||0} color="#ef4444" />
              <StatsRow label="Win Rate" val={`${momWR}%`} color={momWR >= 50 ? "#22c55e" : "#ef4444"} />
