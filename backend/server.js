@@ -77,7 +77,7 @@ const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
 const MOM_FOLLOW_PCT = 0.02;
-const MOM_PENDING_TIMEOUT_MS = 30_000;
+const MOM_PENDING_TIMEOUT_MS = 15_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
 
