@@ -31,6 +31,19 @@ const MIG_MIN_VOL_SLOW = 5_000;
 const MIG_FAST_WINDOW_MS = 20_000;
 const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
+
+// ── MODO OBSERVADOR (recogelotodo) ────────────────────────────────
+// Día de recolección: migración entra en CASI TODO (umbral permisivo) y graba
+// el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
+// Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
+// para volver a la operativa normal. NO toca momentum.
+const OBSERVER_MODE = false;          // ⬅️ poner true para el día de recolección
+const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
+const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
+const OBS_RECORD_MS = 240_000;        // grabar 4 min por token
+const OBS_DENSE_MS = 30_000;          // primeros 30s: muestreo denso
+const OBS_DENSE_INTERVAL = 2_000;     // cada 2s en la fase densa
+const OBS_NORMAL_INTERVAL = 5_000;    // cada 5s de 30s a 240s
 const MIG_BREAKEVEN_AT = 0.22;    // DESACTIVADO en migración: MIG_LOCK_AT (+20%) < este (+22%), así que el trade entra en FOLLOWING antes de llegar aquí y la rama breakeven nunca se alcanza. La rama existe para momentum (allí LOCK +5% > BREAKEVEN +3%, sí funciona). No tocar sin revisar ambas estrategias.
 const MIG_BREAKEVEN_MARGIN = 0.03; // (solo aplicaría si el breakeven de migración estuviera activo, que no lo está)
 const MIG_LOCK_AT = 0.20;         // following a +20%
@@ -121,6 +134,7 @@ async function getTokenBalance(mint) {
 const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
+  obsRecordings: new Map(),  // modo observador: mint → {symbol, vel, mc, vol, t0, entryPrice, puntos:[], mov2s, ...}
   momPending: new Map(),
   momMonitored: new Map(),
   signals: [],
@@ -316,7 +330,9 @@ function migStartWatching(coin) {
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
-  if (mcUsd > 0 && (mcUsd < MIG_MIN_MC || mcUsd > MIG_MAX_MC)) {
+  const mcMin = OBSERVER_MODE ? OBS_MIN_MC : MIG_MIN_MC;
+  const mcMax = OBSERVER_MODE ? Infinity : MIG_MAX_MC;
+  if (mcUsd > 0 && (mcUsd < mcMin || mcUsd > mcMax)) {
     addLog(`⛔ MIG MC fuera rango (${formatMC(mcUsd)}): ${coin.symbol}`, "filter");
     broadcast({ event: "stats", data: state.stats });
     return;
@@ -353,6 +369,16 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   entry.lastPrice = price;
   if (!entry.firstPrice && price > 0) entry.firstPrice = price;
   const elapsed = Date.now() - entry.startTime;
+
+  // ── MODO OBSERVADOR: al alcanzar el umbral permisivo, arrancar grabación ──
+  // (en vez de la entrada normal). Graba el recorrido 4 min y escribe [REC].
+  if (OBSERVER_MODE && entry.volumeUSD >= OBS_MIN_VOL && price > 0) {
+    clearTimeout(entry.timer);
+    entry.entered = true;             // marca para no re-procesar
+    state.migWatching.delete(mint);
+    obsStartRecording(entry, price, elapsed);
+    return;
+  }
 
   // ── Entrada rápida: $2K en <20s ───────────────────────────
   if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_MIN_VOL_FAST) {
@@ -428,6 +454,97 @@ function migEvaluate(mint) {
     state.stats.mig_rejected++;
     broadcast({ event: "stats", data: state.stats });
   }
+}
+
+// ── MODO OBSERVADOR: grabación del recorrido de una migración ──────
+function obsStartRecording(entry, entryPrice, velMs) {
+  const rec = {
+    mint: entry.mint, symbol: entry.symbol,
+    vel: +(velMs / 1000).toFixed(1),         // segundos hasta alcanzar el umbral
+    mc: entry.migratedMcUsd || (entryPrice * 1_000_000_000),
+    vol: Math.round(entry.volumeUSD),
+    t0: Date.now(),
+    entryPrice,
+    puntos: [{ t: 0, p: 0 }],                // recorrido en % vs entrada
+    lastSample: Date.now(),
+    mov2s: null,
+    finished: false,
+  };
+  state.obsRecordings.set(entry.mint, rec);
+  state.stats.mig_entered++;                 // cuenta como "entrada" para el dashboard
+  addLog(`🔬 OBS GRABANDO: ${entry.symbol} | vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} — 4min`, "accept");
+  // Programar el cierre de la grabación a los 4 min.
+  rec.timer = setTimeout(() => obsFinishRecording(entry.mint), OBS_RECORD_MS);
+}
+
+// Se llama desde el routing del feed (precio nuevo) mientras graba.
+function obsSample(mint, price) {
+  const rec = state.obsRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  const dt = Date.now() - rec.t0;
+  const interval = dt <= OBS_DENSE_MS ? OBS_DENSE_INTERVAL : OBS_NORMAL_INTERVAL;
+  if (Date.now() - rec.lastSample < interval) return;   // respeta el ritmo de muestreo
+  rec.lastSample = Date.now();
+  const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
+  rec.puntos.push({ t: Math.round(dt / 1000), p: pct });
+  if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;  // hito: dirección a 2s
+}
+
+// A los 4 min: calcular hitos y escribir la línea [REC].
+function obsFinishRecording(mint) {
+  const rec = state.obsRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  rec.finished = true;
+  state.obsRecordings.delete(mint);
+  unsubscribeToken(mint);
+
+  const pts = rec.puntos;
+  // MIN y MAX con su segundo
+  let min = pts[0], max = pts[0];
+  for (const pt of pts) {
+    if (pt.p < min.p) min = pt;
+    if (pt.p > max.p) max = pt;
+  }
+  // orden: ¿el mínimo fue antes o después del máximo?
+  const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
+  // cruces de +10/+15/+20 (cuántas veces cruzó hacia arriba cada umbral)
+  const cruces = [10, 15, 20].map(u => {
+    let c = 0;
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i - 1].p < u && pts[i].p >= u) c++;
+    }
+    return c;
+  });
+  // cierre_real: qué habría dado la gestión actual (escalón +13 / trailing).
+  // Aproximación sobre el recorrido: simulación ligera del escalón+trailing.
+  const cierreReal = obsSimulaGestionActual(pts);
+  const mov2s = rec.mov2s === null ? "n/a" : `${rec.mov2s >= 0 ? "+" : ""}${rec.mov2s}%`;
+  // puntos crudos compactos al final
+  const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
+  addLog(
+    `[REC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
+    `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
+    `cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cierreReal>=0?"+":""}${cierreReal}% ` +
+    `pts=${ptsRaw}`,
+    "rec"
+  );
+}
+
+// Simulación ligera de la gestión actual (escalón +13 suelo, trailing) sobre el recorrido.
+function obsSimulaGestionActual(pts) {
+  const STEP_TRIGGER = 20, STEP_FLOOR = 13;
+  let armed = false, maxSeen = 0, sl = -18;  // SL inicial -18%
+  for (const pt of pts) {
+    maxSeen = Math.max(maxSeen, pt.p);
+    if (!armed && maxSeen >= STEP_TRIGGER) armed = true;
+    if (armed) {
+      // trailing escalonado simplificado + suelo +13
+      const trail = maxSeen >= 100 ? 5 : maxSeen >= 60 ? 8 : maxSeen >= 40 ? 12 : 15;
+      sl = Math.max(sl, maxSeen - trail, STEP_FLOOR);
+    }
+    if (pt.p <= sl) return +sl.toFixed(1);   // cerró en el stop
+  }
+  return +pts[pts.length - 1].p.toFixed(1);  // no tocó stop: cierra al último precio
 }
 
 function migOpenTrades(entry) {
@@ -1187,6 +1304,7 @@ function connectPumpPortal() {
         if (price <= 0) return;
         const sol = data.solAmount || 0;
         if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
+        if (OBSERVER_MODE && state.obsRecordings.has(data.mint)) obsSample(data.mint, price);
         if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
       }
     } catch (e) { console.log("PP:", e.message); }
@@ -1260,7 +1378,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.13 — v6.12 + momentum doble filtro mudos + contadores filtrado + instrumentación primer movimiento migración (paso 2) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.14 — v6.13 + MODO OBSERVADOR (recogelotodo, APAGADO por defecto OBSERVER_MODE=false) | filtro liquidez ${MOM_MIN_LIQUIDITY/1000}K + cancelar feed mudo ${MOM_MUTE_TIMEOUT_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
