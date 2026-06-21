@@ -37,7 +37,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = false;          // ⬅️ poner true para el día de recolección
+const OBSERVER_MODE = true;          // ⬅️ poner true para el día de recolección
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
 const OBS_RECORD_MS = 240_000;        // grabar 4 min por token
