@@ -22,8 +22,8 @@ const REAL_STRATEGIES = ["migration"];
 const STATE_FILE = "/tmp/solscanbot_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 2.50;              // v6.10: +150% (red de seguridad alta; el trailing escalonado gestiona las grandes antes)
-const MIG_SL = 0.82;              // -18%
+const MIG_TP = 4.00;              // v6.15: +300% (red de seguridad alta; imprescindible con el armado tardío, si no corta los pelotazos +300%+)
+const MIG_SL = 0.80;              // v6.15: -20% (era -18%; aviso de la auditoría: bajar riesgo por op, el agregado apenas pierde)
 const MIG_DURATION_MS = 15 * 60 * 1000; // 15 min — más tiempo para el movimiento
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 2_000;
@@ -37,24 +37,31 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = true;          // ⬅️ poner true para el día de recolección
+const OBSERVER_MODE = false;          // ⬅️ poner true para el día de recolección
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
 const OBS_RECORD_MS = 240_000;        // grabar 4 min por token
 const OBS_DENSE_MS = 30_000;          // primeros 30s: muestreo denso
 const OBS_DENSE_INTERVAL = 2_000;     // cada 2s en la fase densa
 const OBS_NORMAL_INTERVAL = 5_000;    // cada 5s de 30s a 240s
-const MIG_BREAKEVEN_AT = 0.22;    // DESACTIVADO en migración: MIG_LOCK_AT (+20%) < este (+22%), así que el trade entra en FOLLOWING antes de llegar aquí y la rama breakeven nunca se alcanza. La rama existe para momentum (allí LOCK +5% > BREAKEVEN +3%, sí funciona). No tocar sin revisar ambas estrategias.
+const MIG_BREAKEVEN_AT = 0.99;    // v6.15: DESACTIVADO en migración. Antes valía 0.22 y quedaba inactivo porque LOCK (+20%) < 0.22. Ahora LOCK es +70%, así que para mantener la rama breakeven inactiva (el armado tardío NO debe proteger a breakeven antes de +70%) lo subimos por encima del lock. La rama existe para momentum, que usa MOM_BREAKEVEN_AT. No tocar sin revisar ambas estrategias.
 const MIG_BREAKEVEN_MARGIN = 0.03; // (solo aplicaría si el breakeven de migración estuviera activo, que no lo está)
-const MIG_LOCK_AT = 0.20;         // following a +20%
+const MIG_LOCK_AT = 0.70;         // v6.15: following a +70% (armado tardío; era +20%)
 const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;   // v6.7: nº de ticks consecutivos bajo el SL inicial necesarios para cerrar. Un tick basura aislado (DUR 0-2s, -47% imposible) no se confirma; una caída real sí. Solo aplica al SL bajo entrada, no al piso/trailing en positivo
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar (ahora ventana de confirmación, v6.9)
+// ── v6.15: FILTRO DE CALIDAD con entrada retrasada a 15s ──────────
+// Validado sobre observador: mov2s>0 Y pendiente15s>0 → WR 61%, +12.7/op (vs +8.9 global).
+// El bot espera 15s desde que el token pasa el umbral de volumen, mide la dirección a 2s
+// y la pendiente a 15s, y SOLO entra si ambas son positivas. La entrada es más cara (pierde
+// los primeros 15s de subida) pero evita las que se desploman en esa ventana.
+const MIG_QUAL_GATE = true;        // activar el filtro de calidad
+const MIG_QUAL_WINDOW_MS = 15_000; // ventana de evaluación de calidad
 const MIG_MAX_CAIDA_DELAY = 0.25; // v6.9: si el precio cae >25% durante la ventana de 3s, NO entrar (el token se desploma justo al abrir). Precio de entrada = precio REAL tras el delay, no el congelado
 // ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
-const MIG_STEP_TRIGGER = 0.20;    // al tocar +20% de beneficio...
+const MIG_STEP_TRIGGER = 0.70;    // v6.15: armado tardío — al tocar +70% de beneficio...
 const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
 const MIG_FOLLOW_PCT_STEP = 0.15; // v6.5: trailing ceñido (-15%) cuando el escalón está armado (maxGain>=+20%). El trailing supera el piso +13% a partir de +15.3% (vs +41% con -20%), capturando las medianas-altas +25-40% que antes se cortaban en +13%
 // ── v6.10: cap loss duro + trailing escalonado por tramos ──
@@ -342,6 +349,10 @@ function migStartWatching(coin) {
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
     timer: null, entered: false, pendingEntry: false,
+    // v6.15: filtro de calidad con entrada retrasada a 15s
+    qualGate: false,        // en ventana de evaluación de calidad (15s)
+    qualStartPrice: null,   // precio al arrancar la evaluación (referencia para mov2s/pendiente15s)
+    qualMov2s: null,        // % a los 2s vs qualStartPrice
   };
   state.migWatching.set(coin.mint, entry);
   state.stats.mig_watched++;
@@ -399,12 +410,10 @@ function migUpdateWatching(mint, price, solAmount, entry) {
         broadcast({ event: "stats", data: state.stats });
         return;
       }
-      entry.entered = true;
-      state.stats.mig_entered++;
-      state.migWatching.delete(mint);
-      entry.firstPrice = precioB;   // precio de entrada = REAL tras el delay
-      addLog(`⚡ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
-      migOpenTrades(entry);
+      entry.entered = false;        // aún no entramos: pasa por el gate de calidad
+      entry.pendingEntry = true;    // seguir capturando precio durante la ventana de 15s
+      addLog(`⚡ MIG RÁPIDA confirmada: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
+      migQualityGateThenOpen(entry, precioB);
     }, MIG_ENTRY_DELAY_MS);
     return;
   }
@@ -416,6 +425,59 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed),
     mc: price * 1_000_000_000,
   }});
+}
+
+// ── v6.15: gate de calidad. Tras pasar la confirmación de entrada, en vez de
+// abrir el trade directamente, espera MIG_QUAL_WINDOW_MS (15s) capturando el
+// recorrido, y solo abre si mov2s>0 Y pendiente15s>0. Si el filtro está off
+// (MIG_QUAL_GATE=false) abre inmediatamente con el comportamiento anterior.
+// entryPriceB = precio ya confirmado (tras los 3s) que sería el de entrada sin filtro.
+function migQualityGateThenOpen(entry, entryPriceB) {
+  if (!MIG_QUAL_GATE) {
+    entry.entered = true;
+    state.stats.mig_entered++;
+    state.migWatching.delete(entry.mint);
+    entry.firstPrice = entryPriceB;
+    addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entryPriceB * 1_000_000_000)}`, "accept");
+    migOpenTrades(entry);
+    return;
+  }
+  // Arrancar ventana de calidad. Seguimos en pendingEntry para que migUpdateWatching
+  // siga refrescando entry.lastPrice durante los 15s.
+  entry.qualGate = true;
+  entry.qualStartPrice = entryPriceB;
+  entry.qualMov2s = null;
+  const t0 = Date.now();
+  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>0 Y pendiente15s>0)`, "filter");
+  // muestreo del hito de 2s
+  entry.qualTimer2s = setTimeout(() => {
+    if (entry.qualStartPrice > 0 && entry.lastPrice > 0) {
+      entry.qualMov2s = (entry.lastPrice / entry.qualStartPrice - 1) * 100;
+    }
+  }, 2_000);
+  // decisión a los 15s
+  setTimeout(() => {
+    const priceNow = entry.lastPrice;
+    const pend15 = (entry.qualStartPrice > 0 && priceNow > 0)
+      ? (priceNow / entry.qualStartPrice - 1) * 100 : -999;
+    const mov2 = entry.qualMov2s == null ? -999 : entry.qualMov2s;
+    entry.qualGate = false;
+    // FILTRO: ambas positivas
+    if (mov2 > 0 && pend15 > 0) {
+      entry.entered = true;
+      state.stats.mig_entered++;
+      state.migWatching.delete(entry.mint);
+      entry.firstPrice = priceNow;   // entrada al precio del segundo 15 (más caro, pero filtrado)
+      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% · pend15s ${pend15>=0?"+":""}${pend15.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
+      migOpenTrades(entry);
+    } else {
+      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | mov2s ${mov2<=-999?"n/a":(mov2>=0?"+":"")+mov2.toFixed(1)+"%"} · pend15s ${pend15<=-999?"n/a":(pend15>=0?"+":"")+pend15.toFixed(1)+"%"}`, "filter");
+      state.stats.mig_rejected++;
+      state.migWatching.delete(entry.mint);
+      unsubscribeToken(entry.mint);
+      broadcast({ event: "stats", data: state.stats });
+    }
+  }, MIG_QUAL_WINDOW_MS);
 }
 
 function migEvaluate(mint) {
@@ -440,12 +502,9 @@ function migEvaluate(mint) {
         broadcast({ event: "stats", data: state.stats });
         return;
       }
-      state.stats.mig_entered++;
-      entry.entered = true;
-      state.migWatching.delete(mint);
-      entry.firstPrice = precioB;
-      addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
-      migOpenTrades(entry);
+      entry.pendingEntry = true;    // seguir capturando precio durante la ventana de 15s
+      addLog(`✅ MIG LENTA confirmada: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
+      migQualityGateThenOpen(entry, precioB);
     }, MIG_ENTRY_DELAY_MS);
   } else {
     state.migWatching.delete(mint);
