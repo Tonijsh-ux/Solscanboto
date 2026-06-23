@@ -798,7 +798,7 @@ async function momentumScan() {
     const url = `${BIRDEYE_TOKEN_LIST}?sort_by=volume_1h_usd&sort_type=desc`
       + `&min_liquidity=${MOM_MIN_LIQUIDITY}`
       + `&min_market_cap=${MOM_MIN_MC}&max_market_cap=${MOM_MAX_MC}`
-      + `&offset=0&limit=100`;   // v6.15.2: subido de 50. Misma 1 petición por scan (sin coste extra), pero mantiene en cobertura a más tokens abiertos antes de que se caigan del top por volumen y dejen de recibir precio
+      + `&offset=0&limit=50`;    // v6.15.6: vuelto a 50 (limit=100 doblaba CUs por request y causaba 429 en plan Lite)
     const res = await fetch(url, {
       headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
       signal: AbortSignal.timeout(10000),
@@ -858,8 +858,6 @@ async function momentumScan() {
       });
       state.stats.mom_pending = state.momPending.size;
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-      // v6.15.5: escalonar 1s por señal para evitar ráfaga de birdeyeFreshPrice (todos a la vez → 429)
-      const delay = MOM_PENDING_TIMEOUT_MS + (totalSignals - 1) * 1_000;
       setTimeout(async () => {
         if (!state.momPending.has(mint)) return;
         const pending = state.momPending.get(mint);
@@ -899,7 +897,7 @@ async function momentumScan() {
         addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${secondPrice.toFixed(8)} (movió ${(move*100).toFixed(2)}%)`, "accept");
         state.stats.mom_entered++;
         momActivateFromPending(mint, secondPrice, 0);
-      }, delay);
+      }, MOM_PENDING_TIMEOUT_MS);
       broadcast({ event: "stats", data: state.stats });
     }
     addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
