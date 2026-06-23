@@ -44,10 +44,18 @@ const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6
 // ABRE de verdad. Escribe una línea [REC] al cerrar el trade, con cierre_real = el
 // pnl REAL ejecutado por la gestión (no una simulación). Datos superiores: recorrido
 // real del trade + la salida que de verdad hizo el bot. Solo migración.
-const LIVE_RECORD = true;             // ⬅️ grabar las entradas reales mientras opera
+const LIVE_RECORD = true;             // ⬅️ grabar las entradas reales de MIGRACIÓN mientras opera
 const LIVE_REC_DENSE_MS = 60_000;     // primeros 60s: muestreo denso (donde el trailing trabaja)
 const LIVE_REC_DENSE_INTERVAL = 2_000;// cada 2s en la fase densa
 const LIVE_REC_NORMAL_INTERVAL = 5_000;// cada 5s después
+// ── v6.15.4: GRABACIÓN DE MOMENTUM ([MOMREC]) ──────────────────────
+// Igual idea que la de migración pero para momentum: graba el recorrido en % de
+// cada trade que abre y escribe una línea [MOMREC] al cerrar, con cierre_real = el
+// pnl REAL ejecutado. Sirve para decidir con datos el breakeven óptimo (grupo A vs B:
+// las que mueren en breakeven, ¿siguieron cayendo o solo bachearon?). El feed de
+// momentum es el scan cada 15s, así que la resolución es de ~15s (no tick a tick).
+// Funciones momRec* SEPARADAS: no tocan nada de migración.
+const MOM_RECORD = true;              // ⬅️ poner false para dejar de grabar momentum
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
 const OBS_RECORD_MS = 600_000;        // v6.15.3: grabar 10 min por token (era 4 min). Cubre el pico y la reversión de migración sin grabar la cola muerta del trade de 15 min
@@ -642,9 +650,72 @@ function liveRecFinish(mint, cierreRealPct) {
   const cr = +(+cierreRealPct).toFixed(1);
   const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
   addLog(
-    `[LIVEREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
+    `[MIGREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
     `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
     `cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
+    `pts=${ptsRaw}`,
+    "rec"
+  );
+}
+
+// ── v6.15.4: GRABACIÓN DE MOMENTUM (aislada, no toca migración) ──
+// momMonitored guarda el token; arrancamos al activar el trade.
+function momRecStart(mint, symbol, entryPrice, meta) {
+  if (!MOM_RECORD || entryPrice <= 0) return;
+  const rec = {
+    mint, symbol,
+    pct1h: meta?.pct1h ?? null,
+    vol1h: meta?.vol1h ?? null,
+    mc: meta?.mc ?? (entryPrice * 1_000_000_000),
+    t0: Date.now(),
+    entryPrice,
+    puntos: [{ t: 0, p: 0 }],
+    lastSample: Date.now(),
+    finished: false,
+  };
+  state.liveRecordings.set(mint, rec);   // comparte el Map, pero clave distinta por mint
+}
+
+function momRecSample(mint, price) {
+  if (!MOM_RECORD) return;
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || rec.finished || price <= 0) return;
+  // El feed de momentum es el scan (~15s); muestreamos cada vez que llega un precio,
+  // sin sub-intervalo: la propia frecuencia del scan marca el ritmo.
+  const dt = Date.now() - rec.t0;
+  const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
+  const last = rec.puntos[rec.puntos.length - 1];
+  if (last && last.t === Math.round(dt / 1000)) return;   // evita duplicar el mismo segundo
+  rec.puntos.push({ t: Math.round(dt / 1000), p: pct });
+}
+
+function momRecFinish(mint, cierreRealPct) {
+  if (!MOM_RECORD) return;
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  rec.finished = true;
+  state.liveRecordings.delete(mint);
+  const pts = rec.puntos;
+  if (pts.length < 2) return;   // sin recorrido útil
+  let min = pts[0], max = pts[0];
+  for (const pt of pts) { if (pt.p < min.p) min = pt; if (pt.p > max.p) max = pt; }
+  const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
+  // Cruces en los umbrales relevantes de momentum: breakeven (+3), lock (+5), TP (+6)
+  const cruces = [3, 5, 6].map(u => {
+    let c = 0;
+    for (let i = 1; i < pts.length; i++) if (pts[i - 1].p < u && pts[i].p >= u) c++;
+    return c;
+  });
+  // Clave para decidir el breakeven: ¿cuánto cayó DESPUÉS de tocar su máximo?
+  // (grupo A: siguió cayendo, el breakeven la salvó · grupo B: solo bacheó, la estranguló)
+  let minTrasMax = max.p;
+  for (const pt of pts) { if (pt.t > max.t && pt.p < minTrasMax) minTrasMax = pt.p; }
+  const cr = +(+cierreRealPct).toFixed(1);
+  const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
+  addLog(
+    `[MOMREC] sym=${rec.symbol} pct1h=${rec.pct1h ?? "?"} MC=${formatMC(rec.mc)} ` +
+    `MAX=${max.p}%@${max.t}s MIN=${min.p}%@${min.t}s minTrasMax=${minTrasMax}% orden=${orden} ` +
+    `cruces[3,5,6]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
     `pts=${ptsRaw}`,
     "rec"
   );
@@ -867,6 +938,7 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
     detectedAt: Date.now(), lastUpdate: Date.now(),
   });
   broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
+  momRecStart(mint, pending.symbol, entryPrice, { pct1h: pending.pct1h, vol1h: pending.vol1h, mc: pending.mc }); // v6.15.4: grabar recorrido
   openDemoTrade(signal);
   openRealTrade(signal);
 }
@@ -883,6 +955,7 @@ function momUpdatePrice(mint, price, solAmount) {
   token.priceLow = Math.min(token.priceLow, price);
   if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
   token.lastUpdate = Date.now();
+  momRecSample(mint, price);   // v6.15.4: muestrear el recorrido del trade de momentum
   updateDemoTrades(mint, price, "momentum");
   updateRealTrades(mint, price, "momentum");
   broadcast({ event: "momTokenUpdate", data: token });
@@ -1299,6 +1372,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     state.stats[`mig_mov_${bucket}_${wl}`]++;
   }
   if (isMig(trade.strategy)) liveRecFinish(trade.mint, trade.pnlPct);
+  if (trade.strategy === "momentum") momRecFinish(trade.mint, trade.pnlPct);  // v6.15.4: [MOMREC] con cierre real
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
@@ -1428,7 +1502,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.3 — OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} (graba ${OBS_RECORD_MS/60000}min, muestreo 2s/3s/5s, gestión desacoplada). Migración NO opera mientras observa. Momentum scan ${MOM_SCAN_MS/1000}s.`);
+  console.log(`🚀 SolScanBot v6.15.4 — grabación momentum [MOMREC] ${MOM_RECORD ? "ON" : "off"} (recorrido + cierre real, para decidir breakeven con datos) | etiquetas: [MIGREC]/[MOMREC]/[REC] | OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | momentum scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
