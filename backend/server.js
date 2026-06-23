@@ -37,7 +37,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
+const OBSERVER_MODE = false;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
 // ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
 // A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
 // operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
