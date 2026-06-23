@@ -107,7 +107,7 @@ const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
-const MOM_SCAN_MS = 15_000;       // v6.15.2: bajado de 30s. El scan es el ÚNICO feed de los trades abiertos de momentum (momUpdatePrice se llama desde aquí); a 30s las medianas que suben +4 y se desinflan se gestionaban a ciegas. A 15s el trailing ve la bajada antes. Coste: x2 llamadas/min a Birdeye
+const MOM_SCAN_MS = 30_000;       // v6.15.5: vuelto a 30s (15s duplicaba los 429 en plan $40 Birdeye)
 const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
@@ -564,7 +564,9 @@ function obsFinishRecording(mint) {
     if (pt.p > max.p) max = pt;
   }
   const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
-  const cruces = [10, 15, 20].map(u => {
+  // v6.15.5: cruces actualizados a [50,70,100] (umbrales relevantes con armado+70)
+  // +50: zona de aproximación al armado · +70: arma el trailing · +100: suelo +65%
+  const cruces = [50, 70, 100].map(u => {
     let c = 0;
     for (let i = 1; i < pts.length; i++) {
       if (pts[i - 1].p < u && pts[i].p >= u) c++;
@@ -577,21 +579,32 @@ function obsFinishRecording(mint) {
   addLog(
     `[REC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
     `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
-    `cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cierreReal>=0?"+":""}${cierreReal}% ` +
+    `cruces[50,70,100]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cierreReal>=0?"+":""}${cierreReal}% ` +
     `pts=${ptsRaw}`,
     "rec"
   );
 }
 
 function obsSimulaGestionActual(pts) {
-  const STEP_TRIGGER = 20, STEP_FLOOR = 13;
-  let armed = false, maxSeen = 0, sl = -18;
+  // v6.15.5: actualizado a la gestión REAL del server (era v6.10: armado+20, SL-18).
+  // Parámetros actuales: armado+70 (LOCK/STEP_TRIGGER), SL-20, trailing -8%(60-100) / -5%(+100)
+  // Suelo +13% (STEP_FLOOR) y suelo +65% (TOP_FLOOR al tocar +100) incluidos.
+  // Los tramos -15% y -12% son código muerto con armado+70 (cuando arma, MAX ya >=70),
+  // pero se incluyen por fidelidad al código real por si algún token arma justo en +70.
+  const STEP_TRIGGER = 70, STEP_FLOOR = 13;
+  const TOP_FLOOR_TRIGGER = 100, TOP_FLOOR = 65;
+  let armed = false, topFloor = false, maxSeen = 0, sl = -20;
   for (const pt of pts) {
     maxSeen = Math.max(maxSeen, pt.p);
     if (!armed && maxSeen >= STEP_TRIGGER) armed = true;
+    if (!topFloor && maxSeen >= TOP_FLOOR_TRIGGER) topFloor = true;
     if (armed) {
+      // trailing escalonado idéntico al server (MIG_TRAIL_T1/T2/T3/P1/P2/P3/P4)
       const trail = maxSeen >= 100 ? 5 : maxSeen >= 60 ? 8 : maxSeen >= 40 ? 12 : 15;
       sl = Math.max(sl, maxSeen - trail, STEP_FLOOR);
+    }
+    if (topFloor) {
+      sl = Math.max(sl, TOP_FLOOR);  // suelo +65% una vez tocado +100
     }
     if (pt.p <= sl) return +sl.toFixed(1);
   }
@@ -845,6 +858,8 @@ async function momentumScan() {
       });
       state.stats.mom_pending = state.momPending.size;
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+      // v6.15.5: escalonar 1s por señal para evitar ráfaga de birdeyeFreshPrice (todos a la vez → 429)
+      const delay = MOM_PENDING_TIMEOUT_MS + (totalSignals - 1) * 1_000;
       setTimeout(async () => {
         if (!state.momPending.has(mint)) return;
         const pending = state.momPending.get(mint);
@@ -884,7 +899,7 @@ async function momentumScan() {
         addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${secondPrice.toFixed(8)} (movió ${(move*100).toFixed(2)}%)`, "accept");
         state.stats.mom_entered++;
         momActivateFromPending(mint, secondPrice, 0);
-      }, MOM_PENDING_TIMEOUT_MS);
+      }, delay);
       broadcast({ event: "stats", data: state.stats });
     }
     addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
