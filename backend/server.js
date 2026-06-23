@@ -95,7 +95,7 @@ const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
-const MOM_SCAN_MS = 30_000;
+const MOM_SCAN_MS = 15_000;       // v6.15.2: bajado de 30s. El scan es el ÚNICO feed de los trades abiertos de momentum (momUpdatePrice se llama desde aquí); a 30s las medianas que suben +4 y se desinflan se gestionaban a ciegas. A 15s el trailing ve la bajada antes. Coste: x2 llamadas/min a Birdeye
 const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
@@ -707,7 +707,7 @@ async function momentumScan() {
     const url = `${BIRDEYE_TOKEN_LIST}?sort_by=volume_1h_usd&sort_type=desc`
       + `&min_liquidity=${MOM_MIN_LIQUIDITY}`
       + `&min_market_cap=${MOM_MIN_MC}&max_market_cap=${MOM_MAX_MC}`
-      + `&offset=0&limit=50`;
+      + `&offset=0&limit=100`;   // v6.15.2: subido de 50. Misma 1 petición por scan (sin coste extra), pero mantiene en cobertura a más tokens abiertos antes de que se caigan del top por volumen y dejen de recibir precio
     const res = await fetch(url, {
       headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
       signal: AbortSignal.timeout(10000),
@@ -1421,7 +1421,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.1 — v6.15 + fix 0%=win (closeDemoTrade rama SL: >=0 → >0). Win rate honesto, P&L sin cambios.`);
+  console.log(`🚀 SolScanBot v6.15.2 — v6.15.1 + scan momentum ${MOM_SCAN_MS/1000}s (era 30s) + limit 100 (era 50). Menos ceguera en trades abiertos. Coste Birdeye x2.`);
   loadState();
   initWallet();
   connectPumpPortal();
