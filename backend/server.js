@@ -37,7 +37,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = false;          // ⬅️ poner true para el día de recolección
+const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
 // ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
 // A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
 // operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
@@ -50,10 +50,14 @@ const LIVE_REC_DENSE_INTERVAL = 2_000;// cada 2s en la fase densa
 const LIVE_REC_NORMAL_INTERVAL = 5_000;// cada 5s después
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
-const OBS_RECORD_MS = 240_000;        // grabar 4 min por token
-const OBS_DENSE_MS = 30_000;          // primeros 30s: muestreo denso
-const OBS_DENSE_INTERVAL = 2_000;     // cada 2s en la fase densa
-const OBS_NORMAL_INTERVAL = 5_000;    // cada 5s de 30s a 240s
+const OBS_RECORD_MS = 600_000;        // v6.15.3: grabar 10 min por token (era 4 min). Cubre el pico y la reversión de migración sin grabar la cola muerta del trade de 15 min
+// v6.15.3: muestreo escalonado en 3 tramos. Más resolución donde el trailing/armado
+// trabajan (subida y pico), menos en la cola. ~170 pts/token (los pts pesan nada).
+const OBS_T1_MS = 60_000;             // tramo 1: primeros 60s (entrada + primer impulso, donde se decide mov2s)
+const OBS_T1_INTERVAL = 2_000;        //   → cada 2s
+const OBS_T2_MS = 300_000;            // tramo 2: 60s-300s (zona del pico y el armado, lo que se re-optimiza)
+const OBS_T2_INTERVAL = 3_000;        //   → cada 3s
+const OBS_T3_INTERVAL = 5_000;        // tramo 3: 300s-600s (cola: solo confirma si aguantó) → cada 5s
 const MIG_BREAKEVEN_AT = 0.99;    // v6.15: DESACTIVADO en migración. Antes valía 0.22 y quedaba inactivo porque LOCK (+20%) < 0.22. Ahora LOCK es +70%, así que para mantener la rama breakeven inactiva (el armado tardío NO debe proteger a breakeven antes de +70%) lo subimos por encima del lock. La rama existe para momentum, que usa MOM_BREAKEVEN_AT. No tocar sin revisar ambas estrategias.
 const MIG_BREAKEVEN_MARGIN = 0.03; // (solo aplicaría si el breakeven de migración estuviera activo, que no lo está)
 const MIG_LOCK_AT = 0.70;         // v6.15: following a +70% (armado tardío; era +20%)
@@ -519,7 +523,7 @@ function obsStartRecording(entry, entryPrice, velMs) {
   };
   state.obsRecordings.set(entry.mint, rec);
   state.stats.mig_entered++;
-  addLog(`🔬 OBS GRABANDO: ${entry.symbol} | vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} — 4min`, "accept");
+  addLog(`🔬 OBS GRABANDO: ${entry.symbol} | vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} — ${OBS_RECORD_MS/60000}min`, "accept");
   rec.timer = setTimeout(() => obsFinishRecording(entry.mint), OBS_RECORD_MS);
 }
 
@@ -527,7 +531,10 @@ function obsSample(mint, price) {
   const rec = state.obsRecordings.get(mint);
   if (!rec || rec.finished) return;
   const dt = Date.now() - rec.t0;
-  const interval = dt <= OBS_DENSE_MS ? OBS_DENSE_INTERVAL : OBS_NORMAL_INTERVAL;
+  // v6.15.3: muestreo escalonado en 3 tramos (denso al principio, basto en la cola)
+  const interval = dt <= OBS_T1_MS ? OBS_T1_INTERVAL
+                 : dt <= OBS_T2_MS ? OBS_T2_INTERVAL
+                 : OBS_T3_INTERVAL;
   if (Date.now() - rec.lastSample < interval) return;
   rec.lastSample = Date.now();
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
@@ -1421,7 +1428,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.2 — v6.15.1 + scan momentum ${MOM_SCAN_MS/1000}s (era 30s) + limit 100 (era 50). Menos ceguera en trades abiertos. Coste Birdeye x2.`);
+  console.log(`🚀 SolScanBot v6.15.3 — OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} (graba ${OBS_RECORD_MS/60000}min, muestreo 2s/3s/5s, gestión desacoplada). Migración NO opera mientras observa. Momentum scan ${MOM_SCAN_MS/1000}s.`);
   loadState();
   initWallet();
   connectPumpPortal();
