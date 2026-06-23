@@ -38,6 +38,16 @@ const MIG_MAX_MC = 2_000_000;
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
 const OBSERVER_MODE = false;          // ⬅️ poner true para el día de recolección
+// ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
+// A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
+// operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
+// ABRE de verdad. Escribe una línea [REC] al cerrar el trade, con cierre_real = el
+// pnl REAL ejecutado por la gestión (no una simulación). Datos superiores: recorrido
+// real del trade + la salida que de verdad hizo el bot. Solo migración.
+const LIVE_RECORD = true;             // ⬅️ grabar las entradas reales mientras opera
+const LIVE_REC_DENSE_MS = 60_000;     // primeros 60s: muestreo denso (donde el trailing trabaja)
+const LIVE_REC_DENSE_INTERVAL = 2_000;// cada 2s en la fase densa
+const LIVE_REC_NORMAL_INTERVAL = 5_000;// cada 5s después
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
 const OBS_RECORD_MS = 240_000;        // grabar 4 min por token
@@ -142,6 +152,7 @@ const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
   obsRecordings: new Map(),  // modo observador: mint → {symbol, vel, mc, vol, t0, entryPrice, puntos:[], mov2s, ...}
+  liveRecordings: new Map(), // v6.15: grabación en vivo de trades reales (demo). mint → {symbol, t0, entryPrice, puntos:[], mov2s, vel, mc, vol}
   momPending: new Map(),
   momMonitored: new Map(),
   signals: [],
@@ -606,9 +617,73 @@ function obsSimulaGestionActual(pts) {
   return +pts[pts.length - 1].p.toFixed(1);  // no tocó stop: cierra al último precio
 }
 
+// ── v6.15: GRABACIÓN EN VIVO ───────────────────────────────────────
+// Arranca al abrir un trade real (demo). Graba el recorrido en % vs entrada.
+function liveRecStart(entry, entryPrice) {
+  if (!LIVE_RECORD || entryPrice <= 0) return;
+  const velMs = entry.qualStartPrice != null ? (Date.now() - entry.startTime) : (Date.now() - entry.startTime);
+  const rec = {
+    mint: entry.mint, symbol: entry.symbol,
+    vel: +(velMs / 1000).toFixed(1),
+    mc: entry.migratedMcUsd || (entryPrice * 1_000_000_000),
+    vol: Math.round(entry.volumeUSD || 0),
+    t0: Date.now(),
+    entryPrice,
+    puntos: [{ t: 0, p: 0 }],
+    lastSample: Date.now(),
+    mov2s: null,
+    finished: false,
+  };
+  state.liveRecordings.set(entry.mint, rec);
+}
+
+// Se llama desde migUpdatePrice en cada tick de un trade abierto.
+function liveRecSample(mint, price) {
+  if (!LIVE_RECORD) return;
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || rec.finished || price <= 0) return;
+  const dt = Date.now() - rec.t0;
+  const interval = dt <= LIVE_REC_DENSE_MS ? LIVE_REC_DENSE_INTERVAL : LIVE_REC_NORMAL_INTERVAL;
+  if (Date.now() - rec.lastSample < interval) return;
+  rec.lastSample = Date.now();
+  const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
+  rec.puntos.push({ t: Math.round(dt / 1000), p: pct });
+  if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
+}
+
+// Se llama desde closeDemoTrade. Escribe la línea [REC] con el cierre REAL ejecutado.
+function liveRecFinish(mint, cierreRealPct) {
+  if (!LIVE_RECORD) return;
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  rec.finished = true;
+  state.liveRecordings.delete(mint);
+  const pts = rec.puntos;
+  if (pts.length < 2) return;   // sin recorrido útil, no escribir
+  let min = pts[0], max = pts[0];
+  for (const pt of pts) { if (pt.p < min.p) min = pt; if (pt.p > max.p) max = pt; }
+  const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
+  const cruces = [10, 15, 20].map(u => {
+    let c = 0;
+    for (let i = 1; i < pts.length; i++) if (pts[i - 1].p < u && pts[i].p >= u) c++;
+    return c;
+  });
+  const mov2s = rec.mov2s === null ? "n/a" : `${rec.mov2s >= 0 ? "+" : ""}${rec.mov2s}%`;
+  const cr = +(+cierreRealPct).toFixed(1);
+  const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
+  addLog(
+    `[LIVEREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
+    `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
+    `cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
+    `pts=${ptsRaw}`,
+    "rec"
+  );
+}
+
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
+  liveRecStart(entry, price);   // v6.15: arrancar grabación en vivo del recorrido
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`,
     strategy: "migration",
@@ -651,6 +726,7 @@ function migUpdatePrice(mint, price, solAmount) {
   token.priceLow = Math.min(token.priceLow, price);
   token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD;
   token.lastUpdate = Date.now();
+  liveRecSample(mint, price);   // v6.15: muestrear el recorrido del trade en vivo
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
   broadcast({ event: "migTokenUpdate", data: token });
@@ -1303,6 +1379,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     const wl = trade.result === "WIN" ? "win" : "loss";
     state.stats[`mig_mov_${bucket}_${wl}`]++;
   }
+  if (isMig(trade.strategy)) liveRecFinish(trade.mint, trade.pnlPct);  // v6.15: [LIVEREC] con cierre real
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
