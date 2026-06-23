@@ -111,15 +111,15 @@ const MOM_SCAN_MS = 30_000;       // v6.15.5: vuelto a 30s (15s duplicaba los 42
 const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
-const MOM_MAX_ENTRY_DRIFT = 0.04;     // v6.12: si el precio fresco se alejó >4% del de la señal, NO entrar (la vela ya se movió)
-const MOM_MUTE_COOLDOWN_MS = 15 * 60_000; // v6.12: 15 min sin reentrar un token que expiró mudo
-const MOM_MUTE_CHECK_MS = 5_000;      // v6.13 Capa 2: separación entre las dos lecturas de precio en la entrada
-const MOM_MUTE_MIN_MOVE = 0.003;      // v6.13 Capa 2: <0.3% de cambio en esa ventana => mudo, no entrar
+const MOM_MUTE_CHECK_MS = 5_000;       // v6.15.7: espera 5s tras la señal antes del check de mudo
+const MOM_MUTE_MIN_MOVE = 0.0005;      // v6.15.7: <0.05% en 5s = feed muerto, no entra
+// (MOM_MAX_ENTRY_DRIFT y MOM_MUTE_COOLDOWN_MS eliminados en v6.15.7)
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
+
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;
 const MOM_FOLLOW_PCT = 0.02;
-const MOM_PENDING_TIMEOUT_MS = 15_000;
+// MOM_PENDING_TIMEOUT_MS eliminado en v6.15.7 (reemplazado por MOM_MUTE_CHECK_MS)
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
 
@@ -180,11 +180,11 @@ const state = {
     mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
     mom_scanned: 0, mom_signals: 0, mom_pending: 0,
     // v6.13: contadores de filtrado de entrada (para medir qué frena cada capa)
-    mom_entered: 0,           // señales que pasaron TODO y abrieron operación
+
     mom_disc_liquidity: 0,    // Capa 1: descartadas en scan por liquidez baja/desconocida
-    mom_disc_drift: 0,        // descartadas por drift (precio ya movido)
+
     mom_disc_mute: 0,         // Capa 2: descartadas por precio mudo en entrada
-    mom_disc_noprice: 0,      // descartadas por no obtener precio fresco
+
     // v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración.
     // Para validar si la dirección temprana predice el resultado (hallazgo del doc).
     mig_mov_up_win: 0,    mig_mov_up_loss: 0,    // mov2s > 0 (subió en 2s)
@@ -838,11 +838,6 @@ async function momentumScan() {
       }
       if (pct1h < MOM_MIN_PCT_1H) continue;
       if (pct1h > MOM_MAX_PCT_1H) continue;
-      // ── v6.12 Fix B: saltar tokens que expiraron mudos hace poco ──
-      const muteAt = momMuteCooldown.get(mint) || 0;
-      if (Date.now() - muteAt < MOM_MUTE_COOLDOWN_MS) {
-        continue;
-      }
       const lastSig = momSignalCooldown.get(mint) || 0;
       if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
       seenMomPools.add(poolAddr);
@@ -855,49 +850,33 @@ async function momentumScan() {
         mint, symbol, name: symbol,
         geckoPrice: bePrice, mc, vol1h, pct1h,
         pendingSince: Date.now(),
+        scanPrice: bePrice,  // precio del scan para el check de mudo
       });
       state.stats.mom_pending = state.momPending.size;
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+      // v6.15.7: lógica v6.10 — sin drift, sin cooldown de mudos.
+      // Solo check de mudo: espera 5s, pide 1 precio a Birdeye.
+      // Si movió >0.05% → token vivo → entra. Si no → feed muerto → no entra.
+      // 1 sola llamada a /defi/price por señal (vs 2 antes). Sin llamadas si hay señales repetidas.
       setTimeout(async () => {
         if (!state.momPending.has(mint)) return;
         const pending = state.momPending.get(mint);
-        // ── v6.12 Fix A: precio fresco + validación de drift ──
-        const freshPrice = await birdeyeFreshPrice(mint);
-        if (!freshPrice) {
-          addLog(`⛔ MOM sin precio fresco: ${pending.symbol} — no entra`, "filter");
-          state.stats.mom_disc_noprice++;
-          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
+        const checkPrice = await birdeyeFreshPrice(mint);
+        if (!checkPrice) {
+          addLog(`⚡ ENTRADA birdeye: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
+          momActivateFromPending(mint, pending.geckoPrice, 0);
           return;
         }
-        const drift = Math.abs(freshPrice - pending.geckoPrice) / pending.geckoPrice;
-        if (drift > MOM_MAX_ENTRY_DRIFT) {
-          addLog(`⛔ MOM drift ${(drift*100).toFixed(1)}% (${pending.symbol}) — la vela ya se movió, NO entra`, "filter");
-          state.stats.mom_disc_drift++;
-          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
-          return;
-        }
-        // ── v6.13 Capa 2: confirmar que el precio se MUEVE ──
-        await new Promise(r => setTimeout(r, MOM_MUTE_CHECK_MS));
-        if (!state.momPending.has(mint)) return;
-        const secondPrice = await birdeyeFreshPrice(mint);
-        if (!secondPrice) {
-          addLog(`⛔ MOM 2ª lectura sin precio: ${pending.symbol} — no entra`, "filter");
-          state.stats.mom_disc_noprice++;
-          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
-          return;
-        }
-        const move = Math.abs(secondPrice - freshPrice) / freshPrice;
+        const move = Math.abs(checkPrice - pending.scanPrice) / pending.scanPrice;
         if (move < MOM_MUTE_MIN_MOVE) {
-          addLog(`🔇 MOM MUDO en entrada: ${pending.symbol} — precio movió ${(move*100).toFixed(2)}% en ${MOM_MUTE_CHECK_MS/1000}s, NO entra`, "filter");
+          addLog(`🔇 MOM MUDO: ${pending.symbol} — precio movió ${(move*100).toFixed(3)}% en 5s, NO entra`, "filter");
           state.stats.mom_disc_mute++;
-          momMuteCooldown.set(mint, Date.now());
           state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
           return;
         }
-        addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${secondPrice.toFixed(8)} (movió ${(move*100).toFixed(2)}%)`, "accept");
-        state.stats.mom_entered++;
-        momActivateFromPending(mint, secondPrice, 0);
-      }, MOM_PENDING_TIMEOUT_MS);
+        addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${checkPrice.toFixed(8)} (movió ${(move*100).toFixed(3)}%)`, "accept");
+        momActivateFromPending(mint, checkPrice, 0);
+      }, MOM_MUTE_CHECK_MS);
       broadcast({ event: "stats", data: state.stats });
     }
     addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
@@ -1515,7 +1494,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.4 — grabación momentum [MOMREC] ${MOM_RECORD ? "ON" : "off"} (recorrido + cierre real, para decidir breakeven con datos) | etiquetas: [MIGREC]/[MOMREC]/[REC] | OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | momentum scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.15.7 — momentum v6.10: sin drift, sin cooldown mudos. Check mudo: 5s / 0.05% / 1 llamada Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
