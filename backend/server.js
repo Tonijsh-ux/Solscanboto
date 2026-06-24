@@ -37,7 +37,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = false;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
+const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
 // ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
 // A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
 // operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
@@ -117,7 +117,7 @@ const MOM_MUTE_MIN_MOVE = 0.0005;      // v6.15.7: <0.05% en 5s = feed muerto, n
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 
 const MOM_BREAKEVEN_AT = 0.03;
-const MOM_LOCK_AT = 0.05;
+const MOM_LOCK_AT = 0.03;   // v6.15.8: bajado de 0.05→0.03; análisis de 714 MOMREC: 47 losses subieron a +3%+ antes de caer, con lock=3% habrían cerrado en ~+1%; SL sin tocar (slippage 30s hace -3% teórico = -4.64% real)
 const MOM_FOLLOW_PCT = 0.02;
 // MOM_PENDING_TIMEOUT_MS eliminado en v6.15.7 (reemplazado por MOM_MUTE_CHECK_MS)
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
@@ -1494,7 +1494,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.7 — momentum v6.10: sin drift, sin cooldown mudos. Check mudo: 5s / 0.05% / 1 llamada Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.15.8 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
