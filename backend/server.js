@@ -14,10 +14,14 @@ import {
 import bs58 from "bs58";
 
 const PORT = process.env.PORT || 3001;
-const SOL_PER_TRADE = 0.09;          // v6.15.9+: 0.09 SOL por posición (~$6.30 con SOL a $70) para experimento real con 15 simultáneas
+const SOL_PER_TRADE_MIG = 0.15;      // v6.15.9+: 0.15 SOL por posición de migración (~$10.50 con SOL a $70)
+const SOL_PER_TRADE_MOM = 0.08;      // v6.15.9+: 0.08 SOL por posición de momentum (~$5.60 con SOL a $70)
+const SOL_PER_TRADE = 0.08;          // fallback (no se usa directamente)
 const MAX_REAL_TRADES = 15;           // v6.15.9+: hasta 15 posiciones simultáneas
+const MAX_MIG_REAL = 2;               // máximo 2 trades reales de migración simultáneos
+const MAX_MOM_REAL = 13;              // máximo 13 trades reales de momentum simultáneos
 // Estrategias que pueden operar en REAL. El resto sigue solo en demo aunque MAX_REAL_TRADES>0.
-const REAL_STRATEGIES = ["momentum"]; // v6.15.9+: momentum activado en real
+const REAL_STRATEGIES = ["migration", "momentum"]; // v6.15.9+: ambas estrategias en real
 const STATE_FILE = "/tmp/solscanbot_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
@@ -117,7 +121,14 @@ function initWallet() {
 
 async function getWalletBalance() {
   if (!wallet || !connection) return 0;
-  try { return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL; } catch { return 0; }
+  for (let i = 0; i < 3; i++) {
+    try { return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL; }
+    catch (e) {
+      if (i < 2) { await new Promise(r => setTimeout(r, 2000)); }
+      else { addLog(`⚠️ getWalletBalance falló 3 veces: ${e.message}`, "warn"); return 0; }
+    }
+  }
+  return 0;
 }
 
 async function getTokenBalance(mint) {
@@ -278,6 +289,11 @@ async function updateSolPrice() {
     if (px > 0) { solPriceUSD = px; solPriceReady = true; addLog(`ℹ️ SOL price vía Jupiter: $${px}`, "info"); return; }
   } catch (e) { addLog(`⚠️ SOL price Jupiter también falló: ${e.message}`, "warn"); }
   addLog(`⚠️ SOL price sin actualizar, sigo con $${solPriceUSD}`, "warn");
+  // v6.15.9+: activar fallback para no bloquear operativa
+  if (!solPriceReady) {
+    solPriceReady = true;
+    addLog(`⚠️ Usando SOL price fallback $${solPriceUSD} — operativa desbloqueada`, "warn");
+  }
 }
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
@@ -883,18 +899,23 @@ async function openRealTrade(signal) {
   if (!wallet) return;
   if (!REAL_STRATEGIES.includes(signal.strategy)) return;
   const openReal = state.realTrades.filter(t => t.status === "OPEN");
-  const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
-  if (stratOpen >= 1) { addLog(`⚠️ Ya hay real abierta (${signal.strategy})`, "warn"); return; }
   if (openReal.length >= MAX_REAL_TRADES) return;
+  // Límite por estrategia
+  const isMigSignal = isMig(signal.strategy);
+  const stratMax = isMigSignal ? MAX_MIG_REAL : MAX_MOM_REAL;
+  const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
+  if (stratOpen >= stratMax) { addLog(`⚠️ Límite real [${signal.strategy}]: ${stratOpen}/${stratMax}`, "warn"); return; }
+  // SOL por estrategia
+  const solAmount = isMigSignal ? SOL_PER_TRADE_MIG : SOL_PER_TRADE_MOM;
   const balance = await getWalletBalance();
-  if (balance < SOL_PER_TRADE + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL`, "warn"); return; }
-  const sig = await buyToken(signal.mint, SOL_PER_TRADE);
+  if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${solAmount + 0.01})`, "warn"); return; }
+  const sig = await buyToken(signal.mint, solAmount);
   if (!sig) return;
   const duration = isMig(signal.strategy) ? MIG_DURATION_MS : MOM_DURATION_MS;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
-    entryPrice: signal.price, tp: signal.tp, sl: signal.sl, solAmount: SOL_PER_TRADE,
+    entryPrice: signal.price, tp: signal.tp, sl: signal.sl, solAmount: solAmount,
     buySignature: sig, sellSignature: null,
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, pnlSol: null,
@@ -908,7 +929,7 @@ async function openRealTrade(signal) {
   state.stats.walletBalance = await getWalletBalance();
   broadcast({ event: "newRealTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`🔴 REAL [${signal.strategy}]: ${signal.symbol} | ${SOL_PER_TRADE} SOL`, "real");
+  addLog(`🔴 REAL [${signal.strategy}]: ${signal.symbol} | ${solAmount} SOL`, "real");
   saveState();
 }
 
@@ -1361,7 +1382,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.9+ — momentum REAL activado | 15 posiciones | 0.09 SOL/trade | tracking slip+fee | OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.15.9+ — MIG+MOM real | 2×MIG(0.15SOL) + 13×MOM(0.08SOL) | slip+fee tracking | SOL fallback fix | OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
