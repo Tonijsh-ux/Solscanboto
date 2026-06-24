@@ -136,7 +136,8 @@ const BIRDEYE_API_KEY = "cffc98f5aed04ad3ae4115c5e900ddbd";
 const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 
 let wallet = null;
-let connection = null;
+let connection = null;       // Helius — para enviar transacciones
+let balanceConn = null;      // RPC público — solo para leer balance
 let pumpPortalWs = null;
 
 function initWallet() {
@@ -146,6 +147,7 @@ function initWallet() {
     const privateKeyBytes = bs58.decode(privateKeyStr);
     wallet = Keypair.fromSecretKey(privateKeyBytes);
     connection = new Connection(SOLANA_RPC, "confirmed");
+    balanceConn = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
     addLog(`✅ Wallet: ${wallet.publicKey.toString()}`, "info");
   } catch (e) { addLog(`❌ Wallet error: ${e.message}`, "error"); }
 }
@@ -160,7 +162,8 @@ async function getWalletBalance(force = false) {
   if (!force && now - lastBalanceFetch < BALANCE_CACHE_MS) return cachedBalance;
   for (let i = 0; i < 3; i++) {
     try {
-      cachedBalance = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+      const conn = balanceConn || connection;
+      cachedBalance = (await conn.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
       lastBalanceFetch = Date.now();
       return cachedBalance;
     }
@@ -1529,7 +1532,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.16.2 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.16.3 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
