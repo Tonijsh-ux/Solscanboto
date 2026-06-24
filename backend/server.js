@@ -14,20 +14,21 @@ import {
 import bs58 from "bs58";
 
 const PORT = process.env.PORT || 3001;
-const SOL_PER_TRADE_MIG = 0.15;      // v6.15.9+: 0.15 SOL por posición de migración (~$10.50 con SOL a $70)
-const SOL_PER_TRADE_MOM = 0.08;      // v6.15.9+: 0.08 SOL por posición de momentum (~$5.60 con SOL a $70)
-const SOL_PER_TRADE = 0.08;          // fallback (no se usa directamente)
-const MAX_REAL_TRADES = 15;           // v6.15.9+: hasta 15 posiciones simultáneas
-const MAX_MIG_REAL = 2;               // máximo 2 trades reales de migración simultáneos
-const MAX_MOM_REAL = 13;              // máximo 13 trades reales de momentum simultáneos
+const SOL_PER_TRADE_MIG = 0.15;   // 0.15 SOL por posición migración (~$10.50)
+const SOL_PER_TRADE_MOM = 0.08;   // 0.08 SOL por posición momentum (~$5.60)
+const SOL_PER_TRADE = 0.08;       // fallback
+const MAX_REAL_TRADES = 15;        // máximo 15 simultáneas en total
+const MAX_MIG_REAL = 2;            // máximo 2 reales de migración
+const MAX_MOM_REAL = 13;           // máximo 13 reales de momentum
 // Estrategias que pueden operar en REAL. El resto sigue solo en demo aunque MAX_REAL_TRADES>0.
-const REAL_STRATEGIES = ["migration", "momentum"]; // v6.15.9+: ambas estrategias en real
+// Ej: ["migration"] = solo migración en real, momentum y re-migración se quedan en demo.
+const REAL_STRATEGIES = ["migration", "momentum"];
 const STATE_FILE = "/tmp/solscanbot_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 4.00;
-const MIG_SL = 0.80;
-const MIG_DURATION_MS = 15 * 60 * 1000;
+const MIG_TP = 4.00;              // v6.15: +300% (red de seguridad alta; imprescindible con el armado tardío, si no corta los pelotazos +300%+)
+const MIG_SL = 0.80;              // v6.15: -20% (era -18%; aviso de la auditoría: bajar riesgo por op, el agregado apenas pierde)
+const MIG_DURATION_MS = 15 * 60 * 1000; // 15 min — más tiempo para el movimiento
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 2_000;
 const MIG_MIN_VOL_SLOW = 5_000;
@@ -36,43 +37,70 @@ const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
 
 // ── MODO OBSERVADOR (recogelotodo) ────────────────────────────────
-const OBSERVER_MODE = false;
-const LIVE_RECORD = true;
-const LIVE_REC_DENSE_MS = 60_000;
-const LIVE_REC_DENSE_INTERVAL = 2_000;
-const LIVE_REC_NORMAL_INTERVAL = 5_000;
-const MOM_RECORD = true;
-const OBS_MIN_VOL = 2_000;
-const OBS_MIN_MC = 20_000;
-const OBS_RECORD_MS = 600_000;
-const OBS_T1_MS = 60_000;
-const OBS_T1_INTERVAL = 2_000;
-const OBS_T2_MS = 300_000;
-const OBS_T2_INTERVAL = 3_000;
-const OBS_T3_INTERVAL = 5_000;
-const MIG_BREAKEVEN_AT = 0.99;
-const MIG_BREAKEVEN_MARGIN = 0.03;
-const MIG_LOCK_AT = 0.70;
-const MIG_FOLLOW_PCT = 0.20;
+// Día de recolección: migración entra en CASI TODO (umbral permisivo) y graba
+// el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
+// Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
+// para volver a la operativa normal. NO toca momentum.
+const OBSERVER_MODE = false;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
+// ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
+// A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
+// operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
+// ABRE de verdad. Escribe una línea [REC] al cerrar el trade, con cierre_real = el
+// pnl REAL ejecutado por la gestión (no una simulación). Datos superiores: recorrido
+// real del trade + la salida que de verdad hizo el bot. Solo migración.
+const LIVE_RECORD = true;             // ⬅️ grabar las entradas reales de MIGRACIÓN mientras opera
+const LIVE_REC_DENSE_MS = 60_000;     // primeros 60s: muestreo denso (donde el trailing trabaja)
+const LIVE_REC_DENSE_INTERVAL = 2_000;// cada 2s en la fase densa
+const LIVE_REC_NORMAL_INTERVAL = 5_000;// cada 5s después
+// ── v6.15.4: GRABACIÓN DE MOMENTUM ([MOMREC]) ──────────────────────
+// Igual idea que la de migración pero para momentum: graba el recorrido en % de
+// cada trade que abre y escribe una línea [MOMREC] al cerrar, con cierre_real = el
+// pnl REAL ejecutado. Sirve para decidir con datos el breakeven óptimo (grupo A vs B:
+// las que mueren en breakeven, ¿siguieron cayendo o solo bachearon?). El feed de
+// momentum es el scan cada 15s, así que la resolución es de ~15s (no tick a tick).
+// Funciones momRec* SEPARADAS: no tocan nada de migración.
+const MOM_RECORD = true;              // ⬅️ poner false para dejar de grabar momentum
+const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
+const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
+const OBS_RECORD_MS = 600_000;        // v6.15.3: grabar 10 min por token (era 4 min). Cubre el pico y la reversión de migración sin grabar la cola muerta del trade de 15 min
+// v6.15.3: muestreo escalonado en 3 tramos. Más resolución donde el trailing/armado
+// trabajan (subida y pico), menos en la cola. ~170 pts/token (los pts pesan nada).
+const OBS_T1_MS = 60_000;             // tramo 1: primeros 60s (entrada + primer impulso, donde se decide mov2s)
+const OBS_T1_INTERVAL = 2_000;        //   → cada 2s
+const OBS_T2_MS = 300_000;            // tramo 2: 60s-300s (zona del pico y el armado, lo que se re-optimiza)
+const OBS_T2_INTERVAL = 3_000;        //   → cada 3s
+const OBS_T3_INTERVAL = 5_000;        // tramo 3: 300s-600s (cola: solo confirma si aguantó) → cada 5s
+const MIG_BREAKEVEN_AT = 0.99;    // v6.15: DESACTIVADO en migración. Antes valía 0.22 y quedaba inactivo porque LOCK (+20%) < 0.22. Ahora LOCK es +70%, así que para mantener la rama breakeven inactiva (el armado tardío NO debe proteger a breakeven antes de +70%) lo subimos por encima del lock. La rama existe para momentum, que usa MOM_BREAKEVEN_AT. No tocar sin revisar ambas estrategias.
+const MIG_BREAKEVEN_MARGIN = 0.03; // (solo aplicaría si el breakeven de migración estuviera activo, que no lo está)
+const MIG_LOCK_AT = 0.70;         // v6.15: following a +70% (armado tardío; era +20%)
+const MIG_FOLLOW_PCT = 0.20;      // trailing -20%
 const MIG_MAX_PRICE_RATIO = 2.0;
-const MIG_SL_CONFIRM_TICKS = 2;
+const MIG_SL_CONFIRM_TICKS = 2;   // v6.7: nº de ticks consecutivos bajo el SL inicial necesarios para cerrar. Un tick basura aislado (DUR 0-2s, -47% imposible) no se confirma; una caída real sí. Solo aplica al SL bajo entrada, no al piso/trailing en positivo
 const MIG_EXPIRED_WIN_PCT = 2;
-const MIG_ENTRY_DELAY_MS = 3_000;
-const MIG_QUAL_GATE = true;
-const MIG_QUAL_WINDOW_MS = 15_000;
-const MIG_MAX_CAIDA_DELAY = 0.25;
-const MIG_STEP_TRIGGER = 0.70;
-const MIG_STEP_FLOOR = 0.13;
-const MIG_FOLLOW_PCT_STEP = 0.15;
-const MIG_HARD_CAP_LOSS = -20;
-const MIG_VELO_DROP = 0.10;
-const MIG_VELO_MS = 2_000;
-const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;
-const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.12;
-const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.08;
-const MIG_TRAIL_P4 = 0.05;
-const MIG_TOP_FLOOR_TRIGGER = 100;
-const MIG_TOP_FLOOR = 0.65;
+const MIG_ENTRY_DELAY_MS = 3_000; // delay 3s antes de entrar (ahora ventana de confirmación, v6.9)
+// ── v6.15: FILTRO DE CALIDAD con entrada retrasada a 15s ──────────
+// Validado sobre observador: mov2s>0 Y pendiente15s>0 → WR 61%, +12.7/op (vs +8.9 global).
+// El bot espera 15s desde que el token pasa el umbral de volumen, mide la dirección a 2s
+// y la pendiente a 15s, y SOLO entra si ambas son positivas. La entrada es más cara (pierde
+// los primeros 15s de subida) pero evita las que se desploman en esa ventana.
+const MIG_QUAL_GATE = true;        // activar el filtro de calidad
+const MIG_QUAL_WINDOW_MS = 15_000; // ventana de evaluación de calidad
+const MIG_MAX_CAIDA_DELAY = 0.25; // v6.9: si el precio cae >25% durante la ventana de 3s, NO entrar (el token se desploma justo al abrir). Precio de entrada = precio REAL tras el delay, no el congelado
+// ── NUEVO v6.2: escalón de beneficio (de v8.4) ─────────────────
+const MIG_STEP_TRIGGER = 0.70;    // v6.15: armado tardío — al tocar +70% de beneficio...
+const MIG_STEP_FLOOR = 0.13;      // ...asegurar piso de +13%
+const MIG_FOLLOW_PCT_STEP = 0.15; // v6.5: trailing ceñido (-15%) cuando el escalón está armado (maxGain>=+20%). El trailing supera el piso +13% a partir de +15.3% (vs +41% con -20%), capturando las medianas-altas +25-40% que antes se cortaban en +13%
+// ── v6.10: cap loss duro + trailing escalonado por tramos ──
+const MIG_HARD_CAP_LOSS = -20;    // tope de pérdida duro (%). Cierre inmediato sin confirmación. Corta las caídas reales rápidas (-23/-30%) que la confirmación de 2 ticks deja ejecutar más profundo. Deja vivir los lavados de -16/-19% que se recuperan
+const MIG_VELO_DROP = 0.10;       // v6.12 Palanca 1: si el precio cae >10%...
+const MIG_VELO_MS = 2_000;        // ...en menos de 2s, vender YA (volcado vertical). Solo si está bajo entrada y sin escalón armado (no toca ganadoras)
+// Trailing escalonado: se ciñe cuanto más alto el MAX. Tramos por maxGainPct (%).
+const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;  // +20-40% → -15%
+const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.12;  // +40-60% → -12% (matiz 2: suaviza el salto)
+const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.08;  // +60-100% → -8%
+const MIG_TRAIL_P4 = 0.05;                            // +100%+ → -5%
+const MIG_TOP_FLOOR_TRIGGER = 100; // al tocar +100%...
+const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege el tramo -5% de caídas verticales que saltan ticks)
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
@@ -83,24 +111,27 @@ const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
-const MOM_SCAN_MS = 15_000;
-const MOM_MIN_LIQUIDITY = 20_000;
-const MOM_MUTE_TIMEOUT_MS = 90_000;
-const MOM_HARD_CAP_LOSS = -10;
-const MOM_MUTE_CHECK_MS = 5_000;
-const MOM_MUTE_MIN_MOVE = 0.0005;
+const MOM_SCAN_MS = 15_000;       // v6.15.9: bajado a 15s. En v6.15.5 daba 429 pero desde v6.15.7 se eliminó drift+mudo2 → mitad de llamadas → margen suficiente
+const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
+const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
+const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
+const MOM_MUTE_CHECK_MS = 5_000;       // v6.15.7: espera 5s tras la señal antes del check de mudo
+const MOM_MUTE_MIN_MOVE = 0.0005;      // v6.15.7: <0.05% en 5s = feed muerto, no entra
+// (MOM_MAX_ENTRY_DRIFT y MOM_MUTE_COOLDOWN_MS eliminados en v6.15.7)
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 
 const MOM_BREAKEVEN_AT = 0.03;
-const MOM_LOCK_AT = 0.03;
+const MOM_LOCK_AT = 0.03;   // v6.15.8: bajado de 0.05→0.03; análisis de 714 MOMREC: 47 losses subieron a +3%+ antes de caer, con lock=3% habrían cerrado en ~+1%; SL sin tocar (slippage 30s hace -3% teórico = -4.64% real)
 const MOM_FOLLOW_PCT = 0.02;
+// MOM_PENDING_TIMEOUT_MS eliminado en v6.15.7 (reemplazado por MOM_MUTE_CHECK_MS)
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
-const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data?api-key=e12mybvnahb5cx2uahup8y1rahn4ewbp99rn4j2u6h6mmy37f1c7cdakf5432kbkcctmmwkcdd37cgke718qey9ne96mpy1mdncmjmut6crkeeb5f5n7ac1gf137auudd56m4u1tcwyku6h130u3m9164cdad99rmuxjpd8b9qq4d3bddu76wu7ad270k2h7155gnbm5x0kuf8";
 const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
+// v6.6: scan de momentum por Birdeye (API key, no sufre el 429 de IP compartida de Gecko)
 const BIRDEYE_API_KEY = "cffc98f5aed04ad3ae4115c5e900ddbd";
 const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 
@@ -114,7 +145,7 @@ function initWallet() {
     if (!privateKeyStr) { addLog("⚠️ Sin WALLET_PRIVATE_KEY — modo demo", "warn"); return; }
     const privateKeyBytes = bs58.decode(privateKeyStr);
     wallet = Keypair.fromSecretKey(privateKeyBytes);
-    connection = new Connection(HELIUS_RPC, "confirmed");
+    connection = new Connection(SOLANA_RPC, "confirmed");
     addLog(`✅ Wallet: ${wallet.publicKey.toString()}`, "info");
   } catch (e) { addLog(`❌ Wallet error: ${e.message}`, "error"); }
 }
@@ -143,8 +174,8 @@ async function getTokenBalance(mint) {
 const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
-  obsRecordings: new Map(),
-  liveRecordings: new Map(),
+  obsRecordings: new Map(),  // modo observador: mint → {symbol, vel, mc, vol, t0, entryPrice, puntos:[], mov2s, ...}
+  liveRecordings: new Map(), // v6.15: grabación en vivo de trades reales (demo). mint → {symbol, t0, entryPrice, puntos:[], mov2s, vel, mc, vol}
   momPending: new Map(),
   momMonitored: new Map(),
   signals: [],
@@ -159,19 +190,21 @@ const state = {
     mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
     mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
     mom_scanned: 0, mom_signals: 0, mom_pending: 0,
-    mom_disc_liquidity: 0,
-    mom_disc_mute: 0,
-    mig_mov_up_win: 0,    mig_mov_up_loss: 0,
-    mig_mov_flat_win: 0,  mig_mov_flat_loss: 0,
-    mig_mov_down_win: 0,  mig_mov_down_loss: 0,
+    // v6.13: contadores de filtrado de entrada (para medir qué frena cada capa)
+
+    mom_disc_liquidity: 0,    // Capa 1: descartadas en scan por liquidez baja/desconocida
+
+    mom_disc_mute: 0,         // Capa 2: descartadas por precio mudo en entrada
+
+    // v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración.
+    // Para validar si la dirección temprana predice el resultado (hallazgo del doc).
+    mig_mov_up_win: 0,    mig_mov_up_loss: 0,    // mov2s > 0 (subió en 2s)
+    mig_mov_flat_win: 0,  mig_mov_flat_loss: 0,  // mov2s ~0 (plano)
+    mig_mov_down_win: 0,  mig_mov_down_loss: 0,  // mov2s < 0 (bajó en 2s)
     mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
     mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
     mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
     mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
-    // v6.15.9+: tracking de slippage real
-    mom_totalSlipFeeSol: 0,   // acumulado slip+fee en SOL
-    mom_slipFeeCount: 0,      // nº de trades con dato real
-    mom_avgSlipFeeSol: 0,     // media slip+fee por trade
     demoOpen: 0, realOpen: 0, walletBalance: 0,
   },
 };
@@ -225,7 +258,7 @@ const frontendClients = new Set();
 const seenMigMints = new Set();
 const seenMomPools = new Set();
 const momSignalCooldown = new Map();
-const momMuteCooldown = new Map();
+const momMuteCooldown = new Map();  // v6.12: mint -> timestamp del último feed mudo (no reentrar 15 min)
 
 function addLog(msg, type = "info") {
   const entry = { msg, type, time: Date.now() };
@@ -256,6 +289,7 @@ function unsubscribeToken(mint) {
   }
 }
 
+// ── calcPrice (v6.0 intacto): supply FIJO 1e9 ──────────────────
 function calcPrice(data) {
   if (data.marketCapSol && data.marketCapSol > 0) {
     return (data.marketCapSol * solPriceUSD) / 1_000_000_000;
@@ -272,24 +306,42 @@ function isPriceValid(newPrice, knownPrice) {
   return ratio >= (1 / MIG_MAX_PRICE_RATIO) && ratio <= MIG_MAX_PRICE_RATIO;
 }
 
-let solPriceUSD = 70;
-let solPriceReady = false;
+// ── NUEVO v6.2: SOL price real (de v8.4) ───────────────────────
+let solPriceUSD = 68;          // default realista; se actualiza por API
+let solPriceReady = false;     // no operar hasta tener un precio real de SOL
 async function updateSolPrice() {
+  // Intento 1: CoinGecko
   try {
     const r = await fetch(
       "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
       { signal: AbortSignal.timeout(8000) });
     const d = await r.json();
-    if (d?.solana?.usd > 0) { solPriceUSD = d.solana.usd; solPriceReady = true; return; }
-  } catch (e) { addLog(`⚠️ SOL price CoinGecko falló: ${e.message}`, "warn"); }
+    if (d?.solana?.usd > 0) {
+      solPriceUSD = d.solana.usd;
+      solPriceReady = true;
+      return;
+    }
+  } catch (e) {
+    addLog(`⚠️ SOL price CoinGecko falló: ${e.message}`, "warn");
+  }
+  // Intento 2 (respaldo): Jupiter price API
   try {
-    const r = await fetch("https://price.jup.ag/v6/price?ids=SOL", { signal: AbortSignal.timeout(8000) });
+    const r = await fetch(
+      "https://price.jup.ag/v6/price?ids=SOL",
+      { signal: AbortSignal.timeout(8000) });
     const d = await r.json();
     const px = d?.data?.SOL?.price;
-    if (px > 0) { solPriceUSD = px; solPriceReady = true; addLog(`ℹ️ SOL price vía Jupiter: $${px}`, "info"); return; }
-  } catch (e) { addLog(`⚠️ SOL price Jupiter también falló: ${e.message}`, "warn"); }
+    if (px > 0) {
+      solPriceUSD = px;
+      solPriceReady = true;
+      addLog(`ℹ️ SOL price vía Jupiter (respaldo): $${px}`, "info");
+      return;
+    }
+  } catch (e) {
+    addLog(`⚠️ SOL price Jupiter también falló: ${e.message}`, "warn");
+  }
+  // Ambas fallaron: mantener el valor anterior y AVISAR
   addLog(`⚠️ SOL price sin actualizar, sigo con $${solPriceUSD}`, "warn");
-  // v6.15.9+: activar fallback para no bloquear operativa
   if (!solPriceReady) {
     solPriceReady = true;
     addLog(`⚠️ Usando SOL price fallback $${solPriceUSD} — operativa desbloqueada`, "warn");
@@ -311,7 +363,10 @@ setInterval(async () => {
 
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
-  if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
+  if (!solPriceReady) {
+    addLog("⏳ Esperando precio real de SOL antes de operar", "warn");
+    return;
+  }
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
@@ -327,7 +382,9 @@ function migStartWatching(coin) {
     startTime: Date.now(), migratedMcUsd: mcUsd,
     volumeUSD: 0, tradeCount: 0, firstPrice: null, lastPrice: null,
     timer: null, entered: false, pendingEntry: false,
-    qualGate: false, qualStartPrice: null, qualMov2s: null,
+    qualGate: false,
+    qualStartPrice: null,
+    qualMov2s: null,
   };
   state.migWatching.set(coin.mint, entry);
   state.stats.mig_watched++;
@@ -342,12 +399,17 @@ function migStartWatching(coin) {
 function migUpdateWatching(mint, price, solAmount, entry) {
   if (entry.entered) return;
   if (!isPriceValid(price, entry.lastPrice)) return;
-  if (entry.pendingEntry) { entry.lastPrice = price; return; }
+  if (entry.pendingEntry) {
+    entry.lastPrice = price;
+    return;
+  }
   entry.volumeUSD += solAmount * solPriceUSD;
   entry.tradeCount++;
   entry.lastPrice = price;
   if (!entry.firstPrice && price > 0) entry.firstPrice = price;
   const elapsed = Date.now() - entry.startTime;
+
+  // ── MODO OBSERVADOR ──
   if (OBSERVER_MODE && entry.volumeUSD >= OBS_MIN_VOL && price > 0) {
     clearTimeout(entry.timer);
     entry.entered = true;
@@ -355,6 +417,8 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     obsStartRecording(entry, price, elapsed);
     return;
   }
+
+  // ── Entrada rápida: $2K en <20s ──
   if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_MIN_VOL_FAST) {
     clearTimeout(entry.timer);
     entry.pendingEntry = true;
@@ -379,6 +443,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     }, MIG_ENTRY_DELAY_MS);
     return;
   }
+
   broadcast({ event: "migWatchUpdate", data: {
     mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD,
     tradeCount: entry.tradeCount,
@@ -388,6 +453,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   }});
 }
 
+// ── v6.15: gate de calidad ──
 function migQualityGateThenOpen(entry, entryPriceB) {
   if (!MIG_QUAL_GATE) {
     entry.entered = true;
@@ -401,6 +467,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
   entry.qualGate = true;
   entry.qualStartPrice = entryPriceB;
   entry.qualMov2s = null;
+  const t0 = Date.now();
   addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>0 Y pendiente15s>0)`, "filter");
   entry.qualTimer2s = setTimeout(() => {
     if (entry.qualStartPrice > 0 && entry.lastPrice > 0) {
@@ -463,15 +530,19 @@ function migEvaluate(mint) {
   }
 }
 
+// ── MODO OBSERVADOR: grabación del recorrido ──
 function obsStartRecording(entry, entryPrice, velMs) {
   const rec = {
     mint: entry.mint, symbol: entry.symbol,
     vel: +(velMs / 1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice * 1_000_000_000),
     vol: Math.round(entry.volumeUSD),
-    t0: Date.now(), entryPrice,
+    t0: Date.now(),
+    entryPrice,
     puntos: [{ t: 0, p: 0 }],
-    lastSample: Date.now(), mov2s: null, finished: false,
+    lastSample: Date.now(),
+    mov2s: null,
+    finished: false,
   };
   state.obsRecordings.set(entry.mint, rec);
   state.stats.mig_entered++;
@@ -483,7 +554,10 @@ function obsSample(mint, price) {
   const rec = state.obsRecordings.get(mint);
   if (!rec || rec.finished) return;
   const dt = Date.now() - rec.t0;
-  const interval = dt <= OBS_T1_MS ? OBS_T1_INTERVAL : dt <= OBS_T2_MS ? OBS_T2_INTERVAL : OBS_T3_INTERVAL;
+  // v6.15.3: muestreo escalonado en 3 tramos (denso al principio, basto en la cola)
+  const interval = dt <= OBS_T1_MS ? OBS_T1_INTERVAL
+                 : dt <= OBS_T2_MS ? OBS_T2_INTERVAL
+                 : OBS_T3_INTERVAL;
   if (Date.now() - rec.lastSample < interval) return;
   rec.lastSample = Date.now();
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
@@ -497,13 +571,21 @@ function obsFinishRecording(mint) {
   rec.finished = true;
   state.obsRecordings.delete(mint);
   unsubscribeToken(mint);
+
   const pts = rec.puntos;
   let min = pts[0], max = pts[0];
-  for (const pt of pts) { if (pt.p < min.p) min = pt; if (pt.p > max.p) max = pt; }
+  for (const pt of pts) {
+    if (pt.p < min.p) min = pt;
+    if (pt.p > max.p) max = pt;
+  }
   const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
+  // v6.15.5: cruces actualizados a [50,70,100] (umbrales relevantes con armado+70)
+  // +50: zona de aproximación al armado · +70: arma el trailing · +100: suelo +65%
   const cruces = [50, 70, 100].map(u => {
     let c = 0;
-    for (let i = 1; i < pts.length; i++) if (pts[i - 1].p < u && pts[i].p >= u) c++;
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i - 1].p < u && pts[i].p >= u) c++;
+    }
     return c;
   });
   const cierreReal = obsSimulaGestionActual(pts);
@@ -513,11 +595,17 @@ function obsFinishRecording(mint) {
     `[REC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
     `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
     `cruces[50,70,100]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cierreReal>=0?"+":""}${cierreReal}% ` +
-    `pts=${ptsRaw}`, "rec"
+    `pts=${ptsRaw}`,
+    "rec"
   );
 }
 
 function obsSimulaGestionActual(pts) {
+  // v6.15.5: actualizado a la gestión REAL del server (era v6.10: armado+20, SL-18).
+  // Parámetros actuales: armado+70 (LOCK/STEP_TRIGGER), SL-20, trailing -8%(60-100) / -5%(+100)
+  // Suelo +13% (STEP_FLOOR) y suelo +65% (TOP_FLOOR al tocar +100) incluidos.
+  // Los tramos -15% y -12% son código muerto con armado+70 (cuando arma, MAX ya >=70),
+  // pero se incluyen por fidelidad al código real por si algún token arma justo en +70.
   const STEP_TRIGGER = 70, STEP_FLOOR = 13;
   const TOP_FLOOR_TRIGGER = 100, TOP_FLOOR = 65;
   let armed = false, topFloor = false, maxSeen = 0, sl = -20;
@@ -526,26 +614,33 @@ function obsSimulaGestionActual(pts) {
     if (!armed && maxSeen >= STEP_TRIGGER) armed = true;
     if (!topFloor && maxSeen >= TOP_FLOOR_TRIGGER) topFloor = true;
     if (armed) {
+      // trailing escalonado idéntico al server (MIG_TRAIL_T1/T2/T3/P1/P2/P3/P4)
       const trail = maxSeen >= 100 ? 5 : maxSeen >= 60 ? 8 : maxSeen >= 40 ? 12 : 15;
       sl = Math.max(sl, maxSeen - trail, STEP_FLOOR);
     }
-    if (topFloor) sl = Math.max(sl, TOP_FLOOR);
+    if (topFloor) {
+      sl = Math.max(sl, TOP_FLOOR);  // suelo +65% una vez tocado +100
+    }
     if (pt.p <= sl) return +sl.toFixed(1);
   }
   return +pts[pts.length - 1].p.toFixed(1);
 }
 
+// ── v6.15: GRABACIÓN EN VIVO ──
 function liveRecStart(entry, entryPrice) {
   if (!LIVE_RECORD || entryPrice <= 0) return;
-  const velMs = Date.now() - entry.startTime;
+  const velMs = entry.qualStartPrice != null ? (Date.now() - entry.startTime) : (Date.now() - entry.startTime);
   const rec = {
     mint: entry.mint, symbol: entry.symbol,
     vel: +(velMs / 1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice * 1_000_000_000),
     vol: Math.round(entry.volumeUSD || 0),
-    t0: Date.now(), entryPrice,
+    t0: Date.now(),
+    entryPrice,
     puntos: [{ t: 0, p: 0 }],
-    lastSample: Date.now(), mov2s: null, finished: false,
+    lastSample: Date.now(),
+    mov2s: null,
+    finished: false,
   };
   state.liveRecordings.set(entry.mint, rec);
 }
@@ -586,10 +681,13 @@ function liveRecFinish(mint, cierreRealPct) {
     `[MIGREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} ` +
     `mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} ` +
     `cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
-    `pts=${ptsRaw}`, "rec"
+    `pts=${ptsRaw}`,
+    "rec"
   );
 }
 
+// ── v6.15.4: GRABACIÓN DE MOMENTUM (aislada, no toca migración) ──
+// momMonitored guarda el token; arrancamos al activar el trade.
 function momRecStart(mint, symbol, entryPrice, meta) {
   if (!MOM_RECORD || entryPrice <= 0) return;
   const rec = {
@@ -597,21 +695,25 @@ function momRecStart(mint, symbol, entryPrice, meta) {
     pct1h: meta?.pct1h ?? null,
     vol1h: meta?.vol1h ?? null,
     mc: meta?.mc ?? (entryPrice * 1_000_000_000),
-    t0: Date.now(), entryPrice,
+    t0: Date.now(),
+    entryPrice,
     puntos: [{ t: 0, p: 0 }],
-    lastSample: Date.now(), finished: false,
+    lastSample: Date.now(),
+    finished: false,
   };
-  state.liveRecordings.set(mint, rec);
+  state.liveRecordings.set(mint, rec);   // comparte el Map, pero clave distinta por mint
 }
 
 function momRecSample(mint, price) {
   if (!MOM_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
+  // El feed de momentum es el scan (~15s); muestreamos cada vez que llega un precio,
+  // sin sub-intervalo: la propia frecuencia del scan marca el ritmo.
   const dt = Date.now() - rec.t0;
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
   const last = rec.puntos[rec.puntos.length - 1];
-  if (last && last.t === Math.round(dt / 1000)) return;
+  if (last && last.t === Math.round(dt / 1000)) return;   // evita duplicar el mismo segundo
   rec.puntos.push({ t: Math.round(dt / 1000), p: pct });
 }
 
@@ -622,15 +724,18 @@ function momRecFinish(mint, cierreRealPct) {
   rec.finished = true;
   state.liveRecordings.delete(mint);
   const pts = rec.puntos;
-  if (pts.length < 2) return;
+  if (pts.length < 2) return;   // sin recorrido útil
   let min = pts[0], max = pts[0];
   for (const pt of pts) { if (pt.p < min.p) min = pt; if (pt.p > max.p) max = pt; }
   const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
+  // Cruces en los umbrales relevantes de momentum: breakeven (+3), lock (+5), TP (+6)
   const cruces = [3, 5, 6].map(u => {
     let c = 0;
     for (let i = 1; i < pts.length; i++) if (pts[i - 1].p < u && pts[i].p >= u) c++;
     return c;
   });
+  // Clave para decidir el breakeven: ¿cuánto cayó DESPUÉS de tocar su máximo?
+  // (grupo A: siguió cayendo, el breakeven la salvó · grupo B: solo bacheó, la estranguló)
   let minTrasMax = max.p;
   for (const pt of pts) { if (pt.t > max.t && pt.p < minTrasMax) minTrasMax = pt.p; }
   const cr = +(+cierreRealPct).toFixed(1);
@@ -639,7 +744,8 @@ function momRecFinish(mint, cierreRealPct) {
     `[MOMREC] sym=${rec.symbol} pct1h=${rec.pct1h ?? "?"} MC=${formatMC(rec.mc)} ` +
     `MAX=${max.p}%@${max.t}s MIN=${min.p}%@${min.t}s minTrasMax=${minTrasMax}% orden=${orden} ` +
     `cruces[3,5,6]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
-    `pts=${ptsRaw}`, "rec"
+    `pts=${ptsRaw}`,
+    "rec"
   );
 }
 
@@ -707,12 +813,15 @@ async function momentumScan() {
     const url = `${BIRDEYE_TOKEN_LIST}?sort_by=volume_1h_usd&sort_type=desc`
       + `&min_liquidity=${MOM_MIN_LIQUIDITY}`
       + `&min_market_cap=${MOM_MIN_MC}&max_market_cap=${MOM_MAX_MC}`
-      + `&offset=0&limit=50`;
+      + `&offset=0&limit=50`;    // v6.15.6: vuelto a 50 (limit=100 doblaba CUs por request y causaba 429 en plan Lite)
     const res = await fetch(url, {
       headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) { addLog(`❌ Birdeye scan HTTP ${res.status}`, "error"); return; }
+    if (!res.ok) {
+      addLog(`❌ Birdeye scan HTTP ${res.status}`, "error");
+      return;
+    }
     const json = await res.json();
     const tokens = json?.data?.items || json?.data?.tokens || [];
     for (const tok of tokens) {
@@ -736,6 +845,7 @@ async function momentumScan() {
       }
       if (seenMomPools.has(poolAddr)) continue;
       if (vol1h < MOM_MIN_VOL_1H) continue;
+      // ── v6.13 Capa 1: filtro de liquidez ──
       if (!liquidity || liquidity < MOM_MIN_LIQUIDITY) {
         addLog(`⛔ MOM liquidez baja/desconocida (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
         state.stats.mom_disc_liquidity++;
@@ -755,10 +865,14 @@ async function momentumScan() {
         mint, symbol, name: symbol,
         geckoPrice: bePrice, mc, vol1h, pct1h,
         pendingSince: Date.now(),
-        scanPrice: bePrice,
+        scanPrice: bePrice,  // precio del scan para el check de mudo
       });
       state.stats.mom_pending = state.momPending.size;
       addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
+      // v6.15.7: lógica v6.10 — sin drift, sin cooldown de mudos.
+      // Solo check de mudo: espera 5s, pide 1 precio a Birdeye.
+      // Si movió >0.05% → token vivo → entra. Si no → feed muerto → no entra.
+      // 1 sola llamada a /defi/price por señal (vs 2 antes). Sin llamadas si hay señales repetidas.
       setTimeout(async () => {
         if (!state.momPending.has(mint)) return;
         const pending = state.momPending.get(mint);
@@ -782,9 +896,12 @@ async function momentumScan() {
     }
     addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
     broadcast({ event: "stats", data: state.stats });
-  } catch (e) { addLog(`❌ Momentum scan error: ${e.message}`, "error"); }
+  } catch (e) {
+    addLog(`❌ Momentum scan error: ${e.message}`, "error");
+  }
 }
 
+// v6.12: precio puntual fresco de Birdeye
 async function birdeyeFreshPrice(mint) {
   try {
     const res = await fetch(`${BIRDEYE_PRICE}?address=${mint}`, {
@@ -828,13 +945,16 @@ function momActivateFromPending(mint, entryPrice, solAmount) {
     detectedAt: Date.now(), lastUpdate: Date.now(),
   });
   broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
-  momRecStart(mint, pending.symbol, entryPrice, { pct1h: pending.pct1h, vol1h: pending.vol1h, mc: pending.mc });
+  momRecStart(mint, pending.symbol, entryPrice, { pct1h: pending.pct1h, vol1h: pending.vol1h, mc: pending.mc }); // v6.15.4: grabar recorrido
   openDemoTrade(signal);
   openRealTrade(signal);
 }
 
 function momUpdatePrice(mint, price, solAmount) {
-  if (state.momPending.has(mint) && solAmount > 0) { momActivateFromPending(mint, price, solAmount); return; }
+  if (state.momPending.has(mint) && solAmount > 0) {
+    momActivateFromPending(mint, price, solAmount);
+    return;
+  }
   const token = state.momMonitored.get(mint);
   if (!token) return;
   token.price = price; token.mc = price * 1_000_000_000;
@@ -842,7 +962,7 @@ function momUpdatePrice(mint, price, solAmount) {
   token.priceLow = Math.min(token.priceLow, price);
   if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
   token.lastUpdate = Date.now();
-  momRecSample(mint, price);
+  momRecSample(mint, price);   // v6.15.4: muestrear el recorrido del trade de momentum
   updateDemoTrades(mint, price, "momentum");
   updateRealTrades(mint, price, "momentum");
   broadcast({ event: "momTokenUpdate", data: token });
@@ -900,15 +1020,13 @@ async function openRealTrade(signal) {
   if (!REAL_STRATEGIES.includes(signal.strategy)) return;
   const openReal = state.realTrades.filter(t => t.status === "OPEN");
   if (openReal.length >= MAX_REAL_TRADES) return;
-  // Límite por estrategia
   const isMigSignal = isMig(signal.strategy);
   const stratMax = isMigSignal ? MAX_MIG_REAL : MAX_MOM_REAL;
   const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
   if (stratOpen >= stratMax) { addLog(`⚠️ Límite real [${signal.strategy}]: ${stratOpen}/${stratMax}`, "warn"); return; }
-  // SOL por estrategia
   const solAmount = isMigSignal ? SOL_PER_TRADE_MIG : SOL_PER_TRADE_MOM;
   const balance = await getWalletBalance();
-  if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${solAmount + 0.01})`, "warn"); return; }
+  if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount + 0.01).toFixed(2)})`, "warn"); return; }
   const sig = await buyToken(signal.mint, solAmount);
   if (!sig) return;
   const duration = isMig(signal.strategy) ? MIG_DURATION_MS : MOM_DURATION_MS;
@@ -933,11 +1051,9 @@ async function openRealTrade(signal) {
   saveState();
 }
 
-// ── v6.15.9+: closeRealTrade con medición de PnL real (balance antes/después) ──
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
-  // Leer balance ANTES de vender para calcular PnL real incluyendo slippage + fees
   const balBefore = await getWalletBalance();
   const sig = await sellToken(trade.mint);
   if (!sig) {
@@ -945,39 +1061,31 @@ async function closeRealTrade(trade, price, reason) {
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
     trade.status = "SELL_FAILED"; broadcast({ event: "realTradeClosed", data: trade }); return;
   }
-  // Balance DESPUÉS de vender → diferencia = SOL recibido por la venta
   const balAfter = await getWalletBalance();
-  // PnL real en SOL = (lo que recibí) - (lo que gasté en comprar)
-  // balAfter - balBefore = SOL entrado por la venta (neto de fees de red)
-  // Sumamos solAmount porque lo gastamos al comprar (lo contamos como coste)
   const realPnlSol = +(balAfter - balBefore + trade.solAmount).toFixed(4);
-  // PnL por precio tick (para comparar con el real)
   const tickPnlSol = +(trade.solAmount * (price - trade.entryPrice) / trade.entryPrice).toFixed(4);
   const slipFeeSol = +(realPnlSol - tickPnlSol).toFixed(4);
   trade.sellSignature = sig; trade.closePrice = price; trade.closeTime = Date.now(); trade.status = "CLOSED";
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
-  trade.pnlSol = realPnlSol;   // SOL real, no estimado por precio
-  trade.slipFeeSol = slipFeeSol; // guardamos el dato de fricción
-  // Acumular estadísticas de slippage
-  state.stats.mom_totalSlipFeeSol += slipFeeSol;
-  state.stats.mom_slipFeeCount++;
-  state.stats.mom_avgSlipFeeSol = +(state.stats.mom_totalSlipFeeSol / state.stats.mom_slipFeeCount).toFixed(5);
-  addLog(`📊 PnL real: ${realPnlSol >= 0 ? "+" : ""}${realPnlSol} SOL | tick: ${tickPnlSol >= 0 ? "+" : ""}${tickPnlSol} SOL | slip+fee: ${slipFeeSol >= 0 ? "+" : ""}${slipFeeSol} SOL | media: ${state.stats.mom_avgSlipFeeSol} SOL`, "real");
+  trade.pnlSol = realPnlSol;
+  trade.slipFeeSol = slipFeeSol;
+  addLog(`📊 PnL real: ${realPnlSol >= 0 ? "+" : ""}${realPnlSol} SOL | tick: ${tickPnlSol >= 0 ? "+" : ""}${tickPnlSol} SOL | slip+fee: ${slipFeeSol >= 0 ? "+" : ""}${slipFeeSol} SOL`, "real");
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = stratPrefix(trade.strategy);
   const expWinPct = isMig(trade.strategy) ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
+  // ── v6.2: STEP cuenta como WIN (igual que TP) ──
   if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
-    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += realPnlSol;
+    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
     const tag = reason === "STEP" ? "🪜 ESCALÓN" : trade.strategy;
     addLog(`✅ REAL WIN [${tag}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
   } else if (reason === "SL") {
     trade.result = "LOSS"; state.stats[`${prefix}_realLosses`]++;
-    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += realPnlSol;
+    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
     addLog(`❌ REAL LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "realloss");
   } else {
-    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += realPnlSol;
+    state.stats[`${prefix}_realPnL`] += trade.pnlPct; state.stats[`${prefix}_realPnLSol`] += trade.pnlSol;
     if (trade.pnlPct >= expWinPct) {
       trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
       addLog(`✅ REAL WIN [EXP+]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
@@ -995,6 +1103,7 @@ async function closeRealTrade(trade, price, reason) {
   saveState();
 }
 
+// v6.10: trailing escalonado para migración.
 function migTrailingPct(maxGainPct) {
   if (maxGainPct >= MIG_TRAIL_T3) return MIG_TRAIL_P4;
   if (maxGainPct >= MIG_TRAIL_T2) return MIG_TRAIL_P3;
@@ -1003,7 +1112,7 @@ function migTrailingPct(maxGainPct) {
 }
 
 function isMig(strategy) { return strategy === "migration"; }
-
+// v6.12 Palanca 1: detecta volcado vertical.
 function veloDropTriggered(trade, price, strategy) {
   if (!isMig(strategy)) return false;
   const now = Date.now();
@@ -1018,7 +1127,6 @@ function veloDropTriggered(trade, price, strategy) {
   const drop = (prevP - price) / prevP;
   return drop >= MIG_VELO_DROP;
 }
-
 function stratPrefix(strategy) {
   if (strategy === "migration") return "mig";
   return "mom";
@@ -1036,17 +1144,23 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // ── v6.12 Palanca 1: salida por velocidad ──
     if (veloDropTriggered(trade, price, strategy)) {
       addLog(`⚡🛑 VELO-EXIT [${strategy} real]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}% — vendiendo ya`, "realloss");
-      closeRealTrade(trade, price, "SL"); continue;
+      closeRealTrade(trade, price, "SL");
+      continue;
     }
+    // ── v6.8: cap loss duro (solo Momentum) ──
     if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [momentum real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
-      closeRealTrade(trade, price, "SL"); continue;
+      closeRealTrade(trade, price, "SL");
+      continue;
     }
+    // ── v6.10: cap loss duro (solo Migración, -20%) ──
     if (isMig(strategy) && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy} real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
-      closeRealTrade(trade, price, "SL"); continue;
+      closeRealTrade(trade, price, "SL");
+      continue;
     }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     const stepArmed = isMig(strategy) && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
@@ -1062,7 +1176,9 @@ function updateRealTrades(mint, price, strategy) {
       trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
     }
     const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-    if (stepArmed && stepFloorPrice > trade.sl) trade.sl = +stepFloorPrice.toFixed(12);
+    if (stepArmed && stepFloorPrice > trade.sl) {
+      trade.sl = +stepFloorPrice.toFixed(12);
+    }
     if (isMig(strategy) && trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
       const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
       if (topFloorPrice > trade.sl) trade.sl = +topFloorPrice.toFixed(12);
@@ -1081,8 +1197,8 @@ function updateRealTrades(mint, price, strategy) {
           broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
         }
       }
-    } else {
-      trade._slBelowCount = 0;
+    }
+    else { trade._slBelowCount = 0;
       if (now >= trade.expiresAt) closeRealTrade(trade, price, "EXPIRED");
       else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
     }
@@ -1100,7 +1216,8 @@ setInterval(() => {
         const tk = state.momMonitored.get(trade.mint);
         addLog(`🔇 MOM FEED MUDO [real]: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
         momMuteCooldown.set(trade.mint, Date.now());
-        closeRealTrade(trade, tk?.price || trade.entryPrice, "EXPIRED"); continue;
+        closeRealTrade(trade, tk?.price || trade.entryPrice, "EXPIRED");
+        continue;
       }
     }
     if (now < trade.expiresAt) continue;
@@ -1144,22 +1261,29 @@ function updateDemoTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // ── v6.13 paso 2: registrar primer movimiento a 1s y 2s (solo migración) ──
     if (isMig(strategy)) {
       const sinceOpen = now - trade.openTime;
       if (trade.mov1s === null && sinceOpen >= 1000) trade.mov1s = +currentPct.toFixed(2);
       if (trade.mov2s === null && sinceOpen >= 2000) trade.mov2s = +currentPct.toFixed(2);
     }
+    // ── v6.12 Palanca 1: salida por velocidad ──
     if (veloDropTriggered(trade, price, strategy)) {
       addLog(`⚡🛑 VELO-EXIT [${strategy}]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}% — vendiendo ya`, "loss");
-      closeDemoTrade(trade, price, "SL", tp_pct); continue;
+      closeDemoTrade(trade, price, "SL", tp_pct);
+      continue;
     }
+    // ── v6.8: cap loss duro (solo Momentum) ──
     if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [momentum]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MOM_HARD_CAP_LOSS}%)`, "loss");
-      closeDemoTrade(trade, price, "SL", tp_pct); continue;
+      closeDemoTrade(trade, price, "SL", tp_pct);
+      continue;
     }
+    // ── v6.10: cap loss duro (solo Migración, -20%) ──
     if (isMig(strategy) && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy}]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MIG_HARD_CAP_LOSS}%)`, "loss");
-      closeDemoTrade(trade, price, "SL", tp_pct); continue;
+      closeDemoTrade(trade, price, "SL", tp_pct);
+      continue;
     }
     const gainPct = (price - trade.entryPrice) / trade.entryPrice;
     const stepArmed = isMig(strategy) && trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
@@ -1178,13 +1302,19 @@ function updateDemoTrades(mint, price, strategy) {
     }
     const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
     if (stepArmed && stepFloorPrice > trade.sl) {
-      if (!trade._stepLogged) { trade._stepLogged = true; addLog(`🪜 ESCALÓN +13% suelo [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail"); }
+      if (!trade._stepLogged) {
+        trade._stepLogged = true;
+        addLog(`🪜 ESCALÓN +13% suelo [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
+      }
       trade.sl = +stepFloorPrice.toFixed(12);
     }
     if (isMig(strategy) && trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
       const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
       if (topFloorPrice > trade.sl) {
-        if (!trade._topFloorLogged) { trade._topFloorLogged = true; addLog(`🏔️ SUELO +65% [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail"); }
+        if (!trade._topFloorLogged) {
+          trade._topFloorLogged = true;
+          addLog(`🏔️ SUELO +65% [${strategy}]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(0)}%)`, "trail");
+        }
         trade.sl = +topFloorPrice.toFixed(12);
       }
     }
@@ -1203,8 +1333,8 @@ function updateDemoTrades(mint, price, strategy) {
           broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
         }
       }
-    } else {
-      trade._slBelowCount = 0;
+    }
+    else { trade._slBelowCount = 0;
       if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
       else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
     }
@@ -1228,6 +1358,9 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     addLog(`✅ WIN [🪜 ESCALÓN][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win");
   } else if (reason === "SL") {
     state.stats[`${prefix}_demoPnL`] += trade.pnlPct;
+    // FIX 0%=win (v6.15.1): el cierre plano en 0% ya NO cuenta como WIN. Antes era >= 0,
+    // lo que inflaba el win rate (~12% de las "wins" eran ceros) y hacía decidir a ciegas.
+    // El P&L no cambia (un 0% suma 0); solo el win rate pasa a ser honesto.
     if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
     else { trade.result = "LOSS"; state.stats[`${prefix}_demoLosses`]++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
   } else {
@@ -1249,13 +1382,14 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   state.stats[`${prefix}_closedCount`]++;
   state.stats[`${prefix}_avgMaxGain`] = +(state.stats[`${prefix}_maxGainSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
   state.stats[`${prefix}_avgMaxLoss`] = +(state.stats[`${prefix}_maxLossSum`] / state.stats[`${prefix}_closedCount`]).toFixed(1);
+  // ── v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración ──
   if (isMig(trade.strategy) && trade.mov2s !== null && trade.result !== "EXPIRED") {
     const bucket = trade.mov2s > 1 ? "up" : (trade.mov2s < -1 ? "down" : "flat");
     const wl = trade.result === "WIN" ? "win" : "loss";
     state.stats[`mig_mov_${bucket}_${wl}`]++;
   }
   if (isMig(trade.strategy)) liveRecFinish(trade.mint, trade.pnlPct);
-  if (trade.strategy === "momentum") momRecFinish(trade.mint, trade.pnlPct);
+  if (trade.strategy === "momentum") momRecFinish(trade.mint, trade.pnlPct);  // v6.15.4: [MOMREC] con cierre real
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
@@ -1273,7 +1407,8 @@ setInterval(() => {
         const tk = state.momMonitored.get(trade.mint);
         addLog(`🔇 MOM FEED MUDO: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
         momMuteCooldown.set(trade.mint, Date.now());
-        closeDemoTrade(trade, tk?.price || trade.entryPrice, "EXPIRED", MOM_TP); continue;
+        closeDemoTrade(trade, tk?.price || trade.entryPrice, "EXPIRED", MOM_TP);
+        continue;
       }
     }
     if (now < trade.expiresAt) continue;
@@ -1319,6 +1454,7 @@ function connectPumpPortal() {
   pumpPortalWs.on("close", () => { addLog("🔄 PumpPortal reconectando...", "warn"); setTimeout(connectPumpPortal, 5000); });
 }
 
+// ── HELIUS — desactivado ───────────────────────────────────────
 function connectHelius() {
   addLog("ℹ️ Helius desactivado — precios via PumpPortal + Gecko", "info");
 }
@@ -1328,6 +1464,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── MOVIMIENTOS MANUALES (de v6.1) ─────────────────────────────
 app.post("/api/movement", (req, res) => {
   const { date, amount, type, note } = req.body;
   if (!date || amount === undefined || !type) return res.status(400).json({ error: "Faltan campos" });
@@ -1382,7 +1519,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.9+ — MIG+MOM real | 2×MIG(0.15SOL) + 13×MOM(0.08SOL) | slip+fee tracking | SOL fallback fix | OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.16.0 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
