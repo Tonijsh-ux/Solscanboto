@@ -36,7 +36,7 @@ const MIG_MIN_MC = 50_000;
 const MIG_MAX_MC = 2_000_000;
 
 // ── MODO OBSERVADOR (recogelotodo) ────────────────────────────────
-const OBSERVER_MODE = true;
+const OBSERVER_MODE = false;
 const LIVE_RECORD = true;
 const LIVE_REC_DENSE_MS = 60_000;
 const LIVE_REC_DENSE_INTERVAL = 2_000;
@@ -76,7 +76,7 @@ const MIG_TOP_FLOOR = 0.65;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
-const MOM_SL = 0.97;
+const MOM_SL = 0.98;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
