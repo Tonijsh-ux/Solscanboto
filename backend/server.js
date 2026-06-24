@@ -41,7 +41,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = false;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
+const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
 // ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
 // A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
 // operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
@@ -104,7 +104,7 @@ const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
 const MOM_TP = 1.06;
-const MOM_SL = 0.98;
+const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
 const MOM_MAX_PCT_1H = 30;
@@ -150,16 +150,26 @@ function initWallet() {
   } catch (e) { addLog(`❌ Wallet error: ${e.message}`, "error"); }
 }
 
-async function getWalletBalance() {
-  if (!wallet || !connection) return 0;
+let cachedBalance = 0;
+let lastBalanceFetch = 0;
+const BALANCE_CACHE_MS = 30_000; // solo consultar RPC cada 30s
+
+async function getWalletBalance(force = false) {
+  if (!wallet || !connection) return cachedBalance;
+  const now = Date.now();
+  if (!force && now - lastBalanceFetch < BALANCE_CACHE_MS) return cachedBalance;
   for (let i = 0; i < 3; i++) {
-    try { return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL; }
+    try {
+      cachedBalance = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+      lastBalanceFetch = Date.now();
+      return cachedBalance;
+    }
     catch (e) {
       if (i < 2) { await new Promise(r => setTimeout(r, 2000)); }
-      else { addLog(`⚠️ getWalletBalance falló 3 veces: ${e.message}`, "warn"); return 0; }
+      else { addLog(`⚠️ getWalletBalance falló 3 veces: ${e.message}`, "warn"); return cachedBalance; }
     }
   }
-  return 0;
+  return cachedBalance;
 }
 
 async function getTokenBalance(mint) {
@@ -1044,7 +1054,7 @@ async function openRealTrade(signal) {
   state.realTrades.unshift(trade);
   if (state.realTrades.length > 200) state.realTrades.pop();
   state.stats.realOpen++;
-  state.stats.walletBalance = await getWalletBalance();
+  state.stats.walletBalance = await getWalletBalance(true);
   broadcast({ event: "newRealTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
   addLog(`🔴 REAL [${signal.strategy}]: ${signal.symbol} | ${solAmount} SOL`, "real");
@@ -1095,7 +1105,7 @@ async function closeRealTrade(trade, price, reason) {
     }
   }
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
-  state.stats.walletBalance = await getWalletBalance();
+  state.stats.walletBalance = await getWalletBalance(true);
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "realTradeClosed", data: trade });
@@ -1519,7 +1529,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.16.1 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.16.2 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
