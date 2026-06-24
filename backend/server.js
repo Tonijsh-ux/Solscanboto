@@ -107,7 +107,7 @@ const MOM_MAX_PCT_1H = 30;
 const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
-const MOM_SCAN_MS = 30_000;       // v6.15.5: vuelto a 30s (15s duplicaba los 429 en plan $40 Birdeye)
+const MOM_SCAN_MS = 15_000;       // v6.15.9: bajado a 15s. En v6.15.5 daba 429 pero desde v6.15.7 se eliminó drift+mudo2 → mitad de llamadas → margen suficiente
 const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
 const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
 const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
@@ -1494,7 +1494,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.15.8 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot v6.15.9 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
   loadState();
   initWallet();
   connectPumpPortal();
