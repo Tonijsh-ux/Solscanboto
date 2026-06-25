@@ -13,17 +13,15 @@ import {
 } from "@solana/web3.js";
 import bs58 from "bs58";
 
-const PORT = process.env.PORT || 3001;
-const SOL_PER_TRADE_MIG = 0.15;   // 0.15 SOL por posición migración (~$10.50)
-const SOL_PER_TRADE_MOM = 0.08;   // 0.08 SOL por posición momentum (~$5.60)
-const SOL_PER_TRADE = 0.08;       // fallback
-const MAX_REAL_TRADES = 15;        // máximo 15 simultáneas en total
-const MAX_MIG_REAL = 2;            // máximo 2 reales de migración
-const MAX_MOM_REAL = 13;           // máximo 13 reales de momentum
+const PORT = process.env.PORT || 3001; // App Migración
+const SOL_PER_TRADE_MIG = 0.15;   // App Migración: 0.15 SOL por posición
+const SOL_PER_TRADE = 0.15;       // fallback
+const MAX_REAL_TRADES = 6;         // máximo 6 simultáneas de migración
+const MAX_MIG_REAL = 6;            // máximo 6 reales de migración
 // Estrategias que pueden operar en REAL. El resto sigue solo en demo aunque MAX_REAL_TRADES>0.
 // Ej: ["migration"] = solo migración en real, momentum y re-migración se quedan en demo.
-const REAL_STRATEGIES = ["migration", "momentum"];
-const STATE_FILE = "/tmp/solscanbot_state.json";
+const REAL_STRATEGIES = ["migration"];
+const STATE_FILE = "/tmp/solscanbot_migracion_state.json";
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 4.00;              // v6.15: +300% (red de seguridad alta; imprescindible con el armado tardío, si no corta los pelotazos +300%+)
@@ -41,7 +39,7 @@ const MIG_MAX_MC = 2_000_000;
 // el recorrido de precio 4 min por token. Escribe una línea [REC] por migración.
 // Ese día el P&L se ignora (se llena de operaciones malas a propósito). Apagar
 // para volver a la operativa normal. NO toca momentum.
-const OBSERVER_MODE = true;           // ⬅️ ACTIVO: día de recolección (v6.15.3)
+const OBSERVER_MODE = false;          // ⬅️ APAGADO: opera en real (era true = solo grababa, no compraba)
 // ── v6.15: GRABACIÓN EN VIVO (opera Y graba a la vez) ──────────────
 // A diferencia de OBSERVER_MODE (que graba EN VEZ de operar), esto deja al bot
 // operar normalmente en demo y, en paralelo, graba el recorrido de cada trade que
@@ -52,14 +50,7 @@ const LIVE_RECORD = true;             // ⬅️ grabar las entradas reales de MI
 const LIVE_REC_DENSE_MS = 60_000;     // primeros 60s: muestreo denso (donde el trailing trabaja)
 const LIVE_REC_DENSE_INTERVAL = 2_000;// cada 2s en la fase densa
 const LIVE_REC_NORMAL_INTERVAL = 5_000;// cada 5s después
-// ── v6.15.4: GRABACIÓN DE MOMENTUM ([MOMREC]) ──────────────────────
-// Igual idea que la de migración pero para momentum: graba el recorrido en % de
-// cada trade que abre y escribe una línea [MOMREC] al cerrar, con cierre_real = el
-// pnl REAL ejecutado. Sirve para decidir con datos el breakeven óptimo (grupo A vs B:
-// las que mueren en breakeven, ¿siguieron cayendo o solo bachearon?). El feed de
-// momentum es el scan cada 15s, así que la resolución es de ~15s (no tick a tick).
-// Funciones momRec* SEPARADAS: no tocan nada de migración.
-const MOM_RECORD = true;              // ⬅️ poner false para dejar de grabar momentum
+
 const OBS_MIN_VOL = 2_000;            // umbral permisivo de volumen (vs 2K/5K normal)
 const OBS_MIN_MC = 20_000;            // umbral permisivo de MC (vs 50K normal)
 const OBS_RECORD_MS = 600_000;        // v6.15.3: grabar 10 min por token (era 4 min). Cubre el pico y la reversión de migración sin grabar la cola muerta del trade de 15 min
@@ -102,42 +93,14 @@ const MIG_TRAIL_P4 = 0.05;                            // +100%+ → -5%
 const MIG_TOP_FLOOR_TRIGGER = 100; // al tocar +100%...
 const MIG_TOP_FLOOR = 0.65;        // ...garantizar suelo +65% (matiz 3: protege el tramo -5% de caídas verticales que saltan ticks)
 
-// ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.06;
-const MOM_SL = 0.97;
-const MOM_DURATION_MS = 45 * 60 * 1000;
-const MOM_MIN_PCT_1H = 10;
-const MOM_MAX_PCT_1H = 30;
-const MOM_MIN_VOL_1H = 100_000;
-const MOM_MIN_MC = 100_000;
-const MOM_MAX_MC = 1_000_000;
-const MOM_SCAN_MS = 15_000;       // v6.15.9: bajado a 15s. En v6.15.5 daba 429 pero desde v6.15.7 se eliminó drift+mudo2 → mitad de llamadas → margen suficiente
-const MOM_MIN_LIQUIDITY = 20_000;     // v6.13: bajado de 25K. Umbral bajo a propósito: el peso del filtrado lo lleva la Capa 2 (movimiento real de precio), porque la liquidez que reporta Birdeye no es fiable (WORLDCUP <$1 pasaba el 25K)
-const MOM_MUTE_TIMEOUT_MS = 90_000;   // v6.4: 90s sin un solo movimiento => feed mudo, cancelar y liberar capital
-const MOM_HARD_CAP_LOSS = -10;        // v6.8: tope de pérdida duro (%). Si currentPct <= esto, cerrar YA. Red de seguridad para caídas verticales en pools ilíquidos donde el SL -3% no se ejecuta porque el precio salta por encima del nivel entre ticks. Corta un -62% a ~-10%
-const MOM_MUTE_CHECK_MS = 5_000;       // v6.15.7: espera 5s tras la señal antes del check de mudo
-const MOM_MUTE_MIN_MOVE = 0.0005;      // v6.15.7: <0.05% en 5s = feed muerto, no entra
-// (MOM_MAX_ENTRY_DRIFT y MOM_MUTE_COOLDOWN_MS eliminados en v6.15.7)
-const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
-
-const MOM_BREAKEVEN_AT = 0.03;
-const MOM_LOCK_AT = 0.03;   // v6.15.8: bajado de 0.05→0.03; análisis de 714 MOMREC: 47 losses subieron a +3%+ antes de caer, con lock=3% habrían cerrado en ~+1%; SL sin tocar (slippage 30s hace -3% teórico = -4.64% real)
-const MOM_FOLLOW_PCT = 0.02;
-// MOM_PENDING_TIMEOUT_MS eliminado en v6.15.7 (reemplazado por MOM_MUTE_CHECK_MS)
-const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
-const MOM_EXPIRED_WIN_PCT = 2;
 
 const HELIUS_API_KEY = "86268796-07db-4bab-8e4f-abc4f697f64d";
 const SOLANA_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PUMPPORTAL_WS = "wss://pumpportal.fun/api/data?api-key=e12mybvnahb5cx2uahup8y1rahn4ewbp99rn4j2u6h6mmy37f1c7cdakf5432kbkcctmmwkcdd37cgke718qey9ne96mpy1mdncmjmut6crkeeb5f5n7ac1gf137auudd56m4u1tcwyku6h130u3m9164cdad99rmuxjpd8b9qq4d3bddu76wu7ad270k2h7155gnbm5x0kuf8";
 const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
-// v6.6: scan de momentum por Birdeye (API key, no sufre el 429 de IP compartida de Gecko)
-const BIRDEYE_API_KEY = "cffc98f5aed04ad3ae4115c5e900ddbd";
-const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 
 let wallet = null;
-let connection = null;       // Helius — para enviar transacciones
-let balanceConn = null;      // RPC público — solo para leer balance
+let connection = null;       // Helius Developer — envío de transacciones Y lectura de balance
 let pumpPortalWs = null;
 
 function initWallet() {
@@ -147,7 +110,6 @@ function initWallet() {
     const privateKeyBytes = bs58.decode(privateKeyStr);
     wallet = Keypair.fromSecretKey(privateKeyBytes);
     connection = new Connection(SOLANA_RPC, "confirmed");
-    balanceConn = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
     addLog(`✅ Wallet: ${wallet.publicKey.toString()}`, "info");
   } catch (e) { addLog(`❌ Wallet error: ${e.message}`, "error"); }
 }
@@ -162,8 +124,7 @@ async function getWalletBalance(force = false) {
   if (!force && now - lastBalanceFetch < BALANCE_CACHE_MS) return cachedBalance;
   for (let i = 0; i < 3; i++) {
     try {
-      const conn = balanceConn || connection;
-      cachedBalance = (await conn.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+      cachedBalance = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
       lastBalanceFetch = Date.now();
       return cachedBalance;
     }
@@ -189,8 +150,7 @@ const state = {
   migMonitored: new Map(),
   obsRecordings: new Map(),  // modo observador: mint → {symbol, vel, mc, vol, t0, entryPrice, puntos:[], mov2s, ...}
   liveRecordings: new Map(), // v6.15: grabación en vivo de trades reales (demo). mint → {symbol, t0, entryPrice, puntos:[], mov2s, vel, mc, vol}
-  momPending: new Map(),
-  momMonitored: new Map(),
+
   signals: [],
   demoTrades: [],
   realTrades: [],
@@ -202,22 +162,10 @@ const state = {
     mig_realWins: 0, mig_realLosses: 0, mig_realPnL: 0, mig_realPnLSol: 0,
     mig_closedCount: 0, mig_maxGainSum: 0, mig_maxLossSum: 0,
     mig_avgMaxGain: 0, mig_avgMaxLoss: 0,
-    mom_scanned: 0, mom_signals: 0, mom_pending: 0,
-    // v6.13: contadores de filtrado de entrada (para medir qué frena cada capa)
-
-    mom_disc_liquidity: 0,    // Capa 1: descartadas en scan por liquidez baja/desconocida
-
-    mom_disc_mute: 0,         // Capa 2: descartadas por precio mudo en entrada
-
     // v6.13 paso 2: cruce primer movimiento (2s) × resultado, solo migración.
-    // Para validar si la dirección temprana predice el resultado (hallazgo del doc).
-    mig_mov_up_win: 0,    mig_mov_up_loss: 0,    // mov2s > 0 (subió en 2s)
-    mig_mov_flat_win: 0,  mig_mov_flat_loss: 0,  // mov2s ~0 (plano)
-    mig_mov_down_win: 0,  mig_mov_down_loss: 0,  // mov2s < 0 (bajó en 2s)
-    mom_demoWins: 0, mom_demoLosses: 0, mom_demoExpired: 0, mom_demoPnL: 0,
-    mom_realWins: 0, mom_realLosses: 0, mom_realPnL: 0, mom_realPnLSol: 0,
-    mom_closedCount: 0, mom_maxGainSum: 0, mom_maxLossSum: 0,
-    mom_avgMaxGain: 0, mom_avgMaxLoss: 0,
+    mig_mov_up_win: 0,    mig_mov_up_loss: 0,
+    mig_mov_flat_win: 0,  mig_mov_flat_loss: 0,
+    mig_mov_down_win: 0,  mig_mov_down_loss: 0,
     demoOpen: 0, realOpen: 0, walletBalance: 0,
   },
 };
@@ -269,9 +217,7 @@ function loadState() {
 
 const frontendClients = new Set();
 const seenMigMints = new Set();
-const seenMomPools = new Set();
-const momSignalCooldown = new Map();
-const momMuteCooldown = new Map();  // v6.12: mint -> timestamp del último feed mudo (no reentrar 15 min)
+
 
 function addLog(msg, type = "info") {
   const entry = { msg, type, time: Date.now() };
@@ -699,68 +645,6 @@ function liveRecFinish(mint, cierreRealPct) {
   );
 }
 
-// ── v6.15.4: GRABACIÓN DE MOMENTUM (aislada, no toca migración) ──
-// momMonitored guarda el token; arrancamos al activar el trade.
-function momRecStart(mint, symbol, entryPrice, meta) {
-  if (!MOM_RECORD || entryPrice <= 0) return;
-  const rec = {
-    mint, symbol,
-    pct1h: meta?.pct1h ?? null,
-    vol1h: meta?.vol1h ?? null,
-    mc: meta?.mc ?? (entryPrice * 1_000_000_000),
-    t0: Date.now(),
-    entryPrice,
-    puntos: [{ t: 0, p: 0 }],
-    lastSample: Date.now(),
-    finished: false,
-  };
-  state.liveRecordings.set(mint, rec);   // comparte el Map, pero clave distinta por mint
-}
-
-function momRecSample(mint, price) {
-  if (!MOM_RECORD) return;
-  const rec = state.liveRecordings.get(mint);
-  if (!rec || rec.finished || price <= 0) return;
-  // El feed de momentum es el scan (~15s); muestreamos cada vez que llega un precio,
-  // sin sub-intervalo: la propia frecuencia del scan marca el ritmo.
-  const dt = Date.now() - rec.t0;
-  const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
-  const last = rec.puntos[rec.puntos.length - 1];
-  if (last && last.t === Math.round(dt / 1000)) return;   // evita duplicar el mismo segundo
-  rec.puntos.push({ t: Math.round(dt / 1000), p: pct });
-}
-
-function momRecFinish(mint, cierreRealPct) {
-  if (!MOM_RECORD) return;
-  const rec = state.liveRecordings.get(mint);
-  if (!rec || rec.finished) return;
-  rec.finished = true;
-  state.liveRecordings.delete(mint);
-  const pts = rec.puntos;
-  if (pts.length < 2) return;   // sin recorrido útil
-  let min = pts[0], max = pts[0];
-  for (const pt of pts) { if (pt.p < min.p) min = pt; if (pt.p > max.p) max = pt; }
-  const orden = min.t <= max.t ? "lava-antes" : "lava-despues";
-  // Cruces en los umbrales relevantes de momentum: breakeven (+3), lock (+5), TP (+6)
-  const cruces = [3, 5, 6].map(u => {
-    let c = 0;
-    for (let i = 1; i < pts.length; i++) if (pts[i - 1].p < u && pts[i].p >= u) c++;
-    return c;
-  });
-  // Clave para decidir el breakeven: ¿cuánto cayó DESPUÉS de tocar su máximo?
-  // (grupo A: siguió cayendo, el breakeven la salvó · grupo B: solo bacheó, la estranguló)
-  let minTrasMax = max.p;
-  for (const pt of pts) { if (pt.t > max.t && pt.p < minTrasMax) minTrasMax = pt.p; }
-  const cr = +(+cierreRealPct).toFixed(1);
-  const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
-  addLog(
-    `[MOMREC] sym=${rec.symbol} pct1h=${rec.pct1h ?? "?"} MC=${formatMC(rec.mc)} ` +
-    `MAX=${max.p}%@${max.t}s MIN=${min.p}%@${min.t}s minTrasMax=${minTrasMax}% orden=${orden} ` +
-    `cruces[3,5,6]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% ` +
-    `pts=${ptsRaw}`,
-    "rec"
-  );
-}
 
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
@@ -815,178 +699,6 @@ function migUpdatePrice(mint, price, solAmount) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// ESTRATEGIA 2: MOMENTUM
-// ════════════════════════════════════════════════════════════════
-
-async function momentumScan() {
-  seenMomPools.clear();
-  let totalScanned = 0;
-  let totalSignals = 0;
-  try {
-    const url = `${BIRDEYE_TOKEN_LIST}?sort_by=volume_1h_usd&sort_type=desc`
-      + `&min_liquidity=${MOM_MIN_LIQUIDITY}`
-      + `&min_market_cap=${MOM_MIN_MC}&max_market_cap=${MOM_MAX_MC}`
-      + `&offset=0&limit=50`;    // v6.15.6: vuelto a 50 (limit=100 doblaba CUs por request y causaba 429 en plan Lite)
-    const res = await fetch(url, {
-      headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-      addLog(`❌ Birdeye scan HTTP ${res.status}`, "error");
-      return;
-    }
-    const json = await res.json();
-    const tokens = json?.data?.items || json?.data?.tokens || [];
-    for (const tok of tokens) {
-      const mint = tok.address || "";
-      if (!mint || mint.length < 32) continue;
-      const poolAddr = mint;
-      const mc = parseFloat(tok.market_cap || tok.fdv || 0);
-      if (mc < MOM_MIN_MC || mc > MOM_MAX_MC) continue;
-      const vol1h = parseFloat(tok.volume_1h_usd || 0);
-      const pct1h = parseFloat(tok.price_change_1h_percent || 0);
-      const bePrice = parseFloat(tok.price || 0);
-      if (bePrice <= 0) continue;
-      const liquidity = parseFloat(tok.liquidity || 0);
-      totalScanned++;
-      if (state.momMonitored.has(mint)) {
-        const token = state.momMonitored.get(mint);
-        token.vol1h = vol1h; token.pct1h = pct1h;
-        if (bePrice > 0) momUpdatePrice(mint, bePrice, 0);
-        seenMomPools.add(poolAddr);
-        continue;
-      }
-      if (seenMomPools.has(poolAddr)) continue;
-      if (vol1h < MOM_MIN_VOL_1H) continue;
-      // ── v6.13 Capa 1: filtro de liquidez ──
-      if (!liquidity || liquidity < MOM_MIN_LIQUIDITY) {
-        addLog(`⛔ MOM liquidez baja/desconocida (${formatMC(liquidity)}): ${tok.symbol || mint.slice(0,8)}`, "filter");
-        state.stats.mom_disc_liquidity++;
-        continue;
-      }
-      if (pct1h < MOM_MIN_PCT_1H) continue;
-      if (pct1h > MOM_MAX_PCT_1H) continue;
-      const lastSig = momSignalCooldown.get(mint) || 0;
-      if (Date.now() - lastSig < MOM_SIGNAL_COOLDOWN_MS) continue;
-      seenMomPools.add(poolAddr);
-      state.stats.mom_scanned++;
-      const symbol = tok.symbol || mint.slice(0, 8);
-      momSignalCooldown.set(mint, Date.now());
-      state.stats.mom_signals++;
-      totalSignals++;
-      state.momPending.set(mint, {
-        mint, symbol, name: symbol,
-        geckoPrice: bePrice, mc, vol1h, pct1h,
-        pendingSince: Date.now(),
-        scanPrice: bePrice,  // precio del scan para el check de mudo
-      });
-      state.stats.mom_pending = state.momPending.size;
-      addLog(`⚡ MOMENTUM: ${symbol} | +${pct1h.toFixed(1)}% 1h | Vol ${formatMC(vol1h)} | MC ${formatMC(mc)}`, "signal");
-      // v6.15.7: lógica v6.10 — sin drift, sin cooldown de mudos.
-      // Solo check de mudo: espera 5s, pide 1 precio a Birdeye.
-      // Si movió >0.05% → token vivo → entra. Si no → feed muerto → no entra.
-      // 1 sola llamada a /defi/price por señal (vs 2 antes). Sin llamadas si hay señales repetidas.
-      setTimeout(async () => {
-        if (!state.momPending.has(mint)) return;
-        const pending = state.momPending.get(mint);
-        const checkPrice = await birdeyeFreshPrice(mint);
-        if (!checkPrice) {
-          addLog(`⚡ ENTRADA birdeye: ${pending.symbol} @ $${pending.geckoPrice.toFixed(8)}`, "accept");
-          momActivateFromPending(mint, pending.geckoPrice, 0);
-          return;
-        }
-        const move = Math.abs(checkPrice - pending.scanPrice) / pending.scanPrice;
-        if (move < MOM_MUTE_MIN_MOVE) {
-          addLog(`🔇 MOM MUDO: ${pending.symbol} — precio movió ${(move*100).toFixed(3)}% en 5s, NO entra`, "filter");
-          state.stats.mom_disc_mute++;
-          state.momPending.delete(mint); state.stats.mom_pending = state.momPending.size;
-          return;
-        }
-        addLog(`⚡ ENTRADA [vivo]: ${pending.symbol} @ $${checkPrice.toFixed(8)} (movió ${(move*100).toFixed(3)}%)`, "accept");
-        momActivateFromPending(mint, checkPrice, 0);
-      }, MOM_MUTE_CHECK_MS);
-      broadcast({ event: "stats", data: state.stats });
-    }
-    addLog(`⚡ Scan: ${totalScanned} candidatos, ${totalSignals} señales nuevas`, "info");
-    broadcast({ event: "stats", data: state.stats });
-  } catch (e) {
-    addLog(`❌ Momentum scan error: ${e.message}`, "error");
-  }
-}
-
-// v6.12: precio puntual fresco de Birdeye
-async function birdeyeFreshPrice(mint) {
-  try {
-    const res = await fetch(`${BIRDEYE_PRICE}?address=${mint}`, {
-      headers: { "accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const px = parseFloat(json?.data?.value || 0);
-    return px > 0 ? px : null;
-  } catch { return null; }
-}
-
-function momActivateFromPending(mint, entryPrice, solAmount) {
-  const pending = state.momPending.get(mint);
-  if (!pending) return;
-  state.momPending.delete(mint);
-  state.stats.mom_pending = state.momPending.size;
-  const signal = {
-    id: `mom-${mint}-${Date.now()}`,
-    strategy: "momentum",
-    mint, name: pending.name, symbol: pending.symbol,
-    price: entryPrice,
-    tp: +(entryPrice * MOM_TP).toFixed(12),
-    sl: +(entryPrice * MOM_SL).toFixed(12),
-    mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h,
-    time: Date.now(),
-  };
-  const source = solAmount > 0 ? "real" : "gecko";
-  addLog(`⚡ ENTRADA [${source}]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3% | 45min`, "accept");
-  state.signals.unshift(signal);
-  if (state.signals.length > 100) state.signals.pop();
-  broadcast({ event: "newSignal", data: signal });
-  state.momMonitored.set(mint, {
-    mint, symbol: pending.symbol, name: pending.name,
-    mc: pending.mc, price: entryPrice,
-    priceHigh: entryPrice, priceLow: entryPrice,
-    pct1h: pending.pct1h, vol1h: pending.vol1h,
-    tradeCount: solAmount > 0 ? 1 : 0,
-    volumeUSD: solAmount * solPriceUSD,
-    detectedAt: Date.now(), lastUpdate: Date.now(),
-  });
-  broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
-  momRecStart(mint, pending.symbol, entryPrice, { pct1h: pending.pct1h, vol1h: pending.vol1h, mc: pending.mc }); // v6.15.4: grabar recorrido
-  openDemoTrade(signal);
-  openRealTrade(signal);
-}
-
-function momUpdatePrice(mint, price, solAmount) {
-  if (state.momPending.has(mint) && solAmount > 0) {
-    momActivateFromPending(mint, price, solAmount);
-    return;
-  }
-  const token = state.momMonitored.get(mint);
-  if (!token) return;
-  token.price = price; token.mc = price * 1_000_000_000;
-  token.priceHigh = Math.max(token.priceHigh, price);
-  token.priceLow = Math.min(token.priceLow, price);
-  if (solAmount > 0) { token.tradeCount++; token.volumeUSD += solAmount * solPriceUSD; }
-  token.lastUpdate = Date.now();
-  momRecSample(mint, price);   // v6.15.4: muestrear el recorrido del trade de momentum
-  updateDemoTrades(mint, price, "momentum");
-  updateRealTrades(mint, price, "momentum");
-  broadcast({ event: "momTokenUpdate", data: token });
-}
-
-function momCleanup(mint, symbol) {
-  state.momMonitored.delete(mint);
-  broadcast({ event: "removeToken", data: { mint } });
-}
-
-// ════════════════════════════════════════════════════════════════
 // TRADING COMPARTIDO
 // ════════════════════════════════════════════════════════════════
 
@@ -1033,16 +745,14 @@ async function openRealTrade(signal) {
   if (!REAL_STRATEGIES.includes(signal.strategy)) return;
   const openReal = state.realTrades.filter(t => t.status === "OPEN");
   if (openReal.length >= MAX_REAL_TRADES) return;
-  const isMigSignal = isMig(signal.strategy);
-  const stratMax = isMigSignal ? MAX_MIG_REAL : MAX_MOM_REAL;
   const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
-  if (stratOpen >= stratMax) { addLog(`⚠️ Límite real [${signal.strategy}]: ${stratOpen}/${stratMax}`, "warn"); return; }
-  const solAmount = isMigSignal ? SOL_PER_TRADE_MIG : SOL_PER_TRADE_MOM;
+  if (stratOpen >= MAX_MIG_REAL) { addLog(`⚠️ Límite real [migración]: ${stratOpen}/${MAX_MIG_REAL}`, "warn"); return; }
+  const solAmount = SOL_PER_TRADE_MIG;
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount + 0.01).toFixed(2)})`, "warn"); return; }
   const sig = await buyToken(signal.mint, solAmount);
   if (!sig) return;
-  const duration = isMig(signal.strategy) ? MIG_DURATION_MS : MOM_DURATION_MS;
+  const duration = MIG_DURATION_MS;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
@@ -1086,7 +796,7 @@ async function closeRealTrade(trade, price, reason) {
   addLog(`📊 PnL real: ${realPnlSol >= 0 ? "+" : ""}${realPnlSol} SOL | tick: ${tickPnlSol >= 0 ? "+" : ""}${tickPnlSol} SOL | slip+fee: ${slipFeeSol >= 0 ? "+" : ""}${slipFeeSol} SOL`, "real");
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = stratPrefix(trade.strategy);
-  const expWinPct = isMig(trade.strategy) ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
+  const expWinPct = MIG_EXPIRED_WIN_PCT;
   // ── v6.2: STEP cuenta como WIN (igual que TP) ──
   if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN"; state.stats[`${prefix}_realWins`]++;
@@ -1110,7 +820,7 @@ async function closeRealTrade(trade, price, reason) {
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
   state.stats.walletBalance = await getWalletBalance(true);
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
-  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
+
   broadcast({ event: "realTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
   saveState();
@@ -1147,10 +857,10 @@ function stratPrefix(strategy) {
 
 function updateRealTrades(mint, price, strategy) {
   const now = Date.now();
-  const breakeven = isMig(strategy) ? MIG_BREAKEVEN_AT : MOM_BREAKEVEN_AT;
-  const breakevenMargin = isMig(strategy) ? MIG_BREAKEVEN_MARGIN : 0;
-  const lock = isMig(strategy) ? MIG_LOCK_AT : MOM_LOCK_AT;
-  const follow = isMig(strategy) ? MIG_FOLLOW_PCT : MOM_FOLLOW_PCT;
+  const breakeven = MIG_BREAKEVEN_AT;
+  const breakevenMargin = MIG_BREAKEVEN_MARGIN;
+  const lock = MIG_LOCK_AT;
+  const follow = MIG_FOLLOW_PCT;
   for (const trade of state.realTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
@@ -1163,12 +873,7 @@ function updateRealTrades(mint, price, strategy) {
       closeRealTrade(trade, price, "SL");
       continue;
     }
-    // ── v6.8: cap loss duro (solo Momentum) ──
-    if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
-      addLog(`🛑 CAP LOSS [momentum real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
-      closeRealTrade(trade, price, "SL");
-      continue;
-    }
+
     // ── v6.10: cap loss duro (solo Migración, -20%) ──
     if (isMig(strategy) && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy} real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
@@ -1222,25 +927,15 @@ setInterval(() => {
   const now = Date.now();
   for (const trade of state.realTrades) {
     if (trade.status !== "OPEN") continue;
-    if (trade.strategy === "momentum") {
-      const aliveMs = now - trade.openTime;
-      const sinMovimiento = (trade.maxGainPct === 0 && trade.maxLossPct === 0);
-      if (aliveMs >= MOM_MUTE_TIMEOUT_MS && sinMovimiento) {
-        const tk = state.momMonitored.get(trade.mint);
-        addLog(`🔇 MOM FEED MUDO [real]: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
-        momMuteCooldown.set(trade.mint, Date.now());
-        closeRealTrade(trade, tk?.price || trade.entryPrice, "EXPIRED");
-        continue;
-      }
-    }
+
     if (now < trade.expiresAt) continue;
-    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
+    const token = state.migMonitored.get(trade.mint);
     closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
   }
 }, 30_000);
 
 function openDemoTrade(signal) {
-  const duration = isMig(signal.strategy) ? MIG_DURATION_MS : MOM_DURATION_MS;
+  const duration = MIG_DURATION_MS;
   const trade = {
     id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
@@ -1256,18 +951,16 @@ function openDemoTrade(signal) {
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  const tpPct = isMig(signal.strategy) ? "+150%" : "+6%";
-  const slPct = isMig(signal.strategy) ? "-18%" : "-3%";
-  addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP ${tpPct} SL ${slPct}`, "demo");
+  addLog(`📝 DEMO [migración]: ${signal.symbol} | TP +300% SL -20%`, "demo");
 }
 
 function updateDemoTrades(mint, price, strategy) {
   const now = Date.now();
-  const tp_pct = isMig(strategy) ? MIG_TP : MOM_TP;
-  const breakeven = isMig(strategy) ? MIG_BREAKEVEN_AT : MOM_BREAKEVEN_AT;
-  const breakevenMargin = isMig(strategy) ? MIG_BREAKEVEN_MARGIN : 0;
-  const lock = isMig(strategy) ? MIG_LOCK_AT : MOM_LOCK_AT;
-  const follow = isMig(strategy) ? MIG_FOLLOW_PCT : MOM_FOLLOW_PCT;
+  const tp_pct = MIG_TP;
+  const breakeven = MIG_BREAKEVEN_AT;
+  const breakevenMargin = MIG_BREAKEVEN_MARGIN;
+  const lock = MIG_LOCK_AT;
+  const follow = MIG_FOLLOW_PCT;
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
@@ -1286,12 +979,7 @@ function updateDemoTrades(mint, price, strategy) {
       closeDemoTrade(trade, price, "SL", tp_pct);
       continue;
     }
-    // ── v6.8: cap loss duro (solo Momentum) ──
-    if (strategy === "momentum" && currentPct <= MOM_HARD_CAP_LOSS) {
-      addLog(`🛑 CAP LOSS [momentum]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MOM_HARD_CAP_LOSS}%)`, "loss");
-      closeDemoTrade(trade, price, "SL", tp_pct);
-      continue;
-    }
+
     // ── v6.10: cap loss duro (solo Migración, -20%) ──
     if (isMig(strategy) && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy}]: ${trade.symbol} ${currentPct.toFixed(1)}% (tope ${MIG_HARD_CAP_LOSS}%)`, "loss");
@@ -1360,7 +1048,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
   const prefix = stratPrefix(trade.strategy);
-  const expWinPct = isMig(trade.strategy) ? MIG_EXPIRED_WIN_PCT : MOM_EXPIRED_WIN_PCT;
+  const expWinPct = MIG_EXPIRED_WIN_PCT;
   if (reason === "TP") {
     trade.result = "WIN"; state.stats[`${prefix}_demoWins`]++;
     state.stats[`${prefix}_demoPnL`] += (tp_pct - 1) * 100;
@@ -1402,9 +1090,9 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     state.stats[`mig_mov_${bucket}_${wl}`]++;
   }
   if (isMig(trade.strategy)) liveRecFinish(trade.mint, trade.pnlPct);
-  if (trade.strategy === "momentum") momRecFinish(trade.mint, trade.pnlPct);  // v6.15.4: [MOMREC] con cierre real
+
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
-  if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
+
   broadcast({ event: "stats", data: state.stats });
   saveState();
 }
@@ -1413,20 +1101,10 @@ setInterval(() => {
   const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.status !== "OPEN") continue;
-    if (trade.strategy === "momentum") {
-      const aliveMs = now - trade.openTime;
-      const sinMovimiento = (trade.maxGainPct === 0 && trade.maxLossPct === 0);
-      if (aliveMs >= MOM_MUTE_TIMEOUT_MS && sinMovimiento) {
-        const tk = state.momMonitored.get(trade.mint);
-        addLog(`🔇 MOM FEED MUDO: ${trade.symbol} — sin trades en ${Math.round(aliveMs/1000)}s, cancelando`, "warn");
-        momMuteCooldown.set(trade.mint, Date.now());
-        closeDemoTrade(trade, tk?.price || trade.entryPrice, "EXPIRED", MOM_TP);
-        continue;
-      }
-    }
+
     if (now < trade.expiresAt) continue;
-    const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
-    const tp_pct = isMig(trade.strategy) ? MIG_TP : MOM_TP;
+    const token = state.migMonitored.get(trade.mint);
+    const tp_pct = MIG_TP;
     closeDemoTrade(trade, token?.price || trade.entryPrice, "EXPIRED", tp_pct);
   }
 }, 30_000);
@@ -1440,7 +1118,7 @@ function connectPumpPortal() {
     pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
     for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-    for (const [mint] of state.momPending.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+
   });
   pumpPortalWs.on("message", async (raw) => {
     try {
@@ -1459,7 +1137,7 @@ function connectPumpPortal() {
         const sol = data.solAmount || 0;
         if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
         if (OBSERVER_MODE && state.obsRecordings.has(data.mint)) obsSample(data.mint, price);
-        if (state.momPending.has(data.mint)) momActivateFromPending(data.mint, price, sol);
+
       }
     } catch (e) { console.log("PP:", e.message); }
   });
@@ -1499,7 +1177,6 @@ app.get("/api/state", (req, res) => {
   res.json({
     migWatching: serializeMigWatching(),
     migMonitored: Array.from(state.migMonitored.values()),
-    momMonitored: Array.from(state.momMonitored.values()),
     signals: state.signals.slice(0, 50),
     demoTrades: state.demoTrades.slice(0, 200),
     realTrades: state.realTrades.slice(0, 200),
@@ -1518,7 +1195,6 @@ wss.on("connection", (ws) => {
     data: {
       migWatching: serializeMigWatching(),
       migMonitored: Array.from(state.migMonitored.values()),
-      momMonitored: Array.from(state.momMonitored.values()),
       signals: state.signals.slice(0, 50),
       demoTrades: state.demoTrades.slice(0, 200),
       realTrades: state.realTrades.slice(0, 200),
@@ -1532,11 +1208,10 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot v6.16.3 — MOM_LOCK_AT 5%→3% (714 MOMREC: 47 losses rescatables). SL -3% sin tocar. Check mudo: 5s / 0.05% / 1 Birdeye. OBSERVADOR ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | scan ${MOM_SCAN_MS/1000}s`);
+  console.log(`🚀 SolScanBot-MIGRACION v6.16.5 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
   loadState();
   initWallet();
   connectPumpPortal();
   connectHelius();
-  setTimeout(momentumScan, 5000);
-  setInterval(momentumScan, MOM_SCAN_MS);
+
 });
