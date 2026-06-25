@@ -972,11 +972,25 @@ setInterval(() => {
   for (const trade of state.realTrades) {
     if (trade.status !== "OPEN") continue;
 
+    // ── DETECCIÓN DE FEED MUERTO (v6.16.9) ──
+    // Si a los 30s de abrir el trade NUNCA se ha movido el % (maxGain y maxLoss
+    // siguen exactamente en 0), es que no llega ningún tick de precio: el pool
+    // está muerto (igual que las expiradas que cerraban en 0% tras 15 min).
+    // Cerrar YA mientras quede algo de liquidez, en vez de esperar a expirar.
+    // Un token vivo (aunque sea plano) recibe ticks y mueve el % del 0 enseguida.
+    const sinceOpen = now - trade.openTime;
+    if (sinceOpen >= 30_000 && trade.maxGainPct === 0 && trade.maxLossPct === 0) {
+      addLog(`💀 FEED MUERTO [migration real]: ${trade.symbol} sin ticks en ${Math.round(sinceOpen/1000)}s — cerrando (pool sin liquidez)`, "realloss");
+      const token = state.migMonitored.get(trade.mint);
+      closeRealTrade(trade, token?.price || trade.entryPrice, "DEAD_FEED");
+      continue;
+    }
+
     if (now < trade.expiresAt) continue;
     const token = state.migMonitored.get(trade.mint);
     closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
   }
-}, 30_000);
+}, 10_000);
 
 function openDemoTrade(signal) {
   const duration = MIG_DURATION_MS;
@@ -1252,7 +1266,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot-MIGRACION v6.16.7 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
+  console.log(`🚀 SolScanBot-MIGRACION v6.16.9 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
   loadState();
   initWallet();
   connectPumpPortal();
