@@ -702,6 +702,39 @@ function migUpdatePrice(mint, price, solAmount) {
 // TRADING COMPARTIDO
 // ════════════════════════════════════════════════════════════════
 
+// Lee cuánto SOL movió EXACTAMENTE una transacción confirmada, mirando el cambio
+// de saldo de nuestra wallet dentro de esa tx (pre/postBalances). Es el mismo número
+// que muestra Solscan, ya neto de fee de red y slippage. No depende del timing de la
+// caché de balance ni se contamina con operaciones simultáneas (lee SÓLO esta tx).
+// Devuelve el delta en SOL: negativo si la wallet pagó (compra), positivo si recibió (venta).
+async function getSolDeltaFromTx(sig, retries = 6) {
+  if (!wallet || !connection) return null;
+  const me = wallet.publicKey.toString();
+  for (let i = 0; i < retries; i++) {
+    try {
+      const tx = await connection.getParsedTransaction(sig, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      });
+      if (tx?.meta && tx.transaction?.message?.accountKeys) {
+        const keys = tx.transaction.message.accountKeys;
+        let idx = -1;
+        for (let k = 0; k < keys.length; k++) {
+          const pk = keys[k]?.pubkey ? keys[k].pubkey.toString() : keys[k]?.toString?.();
+          if (pk === me) { idx = k; break; }
+        }
+        if (idx >= 0 && tx.meta.preBalances && tx.meta.postBalances) {
+          const delta = (tx.meta.postBalances[idx] - tx.meta.preBalances[idx]) / LAMPORTS_PER_SOL;
+          return +delta.toFixed(6);
+        }
+      }
+    } catch (e) { /* reintentar */ }
+    await new Promise(r => setTimeout(r, 1500)); // dar tiempo a que el RPC indexe la tx
+  }
+  addLog(`⚠️ No se pudo leer el SOL movido de la tx ${shortAddr(sig)} tras ${retries} intentos`, "warn");
+  return null;
+}
+
 async function buyToken(mint, solAmount) {
   if (!wallet || !connection) return null;
   try {
@@ -713,13 +746,11 @@ async function buyToken(mint, solAmount) {
     if (!response.ok) { addLog(`❌ Compra error: ${response.status}`, "error"); return null; }
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
-    // Balance justo antes de enviar la compra (force = lectura fresca)
-    const balBefore = await getWalletBalance(true);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
     await connection.confirmTransaction(sig, "confirmed");
-    // Balance justo después: lo que de verdad costó la compra (token + fee + slippage)
-    const balAfter = await getWalletBalance(true);
-    const costSol = +(balBefore - balAfter).toFixed(6);
+    // Coste real = lo que bajó nuestra wallet en esta tx (token + fee + slippage)
+    const delta = await getSolDeltaFromTx(sig);
+    const costSol = delta != null ? +(-delta).toFixed(6) : solAmount; // fallback al nominal si falla la lectura
     addLog(`✅ COMPRA: ${shortAddr(mint)} | coste real ${costSol} SOL | ${sig}`, "real");
     return { sig, costSol };
   } catch (e) { addLog(`❌ Compra: ${e.message}`, "error"); return null; }
@@ -738,13 +769,11 @@ async function sellToken(mint) {
     if (!response.ok) { addLog(`❌ Venta error: ${response.status}`, "error"); return null; }
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
-    // Balance justo antes de enviar la venta (force = lectura fresca)
-    const balBefore = await getWalletBalance(true);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
     await connection.confirmTransaction(sig, "confirmed");
-    // Balance justo después: lo que de verdad entró por la venta (ya neto de fee y slippage)
-    const balAfter = await getWalletBalance(true);
-    const proceedsSol = +(balAfter - balBefore).toFixed(6);
+    // Recibido real = lo que subió nuestra wallet en esta tx (ya neto de fee y slippage)
+    const delta = await getSolDeltaFromTx(sig);
+    const proceedsSol = delta != null ? +delta.toFixed(6) : 0;
     addLog(`✅ VENTA: ${shortAddr(mint)} | recibido real ${proceedsSol} SOL | ${sig}`, "real");
     return { sig, proceedsSol };
   } catch (e) { addLog(`❌ Venta: ${e.message}`, "error"); return null; }
@@ -1223,7 +1252,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot-MIGRACION v6.16.6 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
+  console.log(`🚀 SolScanBot-MIGRACION v6.16.7 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
   loadState();
   initWallet();
   connectPumpPortal();
