@@ -713,10 +713,15 @@ async function buyToken(mint, solAmount) {
     if (!response.ok) { addLog(`❌ Compra error: ${response.status}`, "error"); return null; }
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
+    // Balance justo antes de enviar la compra (force = lectura fresca)
+    const balBefore = await getWalletBalance(true);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
     await connection.confirmTransaction(sig, "confirmed");
-    addLog(`✅ COMPRA: ${shortAddr(mint)} | ${sig}`, "real");
-    return sig;
+    // Balance justo después: lo que de verdad costó la compra (token + fee + slippage)
+    const balAfter = await getWalletBalance(true);
+    const costSol = +(balBefore - balAfter).toFixed(6);
+    addLog(`✅ COMPRA: ${shortAddr(mint)} | coste real ${costSol} SOL | ${sig}`, "real");
+    return { sig, costSol };
   } catch (e) { addLog(`❌ Compra: ${e.message}`, "error"); return null; }
 }
 
@@ -733,10 +738,15 @@ async function sellToken(mint) {
     if (!response.ok) { addLog(`❌ Venta error: ${response.status}`, "error"); return null; }
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
+    // Balance justo antes de enviar la venta (force = lectura fresca)
+    const balBefore = await getWalletBalance(true);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
     await connection.confirmTransaction(sig, "confirmed");
-    addLog(`✅ VENTA: ${shortAddr(mint)} | ${sig}`, "real");
-    return sig;
+    // Balance justo después: lo que de verdad entró por la venta (ya neto de fee y slippage)
+    const balAfter = await getWalletBalance(true);
+    const proceedsSol = +(balAfter - balBefore).toFixed(6);
+    addLog(`✅ VENTA: ${shortAddr(mint)} | recibido real ${proceedsSol} SOL | ${sig}`, "real");
+    return { sig, proceedsSol };
   } catch (e) { addLog(`❌ Venta: ${e.message}`, "error"); return null; }
 }
 
@@ -757,7 +767,8 @@ async function openRealTrade(signal) {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
     entryPrice: signal.price, tp: signal.tp, sl: signal.sl, solAmount: solAmount,
-    buySignature: sig, sellSignature: null,
+    costSol: sig.costSol,
+    buySignature: sig.sig, sellSignature: null,
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, pnlSol: null,
     maxGainPct: 0, maxLossPct: 0, currentPct: 0,
@@ -777,23 +788,27 @@ async function openRealTrade(signal) {
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
-  const balBefore = await getWalletBalance();
-  const sig = await sellToken(trade.mint);
-  if (!sig) {
+  const sell = await sellToken(trade.mint);
+  if (!sell) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
     trade.status = "SELL_FAILED"; broadcast({ event: "realTradeClosed", data: trade }); return;
   }
-  const balAfter = await getWalletBalance();
-  const realPnlSol = +(balAfter - balBefore + trade.solAmount).toFixed(4);
-  const tickPnlSol = +(trade.solAmount * (price - trade.entryPrice) / trade.entryPrice).toFixed(4);
+  // P&L REAL del ciclo de este trade: lo que entró al vender menos lo que costó comprar.
+  // costSol y proceedsSol se miden con balance fresco pegado a cada tx, así que no se
+  // contaminan con compras/ventas simultáneas de otras migraciones.
+  const proceedsSol = sell.proceedsSol;
+  const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
+  const realPnlSol = +(proceedsSol - costSol).toFixed(4);
+  // tick = lo que "debería" haber dado el movimiento de precio sin fricción
+  const tickPnlSol = +(costSol * (price - trade.entryPrice) / trade.entryPrice).toFixed(4);
   const slipFeeSol = +(realPnlSol - tickPnlSol).toFixed(4);
-  trade.sellSignature = sig; trade.closePrice = price; trade.closeTime = Date.now(); trade.status = "CLOSED";
+  trade.sellSignature = sell.sig; trade.closePrice = price; trade.closeTime = Date.now(); trade.status = "CLOSED";
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2);
   trade.pnlSol = realPnlSol;
   trade.slipFeeSol = slipFeeSol;
-  addLog(`📊 PnL real: ${realPnlSol >= 0 ? "+" : ""}${realPnlSol} SOL | tick: ${tickPnlSol >= 0 ? "+" : ""}${tickPnlSol} SOL | slip+fee: ${slipFeeSol >= 0 ? "+" : ""}${slipFeeSol} SOL`, "real");
+  addLog(`📊 PnL real: ${realPnlSol >= 0 ? "+" : ""}${realPnlSol} SOL (coste ${costSol} → recibido ${proceedsSol}) | tick: ${tickPnlSol >= 0 ? "+" : ""}${tickPnlSol} | slip+fee: ${slipFeeSol >= 0 ? "+" : ""}${slipFeeSol}`, "real");
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const prefix = stratPrefix(trade.strategy);
   const expWinPct = MIG_EXPIRED_WIN_PCT;
@@ -1208,7 +1223,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 SolScanBot-MIGRACION v6.16.5 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
+  console.log(`🚀 SolScanBot-MIGRACION v6.16.6 — SNIPER migración pump.fun→PumpSwap | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | RPC: Helius Developer | MAX_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL`);
   loadState();
   initWallet();
   connectPumpPortal();
