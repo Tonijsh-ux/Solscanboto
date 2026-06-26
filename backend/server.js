@@ -1002,6 +1002,7 @@ function momUpdatePrice(mint, price) {
   token.lastUpdate = Date.now();
   momRecSample(mint, price);
   updateDemoTrades(mint, price, "momentum");
+  updateRealTrades(mint, price, "momentum");   // v6.18.5: FIX — las posiciones REALES de momentum también deben recibir el precio del tracker, o el SL/TP nunca se disparan (quedaban congeladas en 0% y desprotegidas).
   broadcast({ event: "momTokenUpdate", data: token });
 }
 
@@ -1261,6 +1262,13 @@ setInterval(() => {
       addLog(`💀 FEED MUERTO [migration real]: ${trade.symbol} sin ticks en ${Math.round(sinceOpen/1000)}s`, "realloss");
       const token = state.migMonitored.get(trade.mint);
       closeRealTrade(trade, token?.price || trade.entryPrice, "DEAD_FEED"); continue;
+    }
+    // v6.18.5: feed mudo para momentum REAL (umbral 90s, coherente con el tracker Birdeye de 15s y con la demo de momentum). Sin esto, una posición real sin ticks quedaba desprotegida hasta los 45min.
+    if (trade.strategy === "momentum" && sinceOpen >= MOM_MUTE_TIMEOUT_MS && trade.maxGainPct === 0 && trade.maxLossPct === 0) {
+      addLog(`🔇 MOM FEED MUDO [real]: ${trade.symbol} sin ticks en ${Math.round(sinceOpen/1000)}s — cerrando`, "realloss");
+      momMuteCooldown.set(trade.mint, Date.now());
+      const token = state.momMonitored.get(trade.mint);
+      closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED"); continue;
     }
     if (now < trade.expiresAt) continue;
     const token = state.migMonitored.get(trade.mint) || state.momMonitored.get(trade.mint);
@@ -1538,7 +1546,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.4 — momentum REAL (límite 1) + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.5 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
