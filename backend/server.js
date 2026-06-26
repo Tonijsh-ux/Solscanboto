@@ -106,7 +106,7 @@ const MOM_RECORD = true;   // v6.15.4: grabar [MOMREC]
 // coherente con el precio de entrada (que también es de Birdeye). Cada cuántos ms
 // se repregunta el precio de las posiciones de momentum abiertas. Una sola llamada
 // batch por ciclo (multi_price) para todas las posiciones de momentum a la vez.
-const MOM_TRACK_MS = 5_000;   // v6.18.2: 15s→5s para reducir slippage de muestreo en SL/TP. OJO: solo viable en sesiones cortas; a 5s permanente revienta el cupo de Birdeye. Volver a 15s o pasar a DexScreener para correr en continuo.
+const MOM_TRACK_MS = 15_000;   // v6.18.2: 15s→5s para reducir slippage de muestreo en SL/TP. OJO: solo viable en sesiones cortas; a 5s permanente revienta el cupo de Birdeye. Volver a 15s o pasar a DexScreener para correr en continuo.
 const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 
 // ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──────────────────────────
