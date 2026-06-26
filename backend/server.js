@@ -101,6 +101,11 @@ const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;   // v6.18.1: vuelto a +5% (params v6.6 — deja correr más hacia el TP en vez de estrangular en +3%)
 const MOM_FOLLOW_PCT = 0.05;   // v6.18.3: ensanchado de 2% a 5%. El 2% se dispara con ruido normal de memecoins y cierra trades buenos antes de tiempo (informe estrategia).
+// v6.18.7: suelo de ganancia. Cuando el token toca +5% (MOM_FLOOR_TRIGGER), el stop
+// se ancla en +3% (MOM_FLOOR) y NUNCA baja de ahí. Evita los "WIN falsos" tipo FARM
+// (subió a +6.4%, el trailing lo dejó cerrar en +1% → pérdida real tras costos).
+const MOM_FLOOR_TRIGGER = 0.05;   // +5% de máximo alcanzado
+const MOM_FLOOR = 0.03;           // suelo asegurado: stop nunca baja de +3%
 const MOM_PENDING_TIMEOUT_MS = 15_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
@@ -1237,6 +1242,12 @@ function updateRealTrades(mint, price, strategy) {
       const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
       if (topFloorPrice > trade.sl) trade.sl = +topFloorPrice.toFixed(12);
     }
+    // v6.18.7: suelo de ganancia para MOMENTUM. Si tocó +5%, el stop nunca baja de +3%.
+    // Evita los "WIN falsos" que tras costos son pérdida (FARM subió +6.4%, cerró +1%).
+    if (strategy === "momentum" && trade.maxGainPct >= MOM_FLOOR_TRIGGER * 100 - 1e-9) {
+      const momFloorPrice = trade.entryPrice * (1 + MOM_FLOOR);
+      if (momFloorPrice > trade.sl) trade.sl = +momFloorPrice.toFixed(12);
+    }
     // v6.18.6 FIX CRÍTICO: el cierre por TP NO existía en updateRealTrades.
     // Las operaciones reales nunca cerraban por Take Profit (solo por SL/trailing/exp).
     // Si el token subía directo al TP, la real no lo recogía. Ahora sí, igual que la demo.
@@ -1358,6 +1369,14 @@ function updateDemoTrades(mint, price, strategy) {
       if (topFloorPrice > trade.sl) {
         if (!trade._topFloorLogged) { trade._topFloorLogged = true; addLog(`🏔️ SUELO +65% [${strategy}]: ${trade.symbol}`, "trail"); }
         trade.sl = +topFloorPrice.toFixed(12);
+      }
+    }
+    // v6.18.7: suelo de ganancia para MOMENTUM (igual que la real). +5% tocado → stop nunca baja de +3%.
+    if (strategy === "momentum" && trade.maxGainPct >= MOM_FLOOR_TRIGGER * 100 - 1e-9) {
+      const momFloorPrice = trade.entryPrice * (1 + MOM_FLOOR);
+      if (momFloorPrice > trade.sl) {
+        if (!trade._momFloorLogged) { trade._momFloorLogged = true; addLog(`🛡️ SUELO +3% [momentum]: ${trade.symbol} (tocó +${trade.maxGainPct.toFixed(1)}%)`, "trail"); }
+        trade.sl = +momFloorPrice.toFixed(12);
       }
     }
     if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
@@ -1554,7 +1573,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.6 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.7 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
