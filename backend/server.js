@@ -1232,10 +1232,18 @@ function updateRealTrades(mint, price, strategy) {
     }
     const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
     if (stepArmed && stepFloorPrice > trade.sl) trade.sl = +stepFloorPrice.toFixed(12);
+    // suelo +65% solo para migración (no debe encadenarse con el cierre por SL)
     if (isMig(strategy) && trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
       const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
       if (topFloorPrice > trade.sl) trade.sl = +topFloorPrice.toFixed(12);
     }
+    // v6.18.6 FIX CRÍTICO: el cierre por TP NO existía en updateRealTrades.
+    // Las operaciones reales nunca cerraban por Take Profit (solo por SL/trailing/exp).
+    // Si el token subía directo al TP, la real no lo recogía. Ahora sí, igual que la demo.
+    if (price >= trade.tp) { trade._slBelowCount = 0; closeRealTrade(trade, price, "TP"); }
+    // v6.18.6 FIX: el cierre por SL/trailing ahora es independiente (antes colgaba de un
+    // else-if del suelo de migración, y para momentum quedaba sin evaluarse bien → la real
+    // no cerraba aunque el trailing hubiera saltado).
     else if (price <= trade.sl) {
       if (trade.sl >= trade.entryPrice) {
         closeRealTrade(trade, price, (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL");
@@ -1546,7 +1554,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.5 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.6 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
