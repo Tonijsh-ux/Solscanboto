@@ -87,7 +87,7 @@ const MOM_MIN_VOL_1H = 100_000;
 const MOM_MIN_MC = 100_000;
 const MOM_MAX_MC = 1_000_000;
 const MOM_SCAN_MS = 30_000;
-const MOM_MIN_LIQUIDITY = 20_000;
+const MOM_MIN_LIQUIDITY = 50_000;     // v6.18.3: subido de 20K a 50K. Con 20K el slippage de la propia venta mueve el precio 5-10%, así que el SL/TP no se ejecutan a los precios previstos. 50K = ejecución más limpia (informe estrategia).
 const MOM_MUTE_TIMEOUT_MS = 90_000;
 const MOM_HARD_CAP_LOSS = -10;
 const MOM_MAX_ENTRY_DRIFT = 0.04;
@@ -97,7 +97,7 @@ const MOM_MUTE_MIN_MOVE = 0.0003;  // v6.18.1: <0.03% en 5s = feed muerto (bajad
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
 const MOM_LOCK_AT = 0.05;   // v6.18.1: vuelto a +5% (params v6.6 — deja correr más hacia el TP en vez de estrangular en +3%)
-const MOM_FOLLOW_PCT = 0.02;
+const MOM_FOLLOW_PCT = 0.05;   // v6.18.3: ensanchado de 2% a 5%. El 2% se dispara con ruido normal de memecoins y cierra trades buenos antes de tiempo (informe estrategia).
 const MOM_PENDING_TIMEOUT_MS = 15_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
@@ -106,7 +106,7 @@ const MOM_RECORD = true;   // v6.15.4: grabar [MOMREC]
 // coherente con el precio de entrada (que también es de Birdeye). Cada cuántos ms
 // se repregunta el precio de las posiciones de momentum abiertas. Una sola llamada
 // batch por ciclo (multi_price) para todas las posiciones de momentum a la vez.
-const MOM_TRACK_MS = 15_000;   // v6.18.2: 15s→5s para reducir slippage de muestreo en SL/TP. OJO: solo viable en sesiones cortas; a 5s permanente revienta el cupo de Birdeye. Volver a 15s o pasar a DexScreener para correr en continuo.
+const MOM_TRACK_MS = 15_000;   // tracker de posiciones abiertas de momentum. A 5s da mejor resolución pero revienta el cupo de Birdeye en continuo; para tick fino permanente, pasar a DexScreener.
 const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 
 // ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──────────────────────────
@@ -1531,7 +1531,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.2 — tracker mom 5s (sesión sim) | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.3 — liquidez mom 50K + trailing 5% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
