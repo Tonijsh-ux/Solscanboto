@@ -439,7 +439,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
       ? (priceNow / entry.qualStartPrice - 1) * 100 : -999;
     const mov2 = entry.qualMov2s == null ? -999 : entry.qualMov2s;
     entry.qualGate = false;
-    if (mov2 > 0 && pend15 > 0) {
+    if (mov2 > 3 && pend15 > 0) {
       entry.entered = true;
       state.stats.mig_entered++;
       state.migWatching.delete(entry.mint);
