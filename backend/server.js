@@ -28,10 +28,10 @@ const MIG_TP = 4.00;              // v6.15: +300% (red de seguridad alta; impres
 const MIG_SL = 0.80;              // v6.15: -20% (era -18%; aviso de la auditoría: bajar riesgo por op, el agregado apenas pierde)
 const MIG_DURATION_MS = 15 * 60 * 1000; // 15 min — más tiempo para el movimiento
 const MIG_WINDOW_MS = 60_000;
-const MIG_MIN_VOL_FAST = 2_000;
-const MIG_MIN_VOL_SLOW = 5_000;
+const MIG_MIN_VOL_FAST = 1_500;
+const MIG_MIN_VOL_SLOW = 2_000;
 const MIG_FAST_WINDOW_MS = 20_000;
-const MIG_MIN_MC = 50_000;
+const MIG_MIN_MC = 0_000;
 const MIG_MAX_MC = 2_000_000;
 
 // ── MODO OBSERVADOR (recogelotodo) ────────────────────────────────
