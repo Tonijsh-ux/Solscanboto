@@ -106,7 +106,7 @@ const MOM_RECORD = true;   // v6.15.4: grabar [MOMREC]
 // coherente con el precio de entrada (que también es de Birdeye). Cada cuántos ms
 // se repregunta el precio de las posiciones de momentum abiertas. Una sola llamada
 // batch por ciclo (multi_price) para todas las posiciones de momentum a la vez.
-const MOM_TRACK_MS = 15_000;
+const MOM_TRACK_MS = 5_000;   // v6.18.2: 15s→5s para reducir slippage de muestreo en SL/TP. OJO: solo viable en sesiones cortas; a 5s permanente revienta el cupo de Birdeye. Volver a 15s o pasar a DexScreener para correr en continuo.
 const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 
 // ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──────────────────────────
@@ -1531,7 +1531,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.1 — momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.2 — tracker mom 5s (sesión sim) | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
