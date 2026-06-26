@@ -17,10 +17,13 @@ import bs58 from "bs58";
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE_MIG = 0.15;
 const SOL_PER_TRADE = 0.15;
-const MAX_REAL_TRADES = 6;
+const MAX_REAL_TRADES = 7;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
 const MAX_MIG_REAL = 6;
-// Momentum solo demo — migration opera en real
-const REAL_STRATEGIES = ["migration"];
+// v6.18.4: momentum real ACTIVADO con límite estricto de 1 operación y lote pequeño, solo para medir el costo real on-chain.
+const SOL_PER_TRADE_MOM = 0.05;
+const MAX_MOM_REAL = 1;
+// Momentum ahora también opera real (límite 1) — migration opera en real
+const REAL_STRATEGIES = ["migration", "momentum"];
 // CAMBIO: estado fuera de /tmp (que se borra al reiniciar en muchos hosts).
 // Se puede sobreescribir con STATE_FILE en el entorno. Si /var/data no existe,
 // cae a ./solscanbot_state.json en el cwd (persistente si el cwd lo es).
@@ -78,7 +81,7 @@ const MIG_TOP_FLOOR_TRIGGER = 100;
 const MIG_TOP_FLOOR = 0.65;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.06;
+const MOM_TP = 1.12;   // v6.18.4: subido de +6% a +12%. El costo round-trip real medido on-chain (~8% en migración) hacía que +6% diera neto negativo. +12% deja margen sobre el costo.
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
 const MOM_MIN_PCT_1H = 10;
@@ -983,7 +986,8 @@ function momActivateFromPending(mint, entryPrice) {
   broadcast({ event: "newMomToken", data: state.momMonitored.get(mint) });
   momRecStart(mint, pending.symbol, entryPrice, { mc: pending.mc, vol: pending.vol1h, pct1h: pending.pct1h });
   openDemoTrade(signal);
-  // CAMBIO: momentum es DEMO. Ya NO se llama a openRealTrade (era no-op confuso).
+  // v6.18.4: momentum REAL reactivado con límite estricto de 1 op (MAX_MOM_REAL) para medir el costo real on-chain. La demo sigue en paralelo para no perder el registro.
+  openRealTrade(signal);
 }
 
 // CAMBIO: momUpdatePrice de momentum ya no recibe solAmount (no viene de PumpPortal).
@@ -1090,8 +1094,11 @@ async function openRealTrade(signal) {
   const openReal = state.realTrades.filter(t => t.status === "OPEN");
   if (openReal.length >= MAX_REAL_TRADES) return;
   const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
-  if (stratOpen >= MAX_MIG_REAL) { addLog(`⚠️ Límite real [migración]: ${stratOpen}/${MAX_MIG_REAL}`, "warn"); return; }
-  const solAmount = SOL_PER_TRADE_MIG;
+  const isMigStrat = signal.strategy === "migration";
+  const maxForStrat = isMigStrat ? MAX_MIG_REAL : MAX_MOM_REAL;
+  if (stratOpen >= maxForStrat) { addLog(`⚠️ Límite real [${signal.strategy}]: ${stratOpen}/${maxForStrat}`, "warn"); return; }
+  const solAmount = isMigStrat ? SOL_PER_TRADE_MIG : SOL_PER_TRADE_MOM;
+  const durationForStrat = isMigStrat ? MIG_DURATION_MS : MOM_DURATION_MS;
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount+0.01).toFixed(2)})`, "warn"); return; }
   const buy = await buyToken(signal.mint, solAmount);
@@ -1105,7 +1112,7 @@ async function openRealTrade(signal) {
     result: null, pnlPct: null, pnlSol: null,
     maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
-    expiresAt: Date.now() + MIG_DURATION_MS, sellRetries: 0,
+    expiresAt: Date.now() + durationForStrat, sellRetries: 0,
   };
   state.realTrades.unshift(trade);
   if (state.realTrades.length > 200) state.realTrades.pop();
@@ -1531,7 +1538,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.3 — liquidez mom 50K + trailing 5% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.4 — momentum REAL (límite 1) + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
