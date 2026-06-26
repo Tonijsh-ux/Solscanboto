@@ -31,7 +31,7 @@ const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
 const MIG_FAST_WINDOW_MS = 20_000;
-const MIG_MIN_MC = 0_000;
+const MIG_MIN_MC = 0;
 const MIG_MAX_MC = 2_000_000;
 
 // ── MODO OBSERVADOR (recogelotodo) ────────────────────────────────
