@@ -517,11 +517,11 @@ async function updateSolPrice() {
     if (d?.solana?.usd > 0) { solPriceUSD = d.solana.usd; solPriceReady = true; return; }
   } catch (e) { addLog(`⚠️ SOL price CoinGecko falló: ${e.message}`, "warn"); }
   try {
-    const r = await fetch("https://price.jup.ag/v6/price?ids=SOL", { signal: AbortSignal.timeout(8000) });
+    const r = await fetch("https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112", { signal: AbortSignal.timeout(8000) });
     const d = await r.json();
-    const px = d?.data?.SOL?.price;
-    if (px > 0) { solPriceUSD = px; solPriceReady = true; addLog(`ℹ️ SOL price vía Jupiter: $${px}`, "info"); return; }
-  } catch (e) { addLog(`⚠️ SOL price Jupiter falló: ${e.message}`, "warn"); }
+    const px = d?.["So11111111111111111111111111111111111111112"]?.usdPrice;
+    if (px > 0) { solPriceUSD = px; solPriceReady = true; addLog(`ℹ️ SOL price vía Jupiter v3: $${px}`, "info"); return; }
+  } catch (e) { addLog(`⚠️ SOL price Jupiter v3 falló: ${e.message}`, "warn"); }
   addLog(`⚠️ SOL price sin actualizar, sigo con $${solPriceUSD}`, "warn");
   if (!solPriceReady) { solPriceReady = true; addLog(`⚠️ Usando SOL price fallback $${solPriceUSD} — operativa desbloqueada`, "warn"); }
 }
@@ -1064,15 +1064,20 @@ async function getSolDeltaFromTx(sig, retries = 6) {
   return null;
 }
 
-async function buyToken(mint, solAmount) {
+async function buyToken(mint, solAmount, slippage = 15) {
   if (!wallet || !connection) return null;
   try {
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "buy", mint, denominatedInSol: "true", amount: solAmount, slippage: 15, priorityFee: 0.0005, pool: "auto" }),
+      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "buy", mint, denominatedInSol: "true", amount: solAmount, slippage, priorityFee: 0.0005, pool: "auto" }),
       signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) { addLog(`❌ Compra error: ${response.status}`, "error"); return null; }
+    if (!response.ok) {
+      let motivo = "";
+      try { motivo = (await response.text()).slice(0, 200); } catch {}
+      addLog(`❌ Compra error: ${response.status}${motivo ? " — " + motivo : ""}`, "error");
+      return null;
+    }
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
@@ -1125,7 +1130,10 @@ async function openRealTrade(signal) {
   const durationForStrat = isMigStrat ? MIG_DURATION_MS : MOM_DURATION_MS;
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount+0.01).toFixed(2)})`, "warn"); return; }
-  const buy = await buyToken(signal.mint, solAmount);
+  // v6.18.9: momentum opera tokens en movimiento rápido (+10-30% 1h); con slippage 15% muchas
+  // compras se rechazaban (error 400) justo en las que despegaban. 30% para momentum, 15% migración.
+  const buySlippage = isMigStrat ? 15 : 30;
+  const buy = await buyToken(signal.mint, solAmount, buySlippage);
   if (!buy) return;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
@@ -1604,7 +1612,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.8 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.9 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
