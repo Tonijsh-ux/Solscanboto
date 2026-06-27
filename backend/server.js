@@ -602,27 +602,42 @@ function mcoStart(mint, symbol, mcMigUsd) {
   }
   const rec = {
     mint, symbol,
-    mcMig: mcMigUsd,
+    // mcMig puede venir 0 si PumpPortal no manda marketCapSol en el evento (caso común:
+    // mcSol:?). En ese caso lo dejamos null y lo fijamos con el PRIMER tick real del feed.
+    mcMig: mcMigUsd > 0 ? mcMigUsd : null,
+    mcMigSource: mcMigUsd > 0 ? "evento" : "1er-tick",
     t0: Date.now(),
-    puntos: [{ t: 0, p: 0 }],
-    lastSample: Date.now(),
+    puntos: [],            // se rellena cuando haya referencia (primer tick fija el 0%)
+    lastSample: 0,
     minP: 0, minT: 0,
     maxP: 0, maxT: 0,
     finished: false,
   };
+  if (rec.mcMig != null) rec.puntos.push({ t: 0, p: 0 });
   state.mcoRecordings.set(mint, rec);
-  addLog(`🔬 MCREC GRABANDO: ${symbol} | MC mig ${formatMC(mcMigUsd)} — ${MCO_RECORD_MS/60000}min`, "accept");
+  addLog(`🔬 MCREC GRABANDO: ${symbol} | MC mig ${rec.mcMig != null ? formatMC(rec.mcMig) : "(esperando 1er tick)"} — ${MCO_RECORD_MS/60000}min`, "accept");
   rec.timer = setTimeout(() => mcoFinish(mint), MCO_RECORD_MS);
 }
 
 function mcoSample(mint, price) {
   const rec = state.mcoRecordings.get(mint);
-  if (!rec || rec.finished || price <= 0 || rec.mcMig <= 0) return;
+  if (!rec || rec.finished || price <= 0) return;
+  const mcNow = price * 1_000_000_000;   // MC actual en USD (supply 1e9)
+  // Si no teníamos MC de referencia (el evento vino sin marketCapSol), lo fijamos
+  // con este primer tick. A partir de aquí, ese es el punto 0% del recorrido.
+  if (rec.mcMig == null) {
+    rec.mcMig = mcNow;
+    rec.t0 = Date.now();           // reiniciar t0 al primer tick real
+    rec.lastSample = 0;
+    rec.puntos.push({ t: 0, p: 0 });
+    addLog(`🔬 MCREC ref fijada (1er tick): ${rec.symbol} | MC ${formatMC(rec.mcMig)}`, "accept");
+    return;
+  }
+  if (rec.mcMig <= 0) return;
   const dt = Date.now() - rec.t0;
   const interval = dt <= MCO_T1_MS ? MCO_T1_INTERVAL : MCO_T2_INTERVAL;
-  if (Date.now() - rec.lastSample < interval) return;
+  if (rec.lastSample && Date.now() - rec.lastSample < interval) return;
   rec.lastSample = Date.now();
-  const mcNow = price * 1_000_000_000;
   const pct = +((mcNow - rec.mcMig) / rec.mcMig * 100).toFixed(2);
   const tSec = Math.round(dt / 1000);
   rec.puntos.push({ t: tSec, p: pct });
@@ -638,6 +653,12 @@ function mcoFinish(mint) {
   unsubscribeToken(mint);
 
   const pts = rec.puntos;
+  // Si nunca llegó un tick válido (token sin trades tras migrar), no hay nada que medir.
+  if (rec.mcMig == null || pts.length < 2) {
+    addLog(`[MCREC] sym=${rec.symbol} SIN DATOS (${pts.length} pts, MC ref ${rec.mcMig == null ? "nunca llegó" : formatMC(rec.mcMig)}) — token sin actividad tras migrar`, "rec");
+    return;
+  }
+
   const lastP = pts.length ? pts[pts.length - 1].p : 0;
 
   let maxAfterMin = rec.minP;
@@ -650,7 +671,7 @@ function mcoFinish(mint) {
 
   const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
   addLog(
-    `[MCREC] sym=${rec.symbol} MCmig=${formatMC(rec.mcMig)} ` +
+    `[MCREC] sym=${rec.symbol} MCmig=${formatMC(rec.mcMig)}(${rec.mcMigSource}) ` +
     `suelo=${rec.minP}%@${rec.minT}s techo=${rec.maxP}%@${rec.maxT}s ` +
     `rebote_desde_suelo=${reboteDesdeSuelo}pts@${maxAfterMinT}s tiro_fuerte=${tiroFuerte} ` +
     `cierre=${lastP}% pts=${ptsRaw}`,
