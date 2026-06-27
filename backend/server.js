@@ -448,6 +448,20 @@ const seenMigMints = new Set();
 const seenMomPools = new Set();
 const momSignalCooldown = new Map();
 const momMuteCooldown = new Map();
+// v6.18.8: lista negra por token. Cuando un token hace PERDER una operación de momentum,
+// no se vuelve a operar durante MOM_BLACKLIST_MS (2h). El análisis de 137 operaciones mostró
+// que el bot re-entraba en los mismos tokens malos (𝕏GIFT perdió 7/10, WENDU 4/5, Pondeer 3/3).
+// Banear tras 1 pérdida pasó el P&L simulado de -156% a +25% (costo 4%).
+const momBlacklist = new Map();   // mint -> timestamp de baneo
+const MOM_BLACKLIST_MS = 2 * 60 * 60 * 1000;   // 2 horas
+const MOM_BLACKLIST_DEMO_PCT = 4;   // en demo (sin costos), banear si cerró por debajo de +4% (no cubriría costo real)
+
+function momIsBlacklisted(mint) {
+  const banAt = momBlacklist.get(mint);
+  if (!banAt) return false;
+  if (Date.now() - banAt >= MOM_BLACKLIST_MS) { momBlacklist.delete(mint); return false; }
+  return true;
+}
 
 function addLog(msg, type = "info") {
   const entry = { msg, type, time: Date.now() };
@@ -876,6 +890,10 @@ async function momentumScan() {
         state.stats.mom_disc_liquidity++; continue;
       }
       if (pct1h < MOM_MIN_PCT_1H || pct1h > MOM_MAX_PCT_1H) continue;
+      if (momIsBlacklisted(mint)) {
+        addLog(`🚫 MOM lista negra (perdió hace <2h): ${tok.symbol||mint.slice(0,8)}`, "filter");
+        continue;
+      }
       const muteAt = momMuteCooldown.get(mint) || 0;
       if (Date.now() - muteAt < MOM_MUTE_COOLDOWN_MS) continue;
       const lastSig = momSignalCooldown.get(mint) || 0;
@@ -1168,6 +1186,13 @@ async function closeRealTrade(trade, price, reason) {
   }
   state.stats.realOpen = Math.max(0, state.stats.realOpen - 1);
   state.stats.walletBalance = await getWalletBalance(true);
+  // v6.18.8: lista negra. Si una operación de momentum perdió dinero REAL (tras costos),
+  // banear el token 2h para no re-entrar. realPnlSol incluye slip+fee, así que un "WIN"
+  // de tick que en realidad perdió SOL también banea (caso FARM/suelo bajo).
+  if (trade.strategy === "momentum" && realPnlSol < 0) {
+    momBlacklist.set(trade.mint, Date.now());
+    addLog(`🚫 Lista negra 2h: ${trade.symbol} (perdió ${realPnlSol} SOL real)`, "filter");
+  }
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "realTradeClosed", data: trade });
@@ -1433,6 +1458,12 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   }
   if (isMig(trade.strategy)) liveRecFinish(trade.mint, trade.pnlPct);
   if (trade.strategy === "momentum") momRecFinish(trade.mint, trade.pnlPct);
+  // v6.18.8: lista negra en demo, coherente con la real. En demo no hay costos, así que
+  // baneamos si el cierre no supera el umbral de rentabilidad (~+4% cubre el costo real medio).
+  // Así la demo simula fielmente la estrategia "no re-entrar en tokens que no rinden".
+  if (trade.strategy === "momentum" && trade.pnlPct < MOM_BLACKLIST_DEMO_PCT) {
+    momBlacklist.set(trade.mint, Date.now());
+  }
   if (isMig(trade.strategy)) migCleanup(trade.mint, trade.symbol);
   if (trade.strategy === "momentum") momCleanup(trade.mint, trade.symbol);
   broadcast({ event: "stats", data: state.stats });
@@ -1573,7 +1604,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.7 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.8 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
