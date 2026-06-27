@@ -455,6 +455,7 @@ const momMuteCooldown = new Map();
 const momBlacklist = new Map();   // mint -> timestamp de baneo
 const MOM_BLACKLIST_MS = 2 * 60 * 60 * 1000;   // 2 horas
 const MOM_BLACKLIST_DEMO_PCT = 4;   // en demo (sin costos), banear si cerró por debajo de +4% (no cubriría costo real)
+const openingLocks = new Map();   // v6.18.9: estrategia -> nº de compras EN CURSO (evita compras simultáneas → error 400)
 
 function momIsBlacklisted(mint) {
   const banAt = momBlacklist.get(mint);
@@ -1126,6 +1127,14 @@ async function openRealTrade(signal) {
   const isMigStrat = signal.strategy === "migration";
   const maxForStrat = isMigStrat ? MAX_MIG_REAL : MAX_MOM_REAL;
   if (stratOpen >= maxForStrat) { addLog(`⚠️ Límite real [${signal.strategy}]: ${stratOpen}/${maxForStrat}`, "warn"); return; }
+  // v6.18.9: cerrojo de apertura. Sin esto, varias señales simultáneas pasaban el chequeo de
+  // límite a la vez (ninguna está "OPEN" todavía porque la compra es async) y disparaban
+  // 3 compras en paralelo desde la misma wallet → PumpPortal devolvía 400 (blockhash/concurrencia).
+  // Contamos las compras EN CURSO además de las ya abiertas.
+  const openingStrat = openingLocks.get(signal.strategy) || 0;
+  if (stratOpen + openingStrat >= maxForStrat) { addLog(`⏳ Compra ya en curso [${signal.strategy}], salto: ${signal.symbol}`, "warn"); return; }
+  openingLocks.set(signal.strategy, openingStrat + 1);
+  try {
   const solAmount = isMigStrat ? SOL_PER_TRADE_MIG : SOL_PER_TRADE_MOM;
   const durationForStrat = isMigStrat ? MIG_DURATION_MS : MOM_DURATION_MS;
   const balance = await getWalletBalance();
@@ -1154,6 +1163,10 @@ async function openRealTrade(signal) {
   broadcast({ event: "stats", data: state.stats });
   addLog(`🔴 REAL [${signal.strategy}]: ${signal.symbol} | ${solAmount} SOL`, "real");
   saveState();
+  } finally {
+    const lk = openingLocks.get(signal.strategy) || 1;
+    openingLocks.set(signal.strategy, Math.max(0, lk - 1));
+  }
 }
 
 async function closeRealTrade(trade, price, reason) {
