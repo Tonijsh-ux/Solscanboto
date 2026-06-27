@@ -81,14 +81,14 @@ const MIG_TOP_FLOOR_TRIGGER = 100;
 const MIG_TOP_FLOOR = 0.65;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.12;   // v6.18.4: subido de +6% a +12%. El costo round-trip real medido on-chain (~8% en migración) hacía que +6% diera neto negativo. +12% deja margen sobre el costo.
+const MOM_TP = 1.25;   // v6.18.10: subido +12%→+25% para atacar la asimetría (las ganadoras deben ser grandes para compensar costos + pérdidas amplificadas). Estudio de viabilidad.
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
-const MOM_MIN_PCT_1H = 10;
-const MOM_MAX_PCT_1H = 30;
-const MOM_MIN_VOL_1H = 100_000;
-const MOM_MIN_MC = 100_000;
-const MOM_MAX_MC = 1_000_000;
+const MOM_MIN_PCT_1H = 5;    // v6.18.10: bajado 10→5 para recoger más tokens en demo (estudio de viabilidad)
+const MOM_MAX_PCT_1H = 50;   // v6.18.10: subido 30→50 (estudio)
+const MOM_MIN_VOL_1H = 40_000;   // v6.18.10: bajado 100K→40K (estudio)
+const MOM_MIN_MC = 50_000;    // v6.18.10: bajado 100K→50K (estudio)
+const MOM_MAX_MC = 3_000_000;   // v6.18.10: subido 1M→3M (estudio)
 const MOM_SCAN_MS = 30_000;
 const MOM_MIN_LIQUIDITY = 50_000;     // v6.18.3: subido de 20K a 50K. Con 20K el slippage de la propia venta mueve el precio 5-10%, así que el SL/TP no se ejecutan a los precios previstos. 50K = ejecución más limpia (informe estrategia).
 const MOM_MUTE_TIMEOUT_MS = 90_000;
@@ -104,8 +104,8 @@ const MOM_FOLLOW_PCT = 0.05;   // v6.18.3: ensanchado de 2% a 5%. El 2% se dispa
 // v6.18.7: suelo de ganancia. Cuando el token toca +5% (MOM_FLOOR_TRIGGER), el stop
 // se ancla en +3% (MOM_FLOOR) y NUNCA baja de ahí. Evita los "WIN falsos" tipo FARM
 // (subió a +6.4%, el trailing lo dejó cerrar en +1% → pérdida real tras costos).
-const MOM_FLOOR_TRIGGER = 0.05;   // +5% de máximo alcanzado
-const MOM_FLOOR = 0.03;           // suelo asegurado: stop nunca baja de +3%
+const MOM_FLOOR_TRIGGER = 0.10;   // v6.18.10: +10% (antes +5%). Coherente con suelo +8%.
+const MOM_FLOOR = 0.08;           // v6.18.10: suelo +8% (antes +3%). Captura las medianas que no llegan al TP +25%.
 const MOM_PENDING_TIMEOUT_MS = 15_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
@@ -996,7 +996,7 @@ function momActivateFromPending(mint, entryPrice) {
     price: entryPrice, tp: +(entryPrice*MOM_TP).toFixed(12), sl: +(entryPrice*MOM_SL).toFixed(12),
     mcUsd: pending.mc, vol1h: pending.vol1h, pct1h: pending.pct1h, time: Date.now(),
   };
-  addLog(`⚡ ENTRADA [birdeye]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +6% SL -3% | 45min`, "accept");
+  addLog(`⚡ ENTRADA [birdeye]: ${pending.symbol} @ $${entryPrice.toFixed(8)} | TP +${((MOM_TP-1)*100).toFixed(0)}% SL -${((1-MOM_SL)*100).toFixed(0)}% | 45min`, "accept");
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
   broadcast({ event: "newSignal", data: signal });
@@ -1625,7 +1625,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.18.9 — fix momentum real (precio+feed mudo) + límite 1 + TP +12% | momentum Birdeye + params v6.6 (lock +5%, mudo 0.03%) + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.18.10 — ESTUDIO momentum (TP +25%, suelo +8%, filtros bajos) + lista negra 2h + cerrojo compras | momentum Birdeye + reconciliación + kill-switch | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
   // avisos de secretos faltantes
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
