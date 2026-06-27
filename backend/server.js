@@ -157,8 +157,8 @@ const BIRDEYE_TRADE_DATA = "https://public-api.birdeye.so/defi/v3/token/trade-da
 // Umbrales de la señal (calibrables con datos). MODO SOMBRA: por ahora solo registra, no bloquea.
 const ENTRY_SIGNAL_SHADOW = true;       // true = solo registra "habría comprado/no"; false = bloquea de verdad
 const ENTRY_MIN_BUYSELL_RATIO = 1.3;    // ratio trades buy/sell mínimo (presión compradora)
-const ENTRY_MIN_VOL_RATIO = 1.2;        // ratio volumen buy/sell mínimo
-const ENTRY_MIN_TRADE_ACCEL = -20;      // aceleración de trades: rechazar si cae más de -20% (momentum agotándose)
+const ENTRY_MIN_VOL_RATIO = 0;        // ratio volumen buy/sell mínimo
+const ENTRY_MIN_TRADE_ACCEL = -9999;      // aceleración de trades: rechazar si cae más de -20% (momentum agotándose)
 
 let wallet = null;
 let connection = null;
