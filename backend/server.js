@@ -17,7 +17,7 @@ import bs58 from "bs58";
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE_MIG = 0.5;
 const SOL_PER_TRADE = 0.5;
-const MAX_REAL_TRADES = 26;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
+const MAX_REAL_TRADES = 0;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
 const MAX_MIG_REAL = 6;
 // v6.18.4: momentum real ACTIVADO con límite estricto de 1 operación y lote pequeño, solo para medir el costo real on-chain.
 const SOL_PER_TRADE_MOM = 0.25;
