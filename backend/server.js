@@ -15,13 +15,13 @@ import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
 
 const PORT = process.env.PORT || 3001;
-const SOL_PER_TRADE_MIG = 0.15;
-const SOL_PER_TRADE = 0.15;
-const MAX_REAL_TRADES = 7;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
+const SOL_PER_TRADE_MIG = 0.5;
+const SOL_PER_TRADE = 0.5;
+const MAX_REAL_TRADES = 26;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
 const MAX_MIG_REAL = 6;
 // v6.18.4: momentum real ACTIVADO con límite estricto de 1 operación y lote pequeño, solo para medir el costo real on-chain.
-const SOL_PER_TRADE_MOM = 0.05;
-const MAX_MOM_REAL = 1;
+const SOL_PER_TRADE_MOM = 0.25;
+const MAX_MOM_REAL = 20;
 // Momentum ahora también opera real (límite 1) — migration opera en real
 const REAL_STRATEGIES = ["migration", "momentum"];
 // CAMBIO: estado fuera de /tmp (que se borra al reiniciar en muchos hosts).
@@ -61,7 +61,7 @@ const OBS_T3_INTERVAL = 5_000;
 // Por cada migración escupe [MCREC] con: MC de salida, suelo (caída máx % y cuándo),
 // y rebote desde ese suelo. Sirve para ver cuánto cae un token antes de tirar fuerte.
 // Independiente: cuando está ON, MIGRACIÓN no opera (solo graba). MOMENTUM sigue igual.
-const MC_OBSERVER = true;             // ⬅️ ON = recoge migraciones y graba recorrido MC
+const MC_OBSERVER = false;             // ⬅️ ON = recoge migraciones y graba recorrido MC
 const MCO_RECORD_MS = 600_000;        // grabar 10 min por migración
 const MCO_T1_MS = 120_000;            // primeros 2 min: muestreo denso (sacudida+rebote)
 const MCO_T1_INTERVAL = 2_000;        //   → cada 2s
@@ -134,8 +134,8 @@ const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 // Al saltar por racha, pausa 1h. Al saltar por pérdida diaria, pausa hasta el
 // cambio de día (UTC). El estado se persiste para que un reinicio no lo resetee.
 const RISK = {
-  maxDailyLossSol: 0.5,
-  maxConsecutiveLosses: 8,
+  maxDailyLossSol: 1.5,
+  maxConsecutiveLosses: 15,
   cooldownAfterStreakMs: 60 * 60 * 1000, // 1h tras racha
 };
 
