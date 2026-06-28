@@ -117,8 +117,8 @@ const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 // Migración sigue con PumpPortal. Momentum compra/vende por Jupiter.
 const USE_JUPITER_MOM = true;   // ⬅️ false = vuelve a PumpPortal al instante (revertir)
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
-const JUP_SWAP = "https://quote-api.jup.ag/v6/swap";
+const JUP_QUOTE = "https://lite-api.jup.ag/swap/v1/quote";
+const JUP_SWAP = "https://lite-api.jup.ag/swap/v1/swap";
 
 // ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──
 const RISK = {
@@ -139,7 +139,7 @@ const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dex
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 const BIRDEYE_TRADE_DATA = "https://public-api.birdeye.so/defi/v3/token/trade-data/single";
-const ENTRY_SIGNAL_SHADOW = false;
+const ENTRY_SIGNAL_SHADOW = true;
 const ENTRY_MIN_BUYSELL_RATIO = 1.3;
 const ENTRY_MIN_VOL_RATIO = 0;
 const ENTRY_MIN_TRADE_ACCEL = -9999;
