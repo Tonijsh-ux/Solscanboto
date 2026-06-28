@@ -17,16 +17,11 @@ import bs58 from "bs58";
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE_MIG = 0.5;
 const SOL_PER_TRADE = 0.5;
-const MAX_REAL_TRADES = 0;   // v6.18.4: 6 (migración) + 1 (momentum prueba)
+const MAX_REAL_TRADES = 4;   // v6.20: prueba de Jupiter en momentum (tope global bajo)
 const MAX_MIG_REAL = 6;
-// v6.18.4: momentum real ACTIVADO con límite estricto de 1 operación y lote pequeño, solo para medir el costo real on-chain.
 const SOL_PER_TRADE_MOM = 0.25;
 const MAX_MOM_REAL = 20;
-// Momentum ahora también opera real (límite 1) — migration opera en real
 const REAL_STRATEGIES = ["migration", "momentum"];
-// CAMBIO: estado fuera de /tmp (que se borra al reiniciar en muchos hosts).
-// Se puede sobreescribir con STATE_FILE en el entorno. Si /var/data no existe,
-// cae a ./solscanbot_state.json en el cwd (persistente si el cwd lo es).
 const STATE_FILE = process.env.STATE_FILE
   || (fs.existsSync("/var/data") ? "/var/data/solscanbot_state.json" : "./solscanbot_state.json");
 
@@ -56,17 +51,13 @@ const OBS_T2_MS = 300_000;
 const OBS_T2_INTERVAL = 3_000;
 const OBS_T3_INTERVAL = 5_000;
 
-// ── MODO MC_OBSERVER (v6.19.1): buscar punto óptimo de entrada por caída de MC ──
-// Graba el recorrido del MC en % desde el MC de migración (evento PumpPortal).
-// Por cada migración escupe [MCREC] con: MC de salida, suelo (caída máx % y cuándo),
-// y rebote desde ese suelo. Sirve para ver cuánto cae un token antes de tirar fuerte.
-// Independiente: cuando está ON, MIGRACIÓN no opera (solo graba). MOMENTUM sigue igual.
-const MC_OBSERVER = false;             // ⬅️ ON = recoge migraciones y graba recorrido MC
-const MCO_RECORD_MS = 600_000;        // grabar 10 min por migración
-const MCO_T1_MS = 120_000;            // primeros 2 min: muestreo denso (sacudida+rebote)
-const MCO_T1_INTERVAL = 2_000;        //   → cada 2s
-const MCO_T2_INTERVAL = 5_000;        // resto (2-10 min) → cada 5s
-const MCO_STRONG_REBOUND = 40;        // puntos de recuperación desde el suelo = "tiró fuerte"
+// ── MODO MC_OBSERVER (v6.19.1) ──
+const MC_OBSERVER = false;
+const MCO_RECORD_MS = 600_000;
+const MCO_T1_MS = 120_000;
+const MCO_T1_INTERVAL = 2_000;
+const MCO_T2_INTERVAL = 5_000;
+const MCO_STRONG_REBOUND = 40;
 
 const MIG_BREAKEVEN_AT = 0.99;
 const MIG_BREAKEVEN_MARGIN = 0.03;
@@ -93,54 +84,50 @@ const MIG_TOP_FLOOR_TRIGGER = 100;
 const MIG_TOP_FLOOR = 0.65;
 
 // ── CONFIG MOMENTUM ────────────────────────────────────────────
-const MOM_TP = 1.25;   // v6.18.10: subido +12%→+25% para atacar la asimetría (las ganadoras deben ser grandes para compensar costos + pérdidas amplificadas). Estudio de viabilidad.
+const MOM_TP = 1.25;
 const MOM_SL = 0.97;
 const MOM_DURATION_MS = 45 * 60 * 1000;
-const MOM_MIN_PCT_1H = 5;    // v6.18.10: bajado 10→5 para recoger más tokens en demo (estudio de viabilidad)
-const MOM_MAX_PCT_1H = 50;   // v6.18.10: subido 30→50 (estudio)
-const MOM_MIN_VOL_1H = 40_000;   // v6.18.10: bajado 100K→40K (estudio)
-const MOM_MIN_MC = 50_000;    // v6.18.10: bajado 100K→50K (estudio)
-const MOM_MAX_MC = 3_000_000;   // v6.18.10: subido 1M→3M (estudio)
+const MOM_MIN_PCT_1H = 5;
+const MOM_MAX_PCT_1H = 50;
+const MOM_MIN_VOL_1H = 40_000;
+const MOM_MIN_MC = 50_000;
+const MOM_MAX_MC = 3_000_000;
 const MOM_SCAN_MS = 30_000;
-const MOM_MIN_LIQUIDITY = 50_000;     // v6.18.3: subido de 20K a 50K. Con 20K el slippage de la propia venta mueve el precio 5-10%, así que el SL/TP no se ejecutan a los precios previstos. 50K = ejecución más limpia (informe estrategia).
+const MOM_MIN_LIQUIDITY = 50_000;
 const MOM_MUTE_TIMEOUT_MS = 90_000;
 const MOM_HARD_CAP_LOSS = -10;
 const MOM_MAX_ENTRY_DRIFT = 0.04;
 const MOM_MUTE_COOLDOWN_MS = 15 * 60_000;
 const MOM_MUTE_CHECK_MS = 5_000;
-const MOM_MUTE_MIN_MOVE = 0.0003;  // v6.18.1: <0.03% en 5s = feed muerto (bajado de 0.05%)
+const MOM_MUTE_MIN_MOVE = 0.0003;
 const BIRDEYE_PRICE = "https://public-api.birdeye.so/defi/price";
 const MOM_BREAKEVEN_AT = 0.03;
-const MOM_LOCK_AT = 0.05;   // v6.18.1: vuelto a +5% (params v6.6 — deja correr más hacia el TP en vez de estrangular en +3%)
-const MOM_FOLLOW_PCT = 0.05;   // v6.18.3: ensanchado de 2% a 5%. El 2% se dispara con ruido normal de memecoins y cierra trades buenos antes de tiempo (informe estrategia).
-// v6.18.7: suelo de ganancia. Cuando el token toca +5% (MOM_FLOOR_TRIGGER), el stop
-// se ancla en +3% (MOM_FLOOR) y NUNCA baja de ahí. Evita los "WIN falsos" tipo FARM
-// (subió a +6.4%, el trailing lo dejó cerrar en +1% → pérdida real tras costos).
-const MOM_FLOOR_TRIGGER = 0.10;   // v6.18.10: +10% (antes +5%). Coherente con suelo +8%.
-const MOM_FLOOR = 0.08;           // v6.18.10: suelo +8% (antes +3%). Captura las medianas que no llegan al TP +25%.
+const MOM_LOCK_AT = 0.05;
+const MOM_FOLLOW_PCT = 0.05;
+const MOM_FLOOR_TRIGGER = 0.10;
+const MOM_FLOOR = 0.08;
 const MOM_PENDING_TIMEOUT_MS = 15_000;
 const MOM_SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 const MOM_EXPIRED_WIN_PCT = 2;
-const MOM_RECORD = true;   // v6.15.4: grabar [MOMREC]
-// CAMBIO (fix momentum): seguimiento de momentum SOLO con precio de Birdeye,
-// coherente con el precio de entrada (que también es de Birdeye). Cada cuántos ms
-// se repregunta el precio de las posiciones de momentum abiertas. Una sola llamada
-// batch por ciclo (multi_price) para todas las posiciones de momentum a la vez.
-const MOM_TRACK_MS = 15_000;   // tracker de posiciones abiertas de momentum. A 5s da mejor resolución pero revienta el cupo de Birdeye en continuo; para tick fino permanente, pasar a DexScreener.
+const MOM_RECORD = true;
+const MOM_TRACK_MS = 15_000;
 const BIRDEYE_MULTI_PRICE = "https://public-api.birdeye.so/defi/multi_price";
 
-// ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──────────────────────────
-// Límites elegidos: -0.5 SOL de pérdida diaria, 8 pérdidas reales seguidas.
-// Al saltar por racha, pausa 1h. Al saltar por pérdida diaria, pausa hasta el
-// cambio de día (UTC). El estado se persiste para que un reinicio no lo resetee.
+// ── JUPITER para momentum (v6.20): rutea todos los DEX, elimina el 400 de PumpPortal ──
+// Migración sigue con PumpPortal. Momentum compra/vende por Jupiter.
+const USE_JUPITER_MOM = true;   // ⬅️ false = vuelve a PumpPortal al instante (revertir)
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const JUP_QUOTE = "https://quote-api.jup.ag/v6/quote";
+const JUP_SWAP = "https://quote-api.jup.ag/v6/swap";
+
+// ── KILL-SWITCH DE PORTAFOLIO (v6.18) ──
 const RISK = {
   maxDailyLossSol: 1.5,
-  maxConsecutiveLosses: 15,
-  cooldownAfterStreakMs: 60 * 60 * 1000, // 1h tras racha
+  maxConsecutiveLosses: 12,
+  cooldownAfterStreakMs: 60 * 60 * 1000,
 };
 
-// ── SECRETOS: ahora desde el entorno (rotar las keys expuestas) ──
-// Antes estaban hardcodeadas en el archivo. Si falta alguna, se avisa al arrancar.
+// ── SECRETOS desde el entorno ──
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const SOLANA_RPC = process.env.SOLANA_RPC
   || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "https://api.mainnet-beta.solana.com");
@@ -151,14 +138,11 @@ const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
 const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dexes/pumpswap/pools";
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
-// v6.19.0: señal de entrada (timing). Token Trade Data Single (12 CU) da volumen buy/sell,
-// nº trades buy/sell y aceleración por ventanas. Construye la confirmación "ahora SÍ / ahora NO".
 const BIRDEYE_TRADE_DATA = "https://public-api.birdeye.so/defi/v3/token/trade-data/single";
-// Umbrales de la señal (calibrables con datos). MODO SOMBRA: por ahora solo registra, no bloquea.
-const ENTRY_SIGNAL_SHADOW = true;       // true = solo registra "habría comprado/no"; false = bloquea de verdad
-const ENTRY_MIN_BUYSELL_RATIO = 1.3;    // ratio trades buy/sell mínimo (presión compradora)
-const ENTRY_MIN_VOL_RATIO = 0;        // ratio volumen buy/sell mínimo
-const ENTRY_MIN_TRADE_ACCEL = -9999;      // aceleración de trades: rechazar si cae más de -20% (momentum agotándose)
+const ENTRY_SIGNAL_SHADOW = false;
+const ENTRY_MIN_BUYSELL_RATIO = 1.3;
+const ENTRY_MIN_VOL_RATIO = 0;
+const ENTRY_MIN_TRADE_ACCEL = -9999;
 
 let wallet = null;
 let connection = null;
@@ -206,6 +190,16 @@ async function getTokenBalance(mint) {
   } catch { return 0; }
 }
 
+// Cantidad CRUDA del token (unidades base, no uiAmount). Jupiter la necesita así.
+async function getTokenBalanceRaw(mint) {
+  if (!wallet || !connection) return 0;
+  try {
+    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) });
+    if (!accounts.value.length) return 0;
+    return accounts.value[0].account.data.parsed.info.tokenAmount.amount || 0;
+  } catch { return 0; }
+}
+
 // ── KILL-SWITCH: estado de riesgo (persistente) ──
 const riskState = {
   dayKey: null,
@@ -222,11 +216,9 @@ function riskRolloverDay() {
     riskState.dayKey = k;
     riskState.dailyPnlSol = 0;
     riskState.consecutiveLosses = 0;
-    // no se toca pausedUntil aquí: una pausa por racha puede cruzar medianoche
   }
 }
 
-// ¿Está pausada la operativa real? (consultar antes de cada entrada real)
 function tradingHalted() {
   riskRolloverDay();
   if (Date.now() < riskState.pausedUntil) return true;
@@ -241,7 +233,7 @@ function tradingHalted() {
   if (riskState.consecutiveLosses >= RISK.maxConsecutiveLosses) {
     if (Date.now() >= riskState.pausedUntil) {
       riskState.pausedUntil = Date.now() + RISK.cooldownAfterStreakMs;
-      riskState.consecutiveLosses = 0; // reset de la racha tras pausar
+      riskState.consecutiveLosses = 0;
       addLog(`🛑 KILL-SWITCH: ${RISK.maxConsecutiveLosses} pérdidas reales seguidas — pausa 1h`, "error");
       broadcast({ event: "risk", data: riskSnapshot() });
     }
@@ -250,7 +242,6 @@ function tradingHalted() {
   return false;
 }
 
-// Registrar el resultado de un trade real cerrado (llamar desde closeRealTrade)
 function riskRecordClose(pnlSol) {
   riskRolloverDay();
   riskState.dailyPnlSol = +(riskState.dailyPnlSol + pnlSol).toFixed(6);
@@ -278,7 +269,7 @@ const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
   obsRecordings: new Map(),
-  mcoRecordings: new Map(),   // MC_OBSERVER: mint → recorrido del MC desde migración
+  mcoRecordings: new Map(),
   liveRecordings: new Map(),
   momPending: new Map(),
   momMonitored: new Map(),
@@ -318,8 +309,6 @@ function serializeMigWatching() {
 
 function saveState() {
   try {
-    // CAMBIO: escritura atómica (tmp + rename) para no corromper el archivo
-    // si el proceso muere a mitad de escritura. Incluye riskState.
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify({
       demoTrades: state.demoTrades,
@@ -337,10 +326,6 @@ function saveState() {
   } catch (e) { console.log("Error guardando estado:", e.message); }
 }
 
-// CAMBIO: loadState ya NO marca las posiciones reales OPEN como EXPIRED a ciegas.
-// Solo carga del disco. La decisión sobre las reales abiertas la toma
-// reconcileStateOnBoot() leyendo la wallet on-chain. Las DEMO sí se cierran
-// (no hay nada on-chain que reconciliar para demo).
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) return;
@@ -349,28 +334,24 @@ function loadState() {
     if (saved.realTrades) state.realTrades = saved.realTrades;
     if (saved.movements) state.movements = saved.movements;
     if (saved.stats) state.stats = { ...state.stats, ...saved.stats };
-    // restaurar kill-switch
     if (saved.riskState) {
       riskState.dayKey = saved.riskState.dayKey ?? null;
       riskState.dailyPnlSol = saved.riskState.dailyPnlSol ?? 0;
       riskState.consecutiveLosses = saved.riskState.consecutiveLosses ?? 0;
       riskState.pausedUntil = saved.riskState.pausedUntil ?? 0;
-      riskRolloverDay(); // si cambió el día (UTC), resetea el diario
+      riskRolloverDay();
     }
-    // DEMO: cerrar las que quedaron abiertas (sin contraparte on-chain)
     for (const trade of state.demoTrades) {
       if (trade.status === "OPEN" || trade.status === "CLOSING") {
         trade.status = "CLOSED"; trade.result = "EXPIRED";
         trade.pnlPct = trade.pnlPct || 0; trade.closeTime = Date.now();
       }
     }
-    // REAL: NO tocar aquí. Quedan como están para que reconcileStateOnBoot decida.
     state.stats.demoOpen = 0;
     addLog(`✅ Estado cargado: ${state.demoTrades.length} demo, ${state.realTrades.length} real (real pendiente de reconciliar)`, "info");
   } catch (e) { addLog(`⚠️ Error cargando estado: ${e.message}`, "warn"); }
 }
 
-// CAMBIO (Parte 1 del documento): reconciliación de estado al arrancar.
 async function reconcileStateOnBoot() {
   if (!wallet || !connection) {
     let n = 0;
@@ -454,7 +435,6 @@ const seenMigMints = new Set();
 const seenMomPools = new Set();
 const momSignalCooldown = new Map();
 const momMuteCooldown = new Map();
-// v6.18.8: lista negra por token.
 const momBlacklist = new Map();
 const MOM_BLACKLIST_MS = 2 * 60 * 60 * 1000;
 const MOM_BLACKLIST_DEMO_PCT = 4;
@@ -589,11 +569,9 @@ function momRecFinish(mint, cierreRealPct) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// MODO MC_OBSERVER: recorrido del MC desde la migración (busca suelo+rebote)
+// MODO MC_OBSERVER
 // ════════════════════════════════════════════════════════════════
 
-// Arranca la grabación al detectar una migración. mcMigUsd = MC del EVENTO
-// de migración (punto 0%). Todo el recorrido se mide en % respecto a ese MC.
 function mcoStart(mint, symbol, mcMigUsd) {
   if (!MC_OBSERVER) return;
   if (state.mcoRecordings.has(mint)) return;
@@ -602,12 +580,10 @@ function mcoStart(mint, symbol, mcMigUsd) {
   }
   const rec = {
     mint, symbol,
-    // mcMig puede venir 0 si PumpPortal no manda marketCapSol en el evento (caso común:
-    // mcSol:?). En ese caso lo dejamos null y lo fijamos con el PRIMER tick real del feed.
     mcMig: mcMigUsd > 0 ? mcMigUsd : null,
     mcMigSource: mcMigUsd > 0 ? "evento" : "1er-tick",
     t0: Date.now(),
-    puntos: [],            // se rellena cuando haya referencia (primer tick fija el 0%)
+    puntos: [],
     lastSample: 0,
     minP: 0, minT: 0,
     maxP: 0, maxT: 0,
@@ -622,12 +598,10 @@ function mcoStart(mint, symbol, mcMigUsd) {
 function mcoSample(mint, price) {
   const rec = state.mcoRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
-  const mcNow = price * 1_000_000_000;   // MC actual en USD (supply 1e9)
-  // Si no teníamos MC de referencia (el evento vino sin marketCapSol), lo fijamos
-  // con este primer tick. A partir de aquí, ese es el punto 0% del recorrido.
+  const mcNow = price * 1_000_000_000;
   if (rec.mcMig == null) {
     rec.mcMig = mcNow;
-    rec.t0 = Date.now();           // reiniciar t0 al primer tick real
+    rec.t0 = Date.now();
     rec.lastSample = 0;
     rec.puntos.push({ t: 0, p: 0 });
     addLog(`🔬 MCREC ref fijada (1er tick): ${rec.symbol} | MC ${formatMC(rec.mcMig)}`, "accept");
@@ -653,7 +627,6 @@ function mcoFinish(mint) {
   unsubscribeToken(mint);
 
   const pts = rec.puntos;
-  // Si nunca llegó un tick válido (token sin trades tras migrar), no hay nada que medir.
   if (rec.mcMig == null || pts.length < 2) {
     addLog(`[MCREC] sym=${rec.symbol} SIN DATOS (${pts.length} pts, MC ref ${rec.mcMig == null ? "nunca llegó" : formatMC(rec.mcMig)}) — token sin actividad tras migrar`, "rec");
     return;
@@ -688,8 +661,6 @@ function migStartWatching(coin) {
   if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
-  // ── MODO MC_OBSERVER: si está ON, grabar el recorrido de MC y NO operar migración ──
-  // (momentum sigue operando real con normalidad; esto solo desvía migración a grabación)
   if (MC_OBSERVER) {
     const mcMigUsd = (coin.marketCapSol || 0) * solPriceUSD;
     broadcast({ event: "stats", data: state.stats });
@@ -957,7 +928,7 @@ function migUpdatePrice(mint, price, solAmount) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// ESTRATEGIA 2: MOMENTUM  (DEMO + REAL límite 1 — seguimiento SOLO con Birdeye)
+// ESTRATEGIA 2: MOMENTUM  (DEMO + REAL — seguimiento SOLO con Birdeye)
 // ════════════════════════════════════════════════════════════════
 
 async function momentumScan() {
@@ -1207,6 +1178,86 @@ async function getSolDeltaFromTx(sig, retries = 6) {
   return null;
 }
 
+// ── Jupiter (momentum): compra SOL→token y venta token→SOL ──
+async function buyTokenJupiter(mint, solAmount, slippagePct) {
+  if (!wallet || !connection) return null;
+  try {
+    const lamports = Math.round(solAmount * LAMPORTS_PER_SOL);
+    const slippageBps = Math.round(slippagePct * 100);
+    const quoteUrl = `${JUP_QUOTE}?inputMint=${SOL_MINT}&outputMint=${mint}`
+      + `&amount=${lamports}&slippageBps=${slippageBps}&swapMode=ExactIn&onlyDirectRoutes=false`;
+    const qRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(8000) });
+    if (!qRes.ok) {
+      let m = ""; try { m = (await qRes.text()).slice(0,200); } catch {}
+      addLog(`❌ Compra Jupiter quote ${qRes.status}${m ? " — " + m : ""}`, "error"); return null;
+    }
+    const quote = await qRes.json();
+    if (!quote || !quote.outAmount || quote.outAmount === "0") {
+      addLog(`❌ Compra Jupiter: sin ruta para ${shortAddr(mint)}`, "error"); return null;
+    }
+    const swapRes = await fetch(JUP_SWAP, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 500000 }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!swapRes.ok) {
+      let m = ""; try { m = (await swapRes.text()).slice(0,200); } catch {}
+      addLog(`❌ Compra Jupiter swap ${swapRes.status}${m ? " — " + m : ""}`, "error"); return null;
+    }
+    const { swapTransaction } = await swapRes.json();
+    if (!swapTransaction) { addLog(`❌ Compra Jupiter: tx vacía`, "error"); return null; }
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+    tx.sign([wallet]);
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction(sig, "confirmed");
+    const delta = await getSolDeltaFromTx(sig);
+    const costSol = delta != null ? +(-delta).toFixed(6) : solAmount;
+    addLog(`✅ COMPRA [Jupiter]: ${shortAddr(mint)} | coste real ${costSol} SOL | ${sig}`, "real");
+    return { sig, costSol };
+  } catch (e) { addLog(`❌ Compra Jupiter: ${e.message}`, "error"); return null; }
+}
+
+async function sellTokenJupiter(mint, slippagePct = 30) {
+  if (!wallet || !connection) return null;
+  try {
+    const rawAmount = await getTokenBalanceRaw(mint);
+    if (!rawAmount || Number(rawAmount) <= 0) { addLog(`⚠️ Sin tokens: ${shortAddr(mint)}`, "warn"); return null; }
+    const slippageBps = Math.round(slippagePct * 100);
+    const quoteUrl = `${JUP_QUOTE}?inputMint=${mint}&outputMint=${SOL_MINT}`
+      + `&amount=${rawAmount}&slippageBps=${slippageBps}&swapMode=ExactIn&onlyDirectRoutes=false`;
+    const qRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(8000) });
+    if (!qRes.ok) {
+      let m = ""; try { m = (await qRes.text()).slice(0,200); } catch {}
+      addLog(`❌ Venta Jupiter quote ${qRes.status}${m ? " — " + m : ""}`, "error"); return null;
+    }
+    const quote = await qRes.json();
+    if (!quote || !quote.outAmount || quote.outAmount === "0") {
+      addLog(`❌ Venta Jupiter: sin ruta para ${shortAddr(mint)}`, "error"); return null;
+    }
+    const swapRes = await fetch(JUP_SWAP, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 500000 }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!swapRes.ok) {
+      let m = ""; try { m = (await swapRes.text()).slice(0,200); } catch {}
+      addLog(`❌ Venta Jupiter swap ${swapRes.status}${m ? " — " + m : ""}`, "error"); return null;
+    }
+    const { swapTransaction } = await swapRes.json();
+    if (!swapTransaction) { addLog(`❌ Venta Jupiter: tx vacía`, "error"); return null; }
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+    tx.sign([wallet]);
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction(sig, "confirmed");
+    const delta = await getSolDeltaFromTx(sig);
+    const proceedsSol = delta != null ? +delta.toFixed(6) : 0;
+    addLog(`✅ VENTA [Jupiter]: ${shortAddr(mint)} | recibido real ${proceedsSol} SOL | ${sig}`, "real");
+    return { sig, proceedsSol };
+  } catch (e) { addLog(`❌ Venta Jupiter: ${e.message}`, "error"); return null; }
+}
+
 async function buyToken(mint, solAmount, slippage = 15) {
   if (!wallet || !connection) return null;
   try {
@@ -1277,7 +1328,10 @@ async function openRealTrade(signal) {
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount+0.01).toFixed(2)})`, "warn"); return; }
   const buySlippage = isMigStrat ? 15 : 30;
-  const buy = await buyToken(signal.mint, solAmount, buySlippage);
+  // Migración → PumpPortal (tokens pump.fun). Momentum → Jupiter (cualquier DEX, evita el 400).
+  const buy = (USE_JUPITER_MOM && !isMigStrat)
+    ? await buyTokenJupiter(signal.mint, solAmount, buySlippage)
+    : await buyToken(signal.mint, solAmount, buySlippage);
   if (!buy) return;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
@@ -1307,7 +1361,10 @@ async function openRealTrade(signal) {
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
-  const sell = await sellToken(trade.mint);
+  // Momentum vende por Jupiter; migración por PumpPortal.
+  const sell = (USE_JUPITER_MOM && trade.strategy === "momentum")
+    ? await sellTokenJupiter(trade.mint, 30)
+    : await sellToken(trade.mint);
   if (!sell) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
@@ -1737,7 +1794,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot v6.19.1 — MC_OBSERVER ${MC_OBSERVER ? "ON 🔬 (migración GRABA, no opera)" : "off"} + momentum real(1) | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL: ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | scan mom ${MOM_SCAN_MS/1000}s | track mom ${MOM_TRACK_MS/1000}s | kill: -${RISK.maxDailyLossSol} SOL/día, ${RISK.maxConsecutiveLosses} losses`);
+  console.log(`🚀 SolScanBot v6.20 — Jupiter(mom) ${USE_JUPITER_MOM ? "ON" : "off"} | MC_OBSERVER ${MC_OBSERVER ? "ON 🔬" : "off"} | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_REAL ${MAX_REAL_TRADES} (mig ${MAX_MIG_REAL}×${SOL_PER_TRADE_MIG} / mom ${MAX_MOM_REAL}×${SOL_PER_TRADE_MOM}) | scan ${MOM_SCAN_MS/1000}s track ${MOM_TRACK_MS/1000}s | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
   if (!BIRDEYE_API_KEY) addLog("⚠️ Falta BIRDEYE_API_KEY en el entorno — el scan/track de momentum fallará", "warn");
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
