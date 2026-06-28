@@ -17,11 +17,11 @@ import bs58 from "bs58";
 const PORT = process.env.PORT || 3001;
 const SOL_PER_TRADE_MIG = 0.5;
 const SOL_PER_TRADE = 0.5;
-const MAX_REAL_TRADES = 4;   // v6.20: prueba de Jupiter en momentum (tope global bajo)
+const MAX_REAL_TRADES = 6;   // v6.20.1: solo migración en real (6 huecos)
 const MAX_MIG_REAL = 6;
 const SOL_PER_TRADE_MOM = 0.25;
 const MAX_MOM_REAL = 20;
-const REAL_STRATEGIES = ["migration", "momentum"];
+const REAL_STRATEGIES = ["migration"];   // v6.20.1: momentum PARADO en real (sigue en demo)
 const STATE_FILE = process.env.STATE_FILE
   || (fs.existsSync("/var/data") ? "/var/data/solscanbot_state.json" : "./solscanbot_state.json");
 
@@ -139,7 +139,7 @@ const GECKO_PUMPSWAP = "https://api.geckoterminal.com/api/v2/networks/solana/dex
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const BIRDEYE_TOKEN_LIST = "https://public-api.birdeye.so/defi/v3/token/list";
 const BIRDEYE_TRADE_DATA = "https://public-api.birdeye.so/defi/v3/token/trade-data/single";
-const ENTRY_SIGNAL_SHADOW = false;
+const ENTRY_SIGNAL_SHADOW = true;
 const ENTRY_MIN_BUYSELL_RATIO = 1.3;
 const ENTRY_MIN_VOL_RATIO = 0;
 const ENTRY_MIN_TRADE_ACCEL = -9999;
