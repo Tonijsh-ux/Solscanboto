@@ -39,7 +39,22 @@ const MIG_MAX_MC = 2_000_000;
 // pump-para-rugear / honeypot). El 29-jun, 3 tokens de MC $228-326K dieron "venta a
 // cero" (honeypots) y se comieron -1.48 SOL (98% de la pérdida del día). Las ganadoras
 // validadas entran a $20-50K.
-const MIG_MAX_MC_ENTRY = 80_000;
+// v6.20.3: el MC NO discrimina rendimiento (análisis de 150 ops/7 días: WR ~27%
+// en TODOS los rangos de MC). Este tope queda SOLO como cortafuegos anti-honeypot
+// extremo (los rug de "venta a cero" del 29-jun eran de MC $228-326K). No filtra
+// rendimiento, solo evita el riesgo de honeypot de MC muy alto.
+const MIG_MAX_MC_ENTRY = 150_000;
+
+// ── v6.20.3: CORTE POR NO-DESPEGUE ─────────────────────────────
+// Hallazgo clave (150 ops/7 días): el predictor real del éxito NO es el MC sino
+// el DESPEGUE rápido. Las ops que a los 15s no han tocado +10% tienen WR ~0%
+// (64 de 64 perdieron). Las que despegan >+30% ganan el 91% de las veces.
+// Regla: a los 15s de abrir, si el máximo alcanzado < +10%, salir ya.
+// Backtest: corta 36/49 perdedoras sacrificando solo 2/20 ganadoras (ratio 18:1).
+// Sube la media de +7.5%/op a ~+13.6%/op. Aplica en real y en demo.
+const MIG_LAUNCH_CHECK = true;       // ⬅️ false = desactiva el corte (volver al comportamiento previo)
+const MIG_LAUNCH_CHECK_MS = 18_000;  // a los 18s de abrir (era 15s; subido a 18s tras ver que ganadoras que despegan justo en el límite —ej. +62% que a 15s iba +8%— se cortaban; 18s salva esas perdiendo solo 1 perdedora más)
+const MIG_LAUNCH_MIN_PCT = 10;       // exige haber tocado +10% (maxGainPct)
 
 // ── MODO OBSERVADOR / GRABACIÓN EN VIVO ────────────────────────
 const OBSERVER_MODE = false;
@@ -925,6 +940,23 @@ async function openRealTrade(signal) {
   broadcast({ event: "stats", data: state.stats });
   addLog(`🔴 REAL [${signal.strategy}]: ${signal.symbol} | ${solAmount} SOL`, "real");
   saveState();
+  scheduleLaunchCheck(trade, "real");
+}
+
+// v6.20.3: corte por no-despegue. A los MIG_LAUNCH_CHECK_MS de abrir, si el trade
+// no ha tocado +MIG_LAUNCH_MIN_PCT%, se cierra (no despegó → WR histórico ~0%).
+function scheduleLaunchCheck(trade, kind) {
+  if (!MIG_LAUNCH_CHECK) return;
+  if (trade.strategy !== "migration") return;
+  setTimeout(() => {
+    if (trade.status !== "OPEN") return;            // ya cerrado por TP/SL/etc
+    if (trade.maxGainPct >= MIG_LAUNCH_MIN_PCT) return; // despegó, se mantiene
+    const token = state.migMonitored.get(trade.mint);
+    const price = token?.price || trade.entryPrice;
+    addLog(`✂️ NO-DESPEGUE [${kind} ${trade.symbol}]: max ${trade.maxGainPct.toFixed(1)}% < ${MIG_LAUNCH_MIN_PCT}% a los ${MIG_LAUNCH_CHECK_MS/1000}s → salida`, kind === "real" ? "realloss" : "loss");
+    if (kind === "real") closeRealTrade(trade, price, "NO_LAUNCH");
+    else closeDemoTrade(trade, price, "NO_LAUNCH", MIG_TP);
+  }, MIG_LAUNCH_CHECK_MS);
 }
 
 async function closeRealTrade(trade, price, reason) {
@@ -956,6 +988,11 @@ async function closeRealTrade(trade, price, reason) {
     trade.result = "LOSS"; state.stats.mig_realLosses++;
     state.stats.mig_realPnL += trade.pnlPct; state.stats.mig_realPnLSol += trade.pnlSol;
     addLog(`❌ REAL LOSS [migration]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "realloss");
+  } else if (reason === "NO_LAUNCH") {
+    trade.result = trade.pnlPct >= 0 ? "WIN" : "LOSS";
+    if (trade.result === "WIN") state.stats.mig_realWins++; else state.stats.mig_realLosses++;
+    state.stats.mig_realPnL += trade.pnlPct; state.stats.mig_realPnLSol += trade.pnlSol;
+    addLog(`✂️ REAL NO-DESPEGUE: ${trade.symbol} ${trade.pnlPct>0?"+":""}${trade.pnlPct}% en ${dur}s`, trade.result === "WIN" ? "realwin" : "realloss");
   } else {
     state.stats.mig_realPnL += trade.pnlPct; state.stats.mig_realPnLSol += trade.pnlSol;
     if (trade.pnlPct >= expWinPct) { trade.result = "WIN"; state.stats.mig_realWins++; addLog(`✅ REAL WIN [EXP+]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin"); }
@@ -1078,6 +1115,7 @@ function openDemoTrade(signal) {
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
   addLog(`📝 DEMO [${signal.strategy}]: ${signal.symbol} | TP +300% SL -20%`, "demo");
+  scheduleLaunchCheck(trade, "demo");
 }
 
 function updateDemoTrades(mint, price, strategy) {
@@ -1164,6 +1202,10 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     state.stats.mig_demoPnL += trade.pnlPct;
     if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats.mig_demoWins++; addLog(`✅ WIN [${trade.trailingPhase}][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
     else { trade.result = "LOSS"; state.stats.mig_demoLosses++; addLog(`❌ LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
+  } else if (reason === "NO_LAUNCH") {
+    state.stats.mig_demoPnL += trade.pnlPct;
+    if (trade.pnlPct > 0) { trade.result = "WIN"; state.stats.mig_demoWins++; addLog(`✂️ NO-DESPEGUE [${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
+    else { trade.result = "LOSS"; state.stats.mig_demoLosses++; addLog(`✂️ NO-DESPEGUE [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "loss"); }
   } else {
     state.stats.mig_demoPnL += trade.pnlPct;
     if (trade.pnlPct >= expWinPct) { trade.result = "WIN"; state.stats.mig_demoWins++; addLog(`✅ WIN [EXP+][${trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "win"); }
@@ -1300,7 +1342,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot MIGRACIÓN v6.20.1 — solo migración real | MC_OBSERVER ${MC_OBSERVER ? "ON 🔬" : "off"} | OBSERVER ${OBSERVER_MODE ? "ACTIVO ⚠️" : "off"} | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
+  console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — solo migración real | corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K (anti-honeypot) | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
   initWallet();
