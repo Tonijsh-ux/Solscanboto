@@ -72,12 +72,22 @@ const OBS_T2_INTERVAL = 3_000;
 const OBS_T3_INTERVAL = 5_000;
 
 // ── MODO MC_OBSERVER ──
-const MC_OBSERVER = false;
-const MCO_RECORD_MS = 600_000;
-const MCO_T1_MS = 120_000;
-const MCO_T1_INTERVAL = 2_000;
-const MCO_T2_INTERVAL = 5_000;
+// ACTIVADO para grabar 20 min y captar la FIRMA DEL RUG que descubrimos:
+//   - MC de NACIMIENTO (1er tick tras migrar) → los rugs nacen en ~2k, sanos en ~30k
+//   - VELAS DE 1s del nacimiento (vela1, vela2, vela3...) con su % cada una
+//   - La clave: tras un impulso fuerte, ¿CORRIGE (sano) o SIGUE INFLANDO (rug)?
+//   - Resultado final a los 20 min (¿murió a cero o sostuvo?)
+const MC_OBSERVER = true;
+const MCO_RECORD_MS = 1_200_000;      // 20 min de grabación
+const MCO_T1_MS = 60_000;             // primer MINUTO completo = alta resolución
+const MCO_T1_INTERVAL = 1_000;        // muestreo cada 1s durante el primer minuto
+const MCO_T2_INTERVAL = 5_000;        // después del minuto, cada 5s
 const MCO_STRONG_REBOUND = 40;
+// ── Captura de las VELAS DEL NACIMIENTO (lo que vimos con el ojo) ──
+const MCO_BIRTH_CANDLES = 12;         // grabar el % de las primeras 12 velas de 1s
+const MCO_BIRTH_WINDOW_MS = 1_000;    // cada "vela" = 1 segundo
+const MCO_PUMP_CANDLE_PCT = 50;       // vela "vertical" si sube >+50% en 1s
+const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -3%
 
 const MIG_BREAKEVEN_AT = 0.99;
 const MIG_BREAKEVEN_MARGIN = 0.03;
@@ -475,6 +485,11 @@ function mcoStart(mint, symbol, mcMigUsd) {
     minP: 0, minT: 0,
     maxP: 0, maxT: 0,
     finished: false,
+    // ── captura de las velas de 1s del nacimiento ──
+    birthCandles: [],        // [{idx, pctAcum, pctVela}] una por segundo
+    lastCandleMc: null,      // MC al cierre de la última vela (para calcular % de la vela)
+    lastCandleT: 0,          // timestamp de la última vela cerrada
+    mcNacimiento: null,      // MC del primerísimo tick (el "nacimiento")
   };
   if (rec.mcMig != null) rec.puntos.push({ t: 0, p: 0 });
   state.mcoRecordings.set(mint, rec);
@@ -488,13 +503,29 @@ function mcoSample(mint, price) {
   const mcNow = price * 1_000_000_000;
   if (rec.mcMig == null) {
     rec.mcMig = mcNow;
+    rec.mcNacimiento = mcNow;
+    rec.lastCandleMc = mcNow;
+    rec.lastCandleT = Date.now();
     rec.t0 = Date.now();
     rec.lastSample = 0;
     rec.puntos.push({ t: 0, p: 0 });
-    addLog(`🔬 MCREC ref fijada (1er tick): ${rec.symbol} | MC ${formatMC(rec.mcMig)}`, "accept");
+    addLog(`🔬 MCREC ref fijada (1er tick): ${rec.symbol} | MC nacimiento ${formatMC(rec.mcMig)}`, "accept");
     return;
   }
   if (rec.mcMig <= 0) return;
+
+  // ── VELAS DEL NACIMIENTO: cerrar una "vela" cada segundo durante las primeras N ──
+  if (rec.birthCandles.length < MCO_BIRTH_CANDLES) {
+    const dtCandle = Date.now() - rec.lastCandleT;
+    if (dtCandle >= MCO_BIRTH_WINDOW_MS) {
+      const pctVela = rec.lastCandleMc > 0 ? +((mcNow - rec.lastCandleMc) / rec.lastCandleMc * 100).toFixed(2) : 0;
+      const pctAcum = +((mcNow - rec.mcNacimiento) / rec.mcNacimiento * 100).toFixed(2);
+      rec.birthCandles.push({ idx: rec.birthCandles.length + 1, pctVela, pctAcum });
+      rec.lastCandleMc = mcNow;
+      rec.lastCandleT = Date.now();
+    }
+  }
+
   const dt = Date.now() - rec.t0;
   const interval = dt <= MCO_T1_MS ? MCO_T1_INTERVAL : MCO_T2_INTERVAL;
   if (rec.lastSample && Date.now() - rec.lastSample < interval) return;
@@ -529,9 +560,32 @@ function mcoFinish(mint) {
   const reboteDesdeSuelo = +(maxAfterMin - rec.minP).toFixed(2);
   const tiroFuerte = reboteDesdeSuelo >= MCO_STRONG_REBOUND ? "SI" : "no";
 
+  // ── ANÁLISIS DE LA FIRMA DEL NACIMIENTO (lo que descubrimos con el ojo) ──
+  const bc = rec.birthCandles;
+  // ¿hubo vela "cohete" (subida vertical >+50% en 1s)?
+  const idxCohete = bc.findIndex(c => c.pctVela >= MCO_PUMP_CANDLE_PCT);
+  const huboCohete = idxCohete >= 0;
+  // tras el cohete, ¿corrigió (vela negativa) o siguió inflando (otra vela muy +)?
+  let firma = "normal";
+  if (huboCohete) {
+    const despues = bc.slice(idxCohete + 1);
+    const corrige = despues.some(c => c.pctVela <= MCO_HEALTHY_CORRECTION);
+    const sigueInflando = despues.length > 0 && despues.every(c => c.pctVela > MCO_HEALTHY_CORRECTION) &&
+                          despues.some(c => c.pctVela >= 30);
+    if (corrige) firma = "COHETE+corrige(sano?)";
+    else if (sigueInflando) firma = "COHETE+sigue-inflando(RUG?)";
+    else firma = "COHETE+plano";
+  }
+  // MC de nacimiento: ¿nació bajo (~2k) o normal (~30k)?
+  const nacBajo = rec.mcNacimiento != null && rec.mcNacimiento < 5000 ? "BAJO" : "normal";
+  // ¿murió? (cierre muy negativo respecto al techo)
+  const murio = lastP < -50 || (rec.maxP > 20 && lastP < rec.maxP - 70) ? "MURIO" : "vivo";
+
+  const velasStr = bc.map(c => `v${c.idx}:${c.pctVela>=0?"+":""}${c.pctVela}%`).join(" ");
   const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
   addLog(
-    `[MCREC] sym=${rec.symbol} MCmig=${formatMC(rec.mcMig)}(${rec.mcMigSource}) ` +
+    `[MCREC] sym=${rec.symbol} nac=${rec.mcNacimiento != null ? formatMC(rec.mcNacimiento) : "?"}(${nacBajo}) ` +
+    `velas[${velasStr}] firma=${firma} fin=${murio} ` +
     `suelo=${rec.minP}%@${rec.minT}s techo=${rec.maxP}%@${rec.maxT}s ` +
     `rebote_desde_suelo=${reboteDesdeSuelo}pts@${maxAfterMinT}s tiro_fuerte=${tiroFuerte} ` +
     `cierre=${lastP}% pts=${ptsRaw}`,
@@ -1342,10 +1396,15 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, async () => {
-  console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — solo migración real | corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K (anti-honeypot) | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
+  if (MC_OBSERVER) {
+    console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
+    addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC]. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
+  } else {
+    console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — solo migración real | corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K (anti-honeypot) | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
+  }
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
   initWallet();
   connectPumpPortal();
-  await reconcileStateOnBoot();
+  if (!MC_OBSERVER) await reconcileStateOnBoot();
 });
