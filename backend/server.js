@@ -35,6 +35,13 @@ const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
 const MIG_FAST_WINDOW_MS = 20_000;
+// ── FILTRO DE VOLUMEN ──
+// false = SIN filtro de volumen (entra en cuanto hay señal de precio, sin esperar $).
+// PRUEBA en demo: ver qué hace sin volumen. AVISO: sin volumen entra en muchos
+// tokens fantasma (suben por 1 compra mínima y se desploman). Alta basura.
+const MIG_VOL_FILTER_ON = false;
+const MIG_VOL_FAST_EFF = MIG_VOL_FILTER_ON ? MIG_MIN_VOL_FAST : 1;   // 1 dólar = prácticamente sin filtro
+const MIG_VOL_SLOW_EFF = MIG_VOL_FILTER_ON ? MIG_MIN_VOL_SLOW : 1;
 const MIG_MIN_MC = 0;
 const MIG_MAX_MC = 2_000_000;
 // v6.20.2: tope de MC en el MOMENTO DE ENTRADA (primer tick real, no el evento).
@@ -666,7 +673,7 @@ function migUpdateWatching(mint, price, solAmount, entry) {
     clearTimeout(entry.timer); entry.entered = true; state.migWatching.delete(mint);
     obsStartRecording(entry, price, elapsed); return;
   }
-  if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_MIN_VOL_FAST) {
+  if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_VOL_FAST_EFF) {
     clearTimeout(entry.timer); entry.pendingEntry = true;
     const precioA = entry.lastPrice;
     addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — confirmando 3s`, "accept");
@@ -707,7 +714,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     migOpenTrades(entry); return;
   }
   entry.qualGate = true; entry.qualStartPrice = entryPriceB; entry.qualMov2s = null;
-  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>3% Y pendiente15s>0)`, "filter");
+  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>${MIG_QUAL_MOV2S_MIN}% Y pendiente15s>0)`, "filter");
   entry.qualTimer2s = setTimeout(() => {
     if (entry.qualStartPrice > 0 && entry.lastPrice > 0)
       entry.qualMov2s = (entry.lastPrice / entry.qualStartPrice - 1) * 100;
@@ -741,7 +748,7 @@ function migEvaluate(mint) {
   const entry = state.migWatching.get(mint);
   if (!entry || entry.entered || entry.pendingEntry) return;
   const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
-  if (entry.volumeUSD >= MIG_MIN_VOL_SLOW && entry.lastPrice) {
+  if (entry.volumeUSD >= MIG_VOL_SLOW_EFF && entry.lastPrice) {
     entry.pendingEntry = true;
     const precioA = entry.lastPrice;
     addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — confirmando 3s`, "accept");
@@ -1514,8 +1521,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC]. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · estructura ${MIG_STRUCT_ON?`ON(arma+${MIG_STRUCT_ARM_PCT}%,valle${MIG_STRUCT_RETROCESO})`:"off"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
-    addLog(`📝 MODO DEMO ACTIVO — estructura+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%. NO toca la wallet real. Config AGRESIVA (alta varianza).`, "accept");
+    console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · estructura ${MIG_STRUCT_ON?`ON(arma+${MIG_STRUCT_ARM_PCT}%,valle${MIG_STRUCT_RETROCESO})`:"off"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
+    addLog(`📝 MODO DEMO — estructura+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF (entra sin esperar $, más basura)"}. NO toca wallet real. AGRESIVA.`, "accept");
   } else {
     console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — REAL | trailing arma +${MIG_LOCK_AT*100}% · breakeven +${MIG_BREAKEVEN_AT*100}% · corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
   }
