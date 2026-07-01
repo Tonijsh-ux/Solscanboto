@@ -15,6 +15,10 @@ import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import bs58 from "bs58";
 
 const PORT = process.env.PORT || 3001;
+// ── MODO DEMO ONLY ──
+// true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
+// la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
+const DEMO_ONLY = true;
 const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = 6;
 const MAX_MIG_REAL = 6;
@@ -24,9 +28,9 @@ const STATE_FILE = process.env.STATE_FILE
   || (fs.existsSync("/var/data") ? "/var/data/solscanbot_state.json" : "./solscanbot_state.json");
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 4.00;
-const MIG_SL = 0.80;
-const MIG_DURATION_MS = 15 * 60 * 1000;
+const MIG_TP = 10.00;                  // TP +1000% (era +300%)
+const MIG_SL = 0.40;                   // SL -60% desde entrada (era -20%). Config agresiva/alta varianza.
+const MIG_DURATION_MS = 30 * 60 * 1000; // red de seguridad 30min (antes 15). La posición se cierra por SL/escalón/estructura; esto solo evita quedarse colgado indefinidamente.
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
@@ -52,7 +56,7 @@ const MIG_MAX_MC_ENTRY = 150_000;
 // Regla: a los 15s de abrir, si el máximo alcanzado < +10%, salir ya.
 // Backtest: corta 36/49 perdedoras sacrificando solo 2/20 ganadoras (ratio 18:1).
 // Sube la media de +7.5%/op a ~+13.6%/op. Aplica en real y en demo.
-const MIG_LAUNCH_CHECK = true;       // ⬅️ false = desactiva el corte (volver al comportamiento previo)
+const MIG_LAUNCH_CHECK = false;      // DESACTIVADO: mataba 14 ganadoras (ratio 1:1.4 malo). Muchos cohetes despegan a los 5-11min, el corte a 18s los ejecutaba antes.
 const MIG_LAUNCH_CHECK_MS = 18_000;  // a los 18s de abrir (era 15s; subido a 18s tras ver que ganadoras que despegan justo en el límite —ej. +62% que a 15s iba +8%— se cortaban; 18s salva esas perdiendo solo 1 perdedora más)
 const MIG_LAUNCH_MIN_PCT = 10;       // exige haber tocado +10% (maxGainPct)
 
@@ -77,7 +81,7 @@ const OBS_T3_INTERVAL = 5_000;
 //   - VELAS DE 1s del nacimiento (vela1, vela2, vela3...) con su % cada una
 //   - La clave: tras un impulso fuerte, ¿CORRIGE (sano) o SIGUE INFLANDO (rug)?
 //   - Resultado final a los 20 min (¿murió a cero o sostuvo?)
-const MC_OBSERVER = true;
+const MC_OBSERVER = false;
 const MCO_RECORD_MS = 1_200_000;      // 20 min de grabación
 const MCO_T1_MS = 60_000;             // primer MINUTO completo = alta resolución
 const MCO_T1_INTERVAL = 1_000;        // muestreo cada 1s durante el primer minuto
@@ -89,22 +93,39 @@ const MCO_BIRTH_WINDOW_MS = 1_000;    // cada "vela" = 1 segundo
 const MCO_PUMP_CANDLE_PCT = 50;       // vela "vertical" si sube >+50% en 1s
 const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -3%
 
-const MIG_BREAKEVEN_AT = 0.99;
+const MIG_BREAKEVEN_AT = 0.20;        // breakeven al +20% (antes +99%): protege el suelo antes
 const MIG_BREAKEVEN_MARGIN = 0.03;
-const MIG_LOCK_AT = 0.70;
+const MIG_LOCK_AT = 0.25;             // trailing FOLLOWING se arma en +25% (antes +70%)
 const MIG_FOLLOW_PCT = 0.20;
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_QUAL_GATE = true;
+const MIG_QUAL_MOV2S_MIN = 5;          // qual_gate: exige mov2s > +5% (era +3%)
 const MIG_QUAL_WINDOW_MS = 15_000;
-const MIG_MAX_CAIDA_DELAY = 0.25;
-const MIG_STEP_TRIGGER = 0.70;
+const MIG_MAX_CAIDA_DELAY = 0.35;      // aborta si cae más de -35% en la confirmación (era -25%)
+const MIG_STEP_TRIGGER = 0.25;        // escalón (suelo +13%) se arma en +25% (antes +70%)
 const MIG_STEP_FLOOR = 0.13;
 const MIG_FOLLOW_PCT_STEP = 0.15;
 const MIG_HARD_CAP_LOSS = -20;
+const MIG_CAP_LOSS_ON = false;        // DESACTIVADO: en modo demo probamos "dejar respirar". Mataba ganadoras que caen<-20 y luego despegan. ALTA VARIANZA.
+// ── TRAILING POR ESTRUCTURA (nuevo) ──
+// En vez de seguir a distancia fija del máximo, sube el stop al último valle
+// confirmado cuando el precio rompe el último máximo. Respeta la estructura del precio.
+const MIG_STRUCT_ON = true;           // trailing por estructura activado
+const MIG_STRUCT_ARM_PCT = 50;        // se arma cuando la posición supera +50%
+const MIG_STRUCT_RETROCESO = 20;      // un valle cuenta si el retroceso desde el máximo es >= 20 puntos
+// ── ESCALONES DE SL POR NIVEL (nuevo) ──
+// Cuando la ganancia alcanza un nivel, sube el SL a un suelo garantizado.
+// Protege la ganancia por tramos: si un cohete sube y se va a cero, te llevas un pedazo.
+const MIG_ESCALONES_ON = true;
+const MIG_ESCALONES = [               // [nivel_alcanzado%, sl_nuevo%]
+  [123, 10],
+  [200, 50],
+];
 const MIG_VELO_DROP = 0.10;
+const MIG_VELO_ON = false;            // DESACTIVADO: en modo demo probamos "dejar respirar". El velo mataba 31 ganadoras que caían brusco y rebotaban. ALTA VARIANZA.
 const MIG_VELO_MS = 2_000;
 const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;
 const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.12;
@@ -697,13 +718,13 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     const mov2 = entry.qualMov2s == null ? -999 : entry.qualMov2s;
     entry.qualGate = false;
     const mcEntryUsd = priceNow * 1_000_000_000;
-    if (mov2 > 3 && pend15 > 0 && mcEntryUsd > MIG_MAX_MC_ENTRY) {
+    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15 > 0 && mcEntryUsd > MIG_MAX_MC_ENTRY) {
       addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)} (riesgo honeypot/pump inflado)`, "filter");
       state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
       broadcast({ event: "stats", data: state.stats });
       return;
     }
-    if (mov2 > 3 && pend15 > 0) {
+    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15 > 0) {
       entry.entered = true; state.stats.mig_entered++;
       state.migWatching.delete(entry.mint); entry.firstPrice = priceNow;
       addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% · pend15s ${pend15>=0?"+":""}${pend15.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
@@ -959,6 +980,7 @@ async function sellToken(mint) {
 }
 
 async function openRealTrade(signal) {
+  if (DEMO_ONLY) return;  // modo demo: no se abre ninguna operación real
   if (!wallet) return;
   if (!REAL_STRATEGIES.includes(signal.strategy)) return;
   if (tradingHalted()) {
@@ -1095,11 +1117,11 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    if (veloDropTriggered(trade, price, strategy)) {
+    if (MIG_VELO_ON && veloDropTriggered(trade, price, strategy)) {
       addLog(`⚡🛑 VELO-EXIT [${strategy} real]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}%`, "realloss");
       closeRealTrade(trade, price, "SL"); continue;
     }
-    if (currentPct <= MIG_HARD_CAP_LOSS) {
+    if (MIG_CAP_LOSS_ON && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy} real]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "realloss");
       closeRealTrade(trade, price, "SL"); continue;
     }
@@ -1172,7 +1194,99 @@ function openDemoTrade(signal) {
   scheduleLaunchCheck(trade, "demo");
 }
 
+// Gestiona el trailing por ESTRUCTURA y los ESCALONES sobre un trade.
+// Actualiza trade.sl (precio) según los valles y los niveles alcanzados.
+// Mantiene el estado de máximos/valles en el propio trade.
+function aplicarEstructuraYEscalones(trade, price) {
+  const pct = (price - trade.entryPrice) / trade.entryPrice * 100; // % desde entrada
+  // inicializar estado la primera vez
+  if (trade._structMax === undefined) {
+    trade._structMax = pct;      // máximo corriente
+    trade._structMin = pct;      // mínimo desde el último máximo
+    trade._structArmed = false;
+    trade._enRetroceso = false;
+  }
+  // ESCALONES: por cada nivel alcanzado (usando el máximo histórico), subir el SL
+  if (MIG_ESCALONES_ON) {
+    for (const [nivel, slNuevoPct] of MIG_ESCALONES) {
+      if (trade.maxGainPct >= nivel) {
+        const slPrice = trade.entryPrice * (1 + slNuevoPct / 100);
+        if (slPrice > trade.sl) {
+          trade.sl = +slPrice.toFixed(12);
+          if (!trade._escalonesLog) trade._escalonesLog = {};
+          if (!trade._escalonesLog[nivel]) {
+            trade._escalonesLog[nivel] = true;
+            addLog(`🪜 ESCALÓN +${nivel}% alcanzado → SL sube a +${slNuevoPct}% [${trade.symbol}]`, "trail");
+          }
+        }
+      }
+    }
+  }
+  // ESTRUCTURA: subir el stop al último valle cuando rompe el último máximo
+  if (MIG_STRUCT_ON) {
+    if (pct >= MIG_STRUCT_ARM_PCT) trade._structArmed = true;
+    if (pct > trade._structMax) {
+      // rompe el máximo: si veníamos de un retroceso suficiente, el mínimo es un valle confirmado
+      if (trade._enRetroceso && (trade._structMax - trade._structMin) >= MIG_STRUCT_RETROCESO && trade._structArmed) {
+        const vallePrice = trade.entryPrice * (1 + trade._structMin / 100);
+        if (vallePrice > trade.sl) {
+          trade.sl = +vallePrice.toFixed(12);
+          addLog(`📐 ESTRUCTURA: ${trade.symbol} rompe máx, SL sube al valle +${trade._structMin.toFixed(0)}%`, "trail");
+        }
+      }
+      trade._structMax = pct;
+      trade._structMin = pct;
+      trade._enRetroceso = false;
+    } else if (pct < trade._structMin) {
+      trade._structMin = pct;
+      trade._enRetroceso = true;
+    }
+  }
+}
+
 function updateDemoTrades(mint, price, strategy) {
+  const now = Date.now();
+  const tp_pct = MIG_TP;
+  for (const trade of state.demoTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    const sinceOpen = now - trade.openTime;
+    if (trade.mov1s === null && sinceOpen >= 1000) trade.mov1s = +currentPct.toFixed(2);
+    if (trade.mov2s === null && sinceOpen >= 2000) trade.mov2s = +currentPct.toFixed(2);
+    if (MIG_VELO_ON && veloDropTriggered(trade, price, strategy)) {
+      addLog(`⚡🛑 VELO-EXIT [${strategy}]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}%`, "loss");
+      closeDemoTrade(trade, price, "SL", tp_pct); continue;
+    }
+    if (MIG_CAP_LOSS_ON && currentPct <= MIG_HARD_CAP_LOSS) {
+      addLog(`🛑 CAP LOSS [${strategy}]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "loss");
+      closeDemoTrade(trade, price, "SL", tp_pct); continue;
+    }
+    // Nueva lógica: estructura + escalones (sube trade.sl)
+    aplicarEstructuraYEscalones(trade, price);
+    // Cierre
+    if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
+    else if (price <= trade.sl) {
+      const slPct = (trade.sl - trade.entryPrice) / trade.entryPrice * 100;
+      const reason = slPct > 0 ? (trade._structArmed ? "STRUCT" : "STEP") : "SL";
+      if (trade.sl >= trade.entryPrice) {
+        closeDemoTrade(trade, trade.sl, reason, tp_pct);
+      } else {
+        trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+        if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", tp_pct); }
+        else { addLog(`⏳ SL sin confirmar (${trade._slBelowCount}/${MIG_SL_CONFIRM_TICKS}): ${trade.symbol} @ ${(trade.currentPct||0).toFixed(1)}%`, "trail"); broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } }); }
+      }
+    } else {
+      trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) closeDemoTrade(trade, price, "EXPIRED", tp_pct);
+      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
+  }
+}
+
+function updateDemoTrades_OLD_UNUSED(mint, price, strategy) {
   const now = Date.now();
   const tp_pct = MIG_TP;
   const breakeven = MIG_BREAKEVEN_AT;
@@ -1188,11 +1302,11 @@ function updateDemoTrades(mint, price, strategy) {
     const sinceOpen = now - trade.openTime;
     if (trade.mov1s === null && sinceOpen >= 1000) trade.mov1s = +currentPct.toFixed(2);
     if (trade.mov2s === null && sinceOpen >= 2000) trade.mov2s = +currentPct.toFixed(2);
-    if (veloDropTriggered(trade, price, strategy)) {
+    if (MIG_VELO_ON && veloDropTriggered(trade, price, strategy)) {
       addLog(`⚡🛑 VELO-EXIT [${strategy}]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}%`, "loss");
       closeDemoTrade(trade, price, "SL", tp_pct); continue;
     }
-    if (currentPct <= MIG_HARD_CAP_LOSS) {
+    if (MIG_CAP_LOSS_ON && currentPct <= MIG_HARD_CAP_LOSS) {
       addLog(`🛑 CAP LOSS [${strategy}]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "loss");
       closeDemoTrade(trade, price, "SL", tp_pct); continue;
     }
@@ -1399,8 +1513,11 @@ server.listen(PORT, async () => {
   if (MC_OBSERVER) {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC]. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
+  } else if (DEMO_ONLY) {
+    console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · estructura ${MIG_STRUCT_ON?`ON(arma+${MIG_STRUCT_ARM_PCT}%,valle${MIG_STRUCT_RETROCESO})`:"off"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
+    addLog(`📝 MODO DEMO ACTIVO — estructura+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%. NO toca la wallet real. Config AGRESIVA (alta varianza).`, "accept");
   } else {
-    console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — solo migración real | corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K (anti-honeypot) | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
+    console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — REAL | trailing arma +${MIG_LOCK_AT*100}% · breakeven +${MIG_BREAKEVEN_AT*100}% · corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
   }
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
