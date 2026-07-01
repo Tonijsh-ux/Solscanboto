@@ -110,6 +110,7 @@ const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_QUAL_GATE = true;
 const MIG_QUAL_MOV2S_MIN = 5;          // qual_gate: exige mov2s > +5% (era +3%)
+const MIG_QUAL_PEND15_ON = false;      // pend15 (pendiente 15s>0) DESACTIVADO — igualar al simulador, que solo usaba mov2s
 const MIG_QUAL_WINDOW_MS = 15_000;
 const MIG_MAX_CAIDA_DELAY = 0.35;      // aborta si cae más de -35% en la confirmación (era -25%)
 const MIG_STEP_TRIGGER = 0.25;        // escalón (suelo +13%) se arma en +25% (antes +70%)
@@ -117,15 +118,19 @@ const MIG_STEP_FLOOR = 0.13;
 const MIG_FOLLOW_PCT_STEP = 0.15;
 const MIG_HARD_CAP_LOSS = -20;
 const MIG_CAP_LOSS_ON = false;        // DESACTIVADO: en modo demo probamos "dejar respirar". Mataba ganadoras que caen<-20 y luego despegan. ALTA VARIANZA.
-// ── TRAILING POR ESTRUCTURA (nuevo) ──
-// En vez de seguir a distancia fija del máximo, sube el stop al último valle
-// confirmado cuando el precio rompe el último máximo. Respeta la estructura del precio.
-const MIG_STRUCT_ON = true;           // trailing por estructura activado
-const MIG_STRUCT_ARM_PCT = 50;        // se arma cuando la posición supera +50%
-const MIG_STRUCT_RETROCESO = 20;      // un valle cuenta si el retroceso desde el máximo es >= 20 puntos
-// ── ESCALONES DE SL POR NIVEL (nuevo) ──
+// ── TRAILING POR ESTRUCTURA ──
+// Sube el stop al último valle confirmado cuando el precio rompe el último máximo.
+const MIG_STRUCT_ON = false;          // DESACTIVADO (probando tendencia en su lugar)
+const MIG_STRUCT_ARM_PCT = 50;
+const MIG_STRUCT_RETROCESO = 20;
+// ── TRAILING POR TENDENCIA ──
+// Une los 2 últimos valles ascendentes, proyecta la línea, y sale cuando el precio
+// cae bajo esa línea proyectada. AVISO: en pruebas fue el peor (+2.63 vs +10.66 estructura).
+const MIG_TREND_ON = true;            // trailing por tendencia activado
+const MIG_TREND_ARM_PCT = 50;         // se arma cuando la posición supera +50%
+const MIG_TREND_RETROCESO = 20;       // un valle cuenta si el retroceso desde el máximo es >= 20 puntos
+// ── ESCALONES DE SL POR NIVEL ──
 // Cuando la ganancia alcanza un nivel, sube el SL a un suelo garantizado.
-// Protege la ganancia por tramos: si un cohete sube y se va a cero, te llevas un pedazo.
 const MIG_ESCALONES_ON = true;
 const MIG_ESCALONES = [               // [nivel_alcanzado%, sl_nuevo%]
   [123, 10],
@@ -714,7 +719,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     migOpenTrades(entry); return;
   }
   entry.qualGate = true; entry.qualStartPrice = entryPriceB; entry.qualMov2s = null;
-  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>${MIG_QUAL_MOV2S_MIN}% Y pendiente15s>0)`, "filter");
+  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>${MIG_QUAL_MOV2S_MIN}%${MIG_QUAL_PEND15_ON ? " Y pendiente15s>0" : ""})`, "filter");
   entry.qualTimer2s = setTimeout(() => {
     if (entry.qualStartPrice > 0 && entry.lastPrice > 0)
       entry.qualMov2s = (entry.lastPrice / entry.qualStartPrice - 1) * 100;
@@ -725,13 +730,14 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     const mov2 = entry.qualMov2s == null ? -999 : entry.qualMov2s;
     entry.qualGate = false;
     const mcEntryUsd = priceNow * 1_000_000_000;
-    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15 > 0 && mcEntryUsd > MIG_MAX_MC_ENTRY) {
+    const pend15ok = MIG_QUAL_PEND15_ON ? (pend15 > 0) : true;
+    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15ok && mcEntryUsd > MIG_MAX_MC_ENTRY) {
       addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)} (riesgo honeypot/pump inflado)`, "filter");
       state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
       broadcast({ event: "stats", data: state.stats });
       return;
     }
-    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15 > 0) {
+    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15ok) {
       entry.entered = true; state.stats.mig_entered++;
       state.migWatching.delete(entry.mint); entry.firstPrice = priceNow;
       addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% · pend15s ${pend15>=0?"+":""}${pend15.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
@@ -1201,7 +1207,7 @@ function openDemoTrade(signal) {
   scheduleLaunchCheck(trade, "demo");
 }
 
-// Gestiona el trailing por ESTRUCTURA y los ESCALONES sobre un trade.
+// Gestiona el trailing por ESTRUCTURA/TENDENCIA y los ESCALONES sobre un trade.
 // Actualiza trade.sl (precio) según los valles y los niveles alcanzados.
 // Mantiene el estado de máximos/valles en el propio trade.
 function aplicarEstructuraYEscalones(trade, price) {
@@ -1212,7 +1218,10 @@ function aplicarEstructuraYEscalones(trade, price) {
     trade._structMin = pct;      // mínimo desde el último máximo
     trade._structArmed = false;
     trade._enRetroceso = false;
+    trade._valles = [];          // valles confirmados [tiempoRel, valorPct] para la tendencia
+    trade._tMinRel = 0;
   }
+  const tRel = (Date.now() - trade.openTime) / 1000; // segundos desde apertura
   // ESCALONES: por cada nivel alcanzado (usando el máximo histórico), subir el SL
   if (MIG_ESCALONES_ON) {
     for (const [nivel, slNuevoPct] of MIG_ESCALONES) {
@@ -1233,7 +1242,6 @@ function aplicarEstructuraYEscalones(trade, price) {
   if (MIG_STRUCT_ON) {
     if (pct >= MIG_STRUCT_ARM_PCT) trade._structArmed = true;
     if (pct > trade._structMax) {
-      // rompe el máximo: si veníamos de un retroceso suficiente, el mínimo es un valle confirmado
       if (trade._enRetroceso && (trade._structMax - trade._structMin) >= MIG_STRUCT_RETROCESO && trade._structArmed) {
         const vallePrice = trade.entryPrice * (1 + trade._structMin / 100);
         if (vallePrice > trade.sl) {
@@ -1247,6 +1255,40 @@ function aplicarEstructuraYEscalones(trade, price) {
     } else if (pct < trade._structMin) {
       trade._structMin = pct;
       trade._enRetroceso = true;
+    }
+  }
+  // TENDENCIA: unir los 2 últimos valles ascendentes, proyectar la línea, salir si el precio cae bajo ella
+  if (MIG_TREND_ON) {
+    if (pct >= MIG_TREND_ARM_PCT) trade._structArmed = true;
+    // detectar valles (igual que estructura, pero los guardamos en una lista)
+    if (pct > trade._structMax) {
+      if (trade._enRetroceso && (trade._structMax - trade._structMin) >= MIG_TREND_RETROCESO) {
+        trade._valles.push([trade._tMinRel, trade._structMin]); // valle confirmado
+      }
+      trade._structMax = pct;
+      trade._structMin = pct;
+      trade._enRetroceso = false;
+    } else if (pct < trade._structMin) {
+      trade._structMin = pct;
+      trade._tMinRel = tRel;
+      trade._enRetroceso = true;
+    }
+    // proyectar la línea con los 2 últimos valles y comprobar si el precio la rompe
+    if (trade._structArmed && trade._valles.length >= 2) {
+      const [t1, v1] = trade._valles[trade._valles.length - 2];
+      const [t2, v2] = trade._valles[trade._valles.length - 1];
+      if (t2 !== t1) {
+        const pend = (v2 - v1) / (t2 - t1);       // pendiente de la línea de tendencia
+        const linea = v2 + pend * (tRel - t2);    // proyección al momento actual
+        // la línea de tendencia actúa como SL dinámico (solo si es ascendente)
+        if (pend >= 0) {
+          const lineaPrice = trade.entryPrice * (1 + linea / 100);
+          if (lineaPrice > trade.sl) {
+            trade.sl = +lineaPrice.toFixed(12);
+            if (!trade._trendLog) { trade._trendLog = true; addLog(`📈 TENDENCIA: ${trade.symbol} SL sigue línea de valles`, "trail"); }
+          }
+        }
+      }
     }
   }
 }
@@ -1277,7 +1319,7 @@ function updateDemoTrades(mint, price, strategy) {
     if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
     else if (price <= trade.sl) {
       const slPct = (trade.sl - trade.entryPrice) / trade.entryPrice * 100;
-      const reason = slPct > 0 ? (trade._structArmed ? "STRUCT" : "STEP") : "SL";
+      const reason = slPct > 0 ? (MIG_TREND_ON ? "TREND" : (trade._structArmed ? "STRUCT" : "STEP")) : "SL";
       if (trade.sl >= trade.entryPrice) {
         closeDemoTrade(trade, trade.sl, reason, tp_pct);
       } else {
@@ -1521,8 +1563,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC]. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · estructura ${MIG_STRUCT_ON?`ON(arma+${MIG_STRUCT_ARM_PCT}%,valle${MIG_STRUCT_RETROCESO})`:"off"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
-    addLog(`📝 MODO DEMO — estructura+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF (entra sin esperar $, más basura)"}. NO toca wallet real. AGRESIVA.`, "accept");
+    console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · ${MIG_STRUCT_ON?`estructura(arma+${MIG_STRUCT_ARM_PCT},valle${MIG_STRUCT_RETROCESO})`:MIG_TREND_ON?`tendencia(arma+${MIG_TREND_ARM_PCT},valle${MIG_TREND_RETROCESO})`:"sin trailing"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
+    addLog(`📝 MODO DEMO — ${MIG_STRUCT_ON?"estructura":MIG_TREND_ON?"tendencia":"sin trailing"}+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF"}. NO toca wallet real. AGRESIVA.`, "accept");
   } else {
     console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — REAL | trailing arma +${MIG_LOCK_AT*100}% · breakeven +${MIG_BREAKEVEN_AT*100}% · corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
   }
