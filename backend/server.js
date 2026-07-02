@@ -88,7 +88,7 @@ const OBS_T3_INTERVAL = 5_000;
 //   - VELAS DE 1s del nacimiento (vela1, vela2, vela3...) con su % cada una
 //   - La clave: tras un impulso fuerte, ¿CORRIGE (sano) o SIGUE INFLANDO (rug)?
 //   - Resultado final a los 20 min (¿murió a cero o sostuvo?)
-const MC_OBSERVER = false;
+const MC_OBSERVER = true;
 const MCO_RECORD_MS = 1_200_000;      // 20 min de grabación
 const MCO_T1_MS = 60_000;             // primer MINUTO completo = alta resolución
 const MCO_T1_INTERVAL = 1_000;        // muestreo cada 1s durante el primer minuto
@@ -97,6 +97,7 @@ const MCO_STRONG_REBOUND = 40;
 // ── Captura de las VELAS DEL NACIMIENTO (lo que vimos con el ojo) ──
 const MCO_BIRTH_CANDLES = 12;         // grabar el % de las primeras 12 velas de 1s
 const MCO_BIRTH_WINDOW_MS = 1_000;    // cada "vela" = 1 segundo
+const MCO_VOL_SECONDS = 60;           // grabar el volumen acumulado segundo a segundo durante los primeros 60s (toda la ventana de entrada del bot)
 const MCO_PUMP_CANDLE_PCT = 50;       // vela "vertical" si sube >+50% en 1s
 const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -3%
 
@@ -112,6 +113,7 @@ const MIG_QUAL_GATE = true;
 const MIG_QUAL_MOV2S_MIN = 5;          // qual_gate: exige mov2s > +5% (era +3%)
 const MIG_QUAL_PEND15_ON = false;      // pend15 (pendiente 15s>0) DESACTIVADO — igualar al simulador, que solo usaba mov2s
 const MIG_QUAL_WINDOW_MS = 15_000;
+const MIG_QUAL_DECIDE_MS = 2_500;      // decidir el qual_gate a los 2.5s (cuando ya se sabe mov2s), NO esperar 15s. Antes esperaba MIG_QUAL_WINDOW_MS=15s y por eso ninguna entraba rápido.
 const MIG_MAX_CAIDA_DELAY = 0.35;      // aborta si cae más de -35% en la confirmación (era -25%)
 const MIG_STEP_TRIGGER = 0.25;        // escalón (suelo +13%) se arma en +25% (antes +70%)
 const MIG_STEP_FLOOR = 0.13;
@@ -523,6 +525,10 @@ function mcoStart(mint, symbol, mcMigUsd) {
     lastCandleMc: null,      // MC al cierre de la última vela (para calcular % de la vela)
     lastCandleT: 0,          // timestamp de la última vela cerrada
     mcNacimiento: null,      // MC del primerísimo tick (el "nacimiento")
+    // ── VOLUMEN POR SEGUNDO (nuevo) — para que el simulador sepa cuándo entra el bot ──
+    volPorSeg: [],           // [volAcumUSD] índice = segundo (0..VOL_SECONDS). Volumen acumulado a cada segundo.
+    volAcum: 0,              // volumen acumulado total (USD)
+    lastVolSec: -1,          // último segundo registrado
   };
   if (rec.mcMig != null) rec.puntos.push({ t: 0, p: 0 });
   state.mcoRecordings.set(mint, rec);
@@ -530,10 +536,20 @@ function mcoStart(mint, symbol, mcMigUsd) {
   rec.timer = setTimeout(() => mcoFinish(mint), MCO_RECORD_MS);
 }
 
-function mcoSample(mint, price) {
+function mcoSample(mint, price, volUSD = 0) {
   const rec = state.mcoRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
   const mcNow = price * 1_000_000_000;
+  // acumular volumen y registrarlo por segundo (para saber cuándo el bot juntaría los $1500)
+  rec.volAcum = (rec.volAcum || 0) + volUSD;
+  if (rec.t0) {
+    const segNow = Math.floor((Date.now() - rec.t0) / 1000);
+    if (segNow >= 0 && segNow <= MCO_VOL_SECONDS && segNow > rec.lastVolSec) {
+      // rellenar los segundos intermedios con el volumen acumulado actual
+      for (let s = rec.lastVolSec + 1; s <= segNow; s++) rec.volPorSeg[s] = +rec.volAcum.toFixed(0);
+      rec.lastVolSec = segNow;
+    }
+  }
   if (rec.mcMig == null) {
     rec.mcMig = mcNow;
     rec.mcNacimiento = mcNow;
@@ -616,12 +632,14 @@ function mcoFinish(mint) {
 
   const velasStr = bc.map(c => `v${c.idx}:${c.pctVela>=0?"+":""}${c.pctVela}%`).join(" ");
   const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
+  // volumen acumulado por segundo: vol=seg:USD,seg:USD,... (para que el simulador sepa cuándo entra el bot)
+  const volRaw = (rec.volPorSeg || []).map((v, s) => v != null ? `${s}:${v}` : null).filter(Boolean).join(",");
   addLog(
     `[MCREC] sym=${rec.symbol} nac=${rec.mcNacimiento != null ? formatMC(rec.mcNacimiento) : "?"}(${nacBajo}) ` +
     `velas[${velasStr}] firma=${firma} fin=${murio} ` +
     `suelo=${rec.minP}%@${rec.minT}s techo=${rec.maxP}%@${rec.maxT}s ` +
     `rebote_desde_suelo=${reboteDesdeSuelo}pts@${maxAfterMinT}s tiro_fuerte=${tiroFuerte} ` +
-    `cierre=${lastP}% pts=${ptsRaw}`,
+    `cierre=${lastP}% vol=${volRaw} pts=${ptsRaw}`,
     "rec"
   );
 }
@@ -719,7 +737,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     migOpenTrades(entry); return;
   }
   entry.qualGate = true; entry.qualStartPrice = entryPriceB; entry.qualMov2s = null;
-  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando 15s (mov2s>${MIG_QUAL_MOV2S_MIN}%${MIG_QUAL_PEND15_ON ? " Y pendiente15s>0" : ""})`, "filter");
+  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando ${(MIG_QUAL_DECIDE_MS/1000).toFixed(1)}s (mov2s>${MIG_QUAL_MOV2S_MIN}%${MIG_QUAL_PEND15_ON ? " Y pendiente15s>0" : ""})`, "filter");
   entry.qualTimer2s = setTimeout(() => {
     if (entry.qualStartPrice > 0 && entry.lastPrice > 0)
       entry.qualMov2s = (entry.lastPrice / entry.qualStartPrice - 1) * 100;
@@ -740,14 +758,14 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     if (mov2 > MIG_QUAL_MOV2S_MIN && pend15ok) {
       entry.entered = true; state.stats.mig_entered++;
       state.migWatching.delete(entry.mint); entry.firstPrice = priceNow;
-      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% · pend15s ${pend15>=0?"+":""}${pend15.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
+      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
       migOpenTrades(entry);
     } else {
-      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | mov2s ${mov2<=-999?"n/a":(mov2>=0?"+":"")+mov2.toFixed(1)+"%"} · pend15s ${pend15<=-999?"n/a":(pend15>=0?"+":"")+pend15.toFixed(1)+"%"}`, "filter");
+      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | mov2s ${mov2<=-999?"n/a":(mov2>=0?"+":"")+mov2.toFixed(1)+"%"}`, "filter");
       state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
       broadcast({ event: "stats", data: state.stats });
     }
-  }, MIG_QUAL_WINDOW_MS);
+  }, MIG_QUAL_DECIDE_MS);
 }
 
 function migEvaluate(mint) {
@@ -1483,7 +1501,7 @@ function connectPumpPortal() {
         const sol = data.solAmount || 0;
         if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
         if (OBSERVER_MODE && state.obsRecordings.has(data.mint)) obsSample(data.mint, price);
-        if (MC_OBSERVER && state.mcoRecordings.has(data.mint)) mcoSample(data.mint, price);
+        if (MC_OBSERVER && state.mcoRecordings.has(data.mint)) mcoSample(data.mint, price, sol * solPriceUSD);
       }
     } catch (e) { console.log("PP:", e.message); }
   });
@@ -1560,8 +1578,8 @@ wss.on("connection", (ws) => {
 
 server.listen(PORT, async () => {
   if (MC_OBSERVER) {
-    console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
-    addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC]. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
+    console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token | velas 1s primer minuto + ${MCO_BIRTH_CANDLES} velas nacimiento + VOLUMEN por segundo (${MCO_VOL_SECONDS}s) | detecta firma cohete+corrige(sano) vs cohete+sigue-inflando(rug)`);
+    addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC] con VOLUMEN por segundo. Recoge datos y luego pon MC_OBSERVER=false para operar.`, "accept");
   } else if (DEMO_ONLY) {
     console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · ${MIG_STRUCT_ON?`estructura(arma+${MIG_STRUCT_ARM_PCT},valle${MIG_STRUCT_RETROCESO})`:MIG_TREND_ON?`tendencia(arma+${MIG_TREND_ARM_PCT},valle${MIG_TREND_RETROCESO})`:"sin trailing"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
     addLog(`📝 MODO DEMO — ${MIG_STRUCT_ON?"estructura":MIG_TREND_ON?"tendencia":"sin trailing"}+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF"}. NO toca wallet real. AGRESIVA.`, "accept");
