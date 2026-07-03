@@ -920,6 +920,15 @@ function liveRecFinish(mint, cierreRealPct) {
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
+  // CINTURÓN: bloquear la apertura si el MC supera el tope, venga por donde venga la entrada.
+  // (El 3-jul entraron 2 ops con MC $423K y $514K saltándose el chequeo previo; ambas pérdidas gordas.)
+  const mcOpen = price * 1_000_000_000;
+  if (mcOpen > MIG_MAX_MC_ENTRY) {
+    addLog(`🛑 MIG MC ALTO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+    return;
+  }
   liveRecStart(entry, price);
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
