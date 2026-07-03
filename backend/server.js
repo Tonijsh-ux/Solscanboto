@@ -54,7 +54,17 @@ const MIG_MAX_MC = 2_000_000;
 // en TODOS los rangos de MC). Este tope queda SOLO como cortafuegos anti-honeypot
 // extremo (los rug de "venta a cero" del 29-jun eran de MC $228-326K). No filtra
 // rendimiento, solo evita el riesgo de honeypot de MC muy alto.
-const MIG_MAX_MC_ENTRY = 150_000;
+// 3-jul: en DEMO subido a $1M (casi sin tope) para recoger datos de la franja alta —
+// en 3 tandas los cohetazos nacieron caros (+797/+655/+462 hoy con MC>150K: +7.28 SOL,
+// vs -2.81 el resto). ⚠️ ANTES DE PASAR A REAL: reevaluar este tope con los datos
+// acumulados, porque el riesgo honeypot de MC alto el demo NO lo mide (en real puede
+// no dejarte vender). Decisión pendiente para real: tope bajo o lote reducido en MC alto.
+const MIG_MAX_MC_ENTRY = 1_000_000;
+// MC MÍNIMO de entrada (3-jul, detectado por el usuario): el feed a veces da tokens con
+// MC de $9-533 DÓLARES (glitch de precio o liquidez retirada). El bot entraba y el PnL
+// era ficción en ambos sentidos: 28 ops fantasma (+797% y -99% incluidos) que EN REAL
+// son inejecutables (no puedes comprar $75 de un token con $200 de MC total).
+const MIG_MIN_MC_ENTRY = 5_000;
 
 // ── v6.20.3: CORTE POR NO-DESPEGUE ─────────────────────────────
 // Hallazgo clave (150 ops/7 días): el predictor real del éxito NO es el MC sino
@@ -786,6 +796,11 @@ function migQualTick(entry, price) {
         broadcast({ event: "stats", data: state.stats }); return;
       }
       const mcEntryUsd = precioB * 1_000_000_000;
+      if (mcEntryUsd < MIG_MIN_MC_ENTRY) {
+        addLog(`🛑 MIG MC BASURA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} < mínimo ${formatMC(MIG_MIN_MC_ENTRY)} (token glitch/muerto, inejecutable en real)`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
       if (mcEntryUsd > MIG_MAX_MC_ENTRY) {
         addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
@@ -923,8 +938,8 @@ function migOpenTrades(entry) {
   // CINTURÓN: bloquear la apertura si el MC supera el tope, venga por donde venga la entrada.
   // (El 3-jul entraron 2 ops con MC $423K y $514K saltándose el chequeo previo; ambas pérdidas gordas.)
   const mcOpen = price * 1_000_000_000;
-  if (mcOpen > MIG_MAX_MC_ENTRY) {
-    addLog(`🛑 MIG MC ALTO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
+  if (mcOpen > MIG_MAX_MC_ENTRY || mcOpen < MIG_MIN_MC_ENTRY) {
+    addLog(`🛑 MIG MC FUERA DE RANGO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} (rango válido ${formatMC(MIG_MIN_MC_ENTRY)}–${formatMC(MIG_MAX_MC_ENTRY)})`, "filter");
     state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
     return;
