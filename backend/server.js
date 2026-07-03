@@ -471,8 +471,14 @@ function calcPrice(data) {
   return 0;
 }
 
-function isPriceValid(newPrice, knownPrice) {
+const MIG_PRICE_STALE_MS = 10_000;  // si el último precio válido tiene >10s, aceptar el nuevo aunque el salto sea grande (evita el congelamiento en rugs violentos)
+function isPriceValid(newPrice, knownPrice, lastValidTs) {
   if (!knownPrice || knownPrice === 0) return newPrice > 0;
+  // ESCAPE ANTI-CONGELAMIENTO: la protección anti-glitch solo tiene sentido entre ticks
+  // muy seguidos. Si llevamos >10s sin precio válido, el "salto" es el mercado real
+  // (p.ej. un rug que cae -60% de golpe), no un glitch. Sin esto, el precio se congela
+  // para siempre y el SL nunca salta (bug detectado el 3-jul: cierre a -18% con token a -90%).
+  if (lastValidTs && Date.now() - lastValidTs > MIG_PRICE_STALE_MS) return newPrice > 0;
   const ratio = newPrice / knownPrice;
   return ratio >= (1 / MIG_MAX_PRICE_RATIO) && ratio <= MIG_MAX_PRICE_RATIO;
 }
@@ -686,7 +692,8 @@ function migStartWatching(coin) {
 
 function migUpdateWatching(mint, price, solAmount, entry) {
   if (entry.entered) return;
-  if (!isPriceValid(price, entry.lastPrice)) return;
+  if (!isPriceValid(price, entry.lastPrice, entry.lastTickTs)) return;
+  entry.lastTickTs = Date.now();
   // histórico corto de precios desde el 1er tick (para el mov2s del qual_gate continuo)
   if (!entry.priceHist) entry.priceHist = [];
   entry.priceHist.push([Date.now(), price]);
@@ -947,7 +954,7 @@ function migUpdatePrice(mint, price, solAmount) {
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
   const token = state.migMonitored.get(mint);
   if (!token) return;
-  if (!isPriceValid(price, token.price)) return;
+  if (!isPriceValid(price, token.price, token.lastUpdate)) return;
   token.price = price; token.mc = price*1_000_000_000;
   token.priceHigh = Math.max(token.priceHigh, price);
   token.priceLow = Math.min(token.priceLow, price);
