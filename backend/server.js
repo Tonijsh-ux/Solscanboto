@@ -28,8 +28,8 @@ const STATE_FILE = process.env.STATE_FILE
   || (fs.existsSync("/var/data") ? "/var/data/solscanbot_state.json" : "./solscanbot_state.json");
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
-const MIG_TP = 10.00;                  // TP +1000% (era +300%)
-const MIG_SL = 0.40;                   // SL -60% desde entrada (era -20%). Config agresiva/alta varianza.
+const MIG_TP = 6.00;                   // TP +500% (validado sobre 356 ops: mejor que +1000, muchos cohetes tocan +500 y caen antes de +1000)
+const MIG_SL = 0.60;                   // SL -40% desde entrada (validado sobre 356 ops: mejor que -60 en ambos días)
 const MIG_DURATION_MS = 30 * 60 * 1000; // red de seguridad 30min (antes 15). La posición se cierra por SL/escalón/estructura; esto solo evita quedarse colgado indefinidamente.
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
@@ -88,7 +88,7 @@ const OBS_T3_INTERVAL = 5_000;
 //   - VELAS DE 1s del nacimiento (vela1, vela2, vela3...) con su % cada una
 //   - La clave: tras un impulso fuerte, ¿CORRIGE (sano) o SIGUE INFLANDO (rug)?
 //   - Resultado final a los 20 min (¿murió a cero o sostuvo?)
-const MC_OBSERVER = true;
+const MC_OBSERVER = false;  // OBSERVADOR OFF: el bot OPERA en demo. Ponlo en true para volver a grabar MCREC.
 const MCO_RECORD_MS = 1_200_000;      // 20 min de grabación
 const MCO_T1_MS = 60_000;             // primer MINUTO completo = alta resolución
 const MCO_T1_INTERVAL = 1_000;        // muestreo cada 1s durante el primer minuto
@@ -110,7 +110,8 @@ const MIG_SL_CONFIRM_TICKS = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_QUAL_GATE = true;
-const MIG_QUAL_MOV2S_MIN = 5;          // qual_gate: exige mov2s > +5% (era +3%)
+const MIG_QUAL_MOV2S_MIN = 10;         // qual_gate: exige mov2s > +10% (validado sobre 356 ops: mismo n° de cohetes, menos basura que +5)
+const MIG_QUAL_MAX_WAIT_MS = 600_000;  // qual_gate CONTINUO: vigila hasta 10 min esperando la señal (las entradas tardías aportan — validado)
 const MIG_QUAL_PEND15_ON = false;      // pend15 (pendiente 15s>0) DESACTIVADO — igualar al simulador, que solo usaba mov2s
 const MIG_QUAL_WINDOW_MS = 15_000;
 const MIG_QUAL_DECIDE_MS = 2_500;      // decidir el qual_gate a los 2.5s (cuando ya se sabe mov2s), NO esperar 15s. Antes esperaba MIG_QUAL_WINDOW_MS=15s y por eso ninguna entraba rápido.
@@ -130,7 +131,7 @@ const MIG_STRUCT_RETROCESO = 20;
 // cae bajo esa línea proyectada. AVISO: en pruebas fue el peor (+2.63 vs +10.66 estructura).
 const MIG_TREND_ON = true;            // trailing por tendencia activado
 const MIG_TREND_ARM_PCT = 50;         // se arma cuando la posición supera +50%
-const MIG_TREND_RETROCESO = 20;       // un valle cuenta si el retroceso desde el máximo es >= 20 puntos
+const MIG_TREND_RETROCESO = 25;       // un valle cuenta si el retroceso desde el máximo es >= 25 puntos (validado: mejor que 20)
 // ── ESCALONES DE SL POR NIVEL ──
 // Cuando la ganancia alcanza un nivel, sube el SL a un suelo garantizado.
 const MIG_ESCALONES_ON = true;
@@ -686,7 +687,15 @@ function migStartWatching(coin) {
 function migUpdateWatching(mint, price, solAmount, entry) {
   if (entry.entered) return;
   if (!isPriceValid(price, entry.lastPrice)) return;
-  if (entry.pendingEntry) { entry.lastPrice = price; return; }
+  // histórico corto de precios desde el 1er tick (para el mov2s del qual_gate continuo)
+  if (!entry.priceHist) entry.priceHist = [];
+  entry.priceHist.push([Date.now(), price]);
+  while (entry.priceHist.length > 2 && Date.now() - entry.priceHist[0][0] > 5_000) entry.priceHist.shift();
+  if (entry.pendingEntry) {
+    entry.lastPrice = price;
+    if (entry.qualGate) migQualTick(entry, price);  // qual_gate continuo: mira cada tick
+    return;
+  }
   entry.volumeUSD += solAmount * solPriceUSD;
   entry.tradeCount++;
   entry.lastPrice = price;
@@ -698,21 +707,10 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   }
   if (elapsed < MIG_FAST_WINDOW_MS && entry.volumeUSD >= MIG_VOL_FAST_EFF) {
     clearTimeout(entry.timer); entry.pendingEntry = true;
-    const precioA = entry.lastPrice;
-    addLog(`⚡ MIG RÁPIDA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — confirmando 3s`, "accept");
+    addLog(`⚡ MIG: ${entry.symbol} | $${Math.round(entry.volumeUSD)} en ${(elapsed/1000).toFixed(1)}s — armando qual_gate continuo`, "accept");
     broadcast({ event: "stats", data: state.stats });
-    setTimeout(() => {
-      const precioB = entry.lastPrice;
-      if (precioB < precioA * (1 - MIG_MAX_CAIDA_DELAY)) {
-        const caida = ((precioB / precioA - 1) * 100).toFixed(1);
-        addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}%`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(mint); unsubscribeToken(mint);
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-      entry.entered = false; entry.pendingEntry = true;
-      addLog(`⚡ MIG RÁPIDA confirmada: ${entry.symbol} @ MC ${formatMC(precioB * 1_000_000_000)}`, "accept");
-      migQualityGateThenOpen(entry, precioB);
-    }, MIG_ENTRY_DELAY_MS); return;
+    migQualityGateThenOpen(entry, price);  // la confirmación de 3s va DESPUÉS de la señal (como el simulador validado)
+    return;
   }
   broadcast({ event: "migWatchUpdate", data: {
     mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD, tradeCount: entry.tradeCount,
@@ -736,36 +734,62 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entryPriceB * 1_000_000_000)}`, "accept");
     migOpenTrades(entry); return;
   }
-  entry.qualGate = true; entry.qualStartPrice = entryPriceB; entry.qualMov2s = null;
-  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — evaluando ${(MIG_QUAL_DECIDE_MS/1000).toFixed(1)}s (mov2s>${MIG_QUAL_MOV2S_MIN}%${MIG_QUAL_PEND15_ON ? " Y pendiente15s>0" : ""})`, "filter");
-  entry.qualTimer2s = setTimeout(() => {
-    if (entry.qualStartPrice > 0 && entry.lastPrice > 0)
-      entry.qualMov2s = (entry.lastPrice / entry.qualStartPrice - 1) * 100;
-  }, 2_000);
-  setTimeout(() => {
-    const priceNow = entry.lastPrice;
-    const pend15 = (entry.qualStartPrice > 0 && priceNow > 0) ? (priceNow / entry.qualStartPrice - 1) * 100 : -999;
-    const mov2 = entry.qualMov2s == null ? -999 : entry.qualMov2s;
+  // referencia del qual = precio del PRIMER tick del token (como el simulador: la señal exige precio > nacimiento)
+  entry.qualStartPrice = (entry.priceHist && entry.priceHist.length) ? entry.priceHist[0][1] : entryPriceB;
+  entry.qualGate = true;
+  addLog(`🔍 MIG CALIDAD: ${entry.symbol} — vigilando hasta ${(MIG_QUAL_MAX_WAIT_MS/60000).toFixed(0)}min, señal al 1er mov2s>+${MIG_QUAL_MOV2S_MIN}%`, "filter");
+  // timeout de descarte: si en MIG_QUAL_MAX_WAIT_MS nunca da la señal, se descarta
+  entry.qualTimeout = setTimeout(() => {
+    if (!entry.qualGate) return;
     entry.qualGate = false;
-    const mcEntryUsd = priceNow * 1_000_000_000;
-    const pend15ok = MIG_QUAL_PEND15_ON ? (pend15 > 0) : true;
-    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15ok && mcEntryUsd > MIG_MAX_MC_ENTRY) {
-      addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)} (riesgo honeypot/pump inflado)`, "filter");
-      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-      broadcast({ event: "stats", data: state.stats });
-      return;
-    }
-    if (mov2 > MIG_QUAL_MOV2S_MIN && pend15ok) {
+    addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | nunca dio mov2s>+${MIG_QUAL_MOV2S_MIN}% en ${(MIG_QUAL_MAX_WAIT_MS/60000).toFixed(0)}min`, "filter");
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+  }, MIG_QUAL_MAX_WAIT_MS);
+}
+
+// Qual_gate CONTINUO: se llama en cada tick mientras entry.qualGate está activo.
+// Da la señal en el PRIMER momento donde mov2s > umbral, el precio sube, y está por
+// encima del precio inicial (igual que el simulador validado). Tras la señal, espera
+// MIG_ENTRY_DELAY_MS de confirmación y aborta si el precio cae > MIG_MAX_CAIDA_DELAY.
+function migQualTick(entry, price) {
+  const now = Date.now();
+  const hist = entry.priceHist || [];
+  const prevPrice = hist.length >= 2 ? hist[hist.length - 2][1] : price;
+  // precio de hace >= 2s; si aún no hay 2s de histórico, usar el primer tick (fallback del simulador)
+  let p2s = null;
+  for (let i = hist.length - 1; i >= 0; i--) {
+    if (now - hist[i][0] >= 2_000) { p2s = hist[i][1]; break; }
+  }
+  if (p2s === null) p2s = hist.length ? hist[0][1] : null;
+  if (p2s === null || p2s <= 0) return;
+  const mov2 = (price / p2s - 1) * 100;
+  if (mov2 > MIG_QUAL_MOV2S_MIN && price > prevPrice && price > entry.qualStartPrice) {
+    // SEÑAL — arrancar la confirmación de 3s (aborta si cae fuerte)
+    entry.qualGate = false; clearTimeout(entry.qualTimeout);
+    const precioSenal = price;
+    const tSenal = ((now - entry.startTime) / 1000).toFixed(0);
+    addLog(`🎯 MIG SEÑAL: ${entry.symbol} | mov2s +${mov2.toFixed(1)}% a los ${tSenal}s — confirmando ${(MIG_ENTRY_DELAY_MS/1000).toFixed(0)}s`, "accept");
+    setTimeout(() => {
+      const precioB = entry.lastPrice;
+      if (precioB < precioSenal * (1 - MIG_MAX_CAIDA_DELAY)) {
+        const caida = ((precioB / precioSenal - 1) * 100).toFixed(1);
+        addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}% en la confirmación`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
+      const mcEntryUsd = precioB * 1_000_000_000;
+      if (mcEntryUsd > MIG_MAX_MC_ENTRY) {
+        addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
       entry.entered = true; state.stats.mig_entered++;
-      state.migWatching.delete(entry.mint); entry.firstPrice = priceNow;
-      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} | mov2s ${mov2>=0?"+":""}${mov2.toFixed(1)}% @ MC ${formatMC(priceNow * 1_000_000_000)}`, "accept");
+      state.migWatching.delete(entry.mint); entry.firstPrice = precioB;
+      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} @ MC ${formatMC(mcEntryUsd)}`, "accept");
       migOpenTrades(entry);
-    } else {
-      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | mov2s ${mov2<=-999?"n/a":(mov2>=0?"+":"")+mov2.toFixed(1)+"%"}`, "filter");
-      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-      broadcast({ event: "stats", data: state.stats });
-    }
-  }, MIG_QUAL_DECIDE_MS);
+    }, MIG_ENTRY_DELAY_MS);
+  }
 }
 
 function migEvaluate(mint) {
