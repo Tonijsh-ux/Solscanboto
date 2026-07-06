@@ -23,11 +23,11 @@ const DEMO_ONLY = false;
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
 // real. NO es para ganar dinero todavía. Requiere: keys ROTADAS + wallet dedicada.
-const SOL_PER_TRADE_REAL = 0.15;
+const SOL_PER_TRADE_REAL = 0.1;
 const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
 const SOL_PER_TRADE_MIG = 0.5;
-const MAX_REAL_TRADES = 10;
-const MAX_MIG_REAL = 10;
+const MAX_REAL_TRADES = 6;
+const MAX_MIG_REAL = 6;
 const REAL_STRATEGIES = ["migration"];
 // MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
 const STATE_FILE = process.env.STATE_FILE
@@ -481,6 +481,14 @@ function formatMC(n) {
 }
 
 function unsubscribeToken(mint) {
+  // GUARD (7-jul): la suscripción al feed es COMPARTIDA por mint. Las grabadoras
+  // desuscribían al terminar y dejaban CIEGAS las posiciones abiertas del mismo token
+  // (causa de las "congeladas" y de huérfanas reales). No desuscribir si sigue en uso.
+  if (state.migMonitored.has(mint)) return;
+  if (state.migWatching.has(mint)) return;
+  if (state.mcoRecordings.has(mint)) return;
+  if (state.obsRecordings.has(mint)) return;
+  if (state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING" || t.status === "SELL_FAILED"))) return;
   if (pumpPortalWs?.readyState === WebSocket.OPEN) {
     pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
   }
@@ -1091,14 +1099,14 @@ async function buyToken(mint, solAmount, slippage = 15) {
   } catch (e) { addLog(`❌ Compra: ${e.message}`, "error"); return null; }
 }
 
-async function sellToken(mint) {
+async function sellToken(mint, slippage = 15) {
   if (!wallet || !connection) return null;
   try {
     const bal = await getTokenBalance(mint);
     if (bal <= 0) { addLog(`⚠️ Sin tokens: ${shortAddr(mint)}`, "warn"); return null; }
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount: bal, slippage: 15, priorityFee: 0.0005, pool: "auto" }),
+      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount: bal, slippage, priorityFee: 0.0005, pool: "auto" }),
       signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) { addLog(`❌ Venta error: ${response.status}`, "error"); return null; }
@@ -1181,7 +1189,9 @@ async function closeRealTrade(trade, price, reason) {
   if (!sell) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
-    trade.status = "SELL_FAILED"; broadcast({ event: "realTradeClosed", data: trade }); return;
+    trade.status = "SELL_FAILED"; trade.result = "SELL_FAILED"; trade.closeTime = Date.now();
+    addLog(`⚠️ POSICIÓN HUÉRFANA: ${trade.symbol} — venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. El barrendero reintentará cada 2 min (o vende a mano desde Phantom).`, "error");
+    broadcast({ event: "realTradeClosed", data: trade }); return;
   }
   const proceedsSol = sell.proceedsSol;
   const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
@@ -1317,7 +1327,38 @@ setInterval(() => {
   }
 }, 10_000);
 
-function openDemoTrade(signal) {
+// ── BARRENDERO DE HUÉRFANAS (7-jul): trades cuya venta falló (SELL_FAILED) quedaban
+// abandonados con los tokens en la wallet y sin gestión. Cada 2 min: si los tokens ya
+// no están (vendidos a mano) → cerrar como MANUAL; si están → reintentar venta con
+// slippage 30 (rescate) y registrar el PnL real.
+setInterval(async () => {
+  if (!wallet || !connection) return;
+  for (const trade of state.realTrades) {
+    if (trade.status !== "SELL_FAILED") continue;
+    try {
+      const bal = await getTokenBalance(trade.mint);
+      if (bal <= 0) {
+        trade.status = "CLOSED"; trade.result = "MANUAL"; trade.closeTime = trade.closeTime || Date.now();
+        addLog(`🧹 Huérfana resuelta externamente: ${trade.symbol} (tokens ya no están — vendida a mano). PnL no registrado por el bot.`, "info");
+        broadcast({ event: "realTradeClosed", data: trade });
+        continue;
+      }
+      const sell = await sellToken(trade.mint, 30);
+      if (!sell) continue; // seguirá intentando en el próximo ciclo
+      const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
+      const realPnlSol = +(sell.proceedsSol - costSol).toFixed(4);
+      trade.sellSignature = sell.sig; trade.closeTime = Date.now(); trade.status = "CLOSED";
+      trade.pnlSol = realPnlSol; trade.pnlPct = +((sell.proceedsSol / costSol - 1) * 100).toFixed(2);
+      trade.result = realPnlSol >= 0 ? "WIN" : "LOSS";
+      if (realPnlSol >= 0) state.stats.mig_realWins++; else state.stats.mig_realLosses++;
+      state.stats.mig_realPnLSol += realPnlSol;
+      riskRecordClose(realPnlSol);
+      addLog(`🧹 RESCATE: ${trade.symbol} vendida con slippage 30 → ${realPnlSol>=0?"+":""}${realPnlSol} SOL`, realPnlSol>=0?"realwin":"realloss");
+      addLog(`[REALREC] sym=${trade.symbol} reason=RESCUE dur=${Math.round((trade.closeTime - trade.openTime)/1000)}s tickPct=0.0% cost=${costSol} recv=${sell.proceedsSol} realSol=${realPnlSol} slipFee=0 slipPct=0%`, "real");
+      broadcast({ event: "realTradeClosed", data: trade });
+    } catch (e) { /* siguiente ciclo */ }
+  }
+}, 120_000);
   const trade = {
     id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
