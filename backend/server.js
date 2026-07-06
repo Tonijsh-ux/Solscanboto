@@ -18,10 +18,16 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = true;
+const DEMO_ONLY = false;
+// ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
+// (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
+// comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
+// real. NO es para ganar dinero todavía. Requiere: keys ROTADAS + wallet dedicada.
+const SOL_PER_TRADE_REAL = 0.15;
+const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
 const SOL_PER_TRADE_MIG = 0.5;
-const MAX_REAL_TRADES = 6;
-const MAX_MIG_REAL = 6;
+const MAX_REAL_TRADES = 10;
+const MAX_MIG_REAL = 10;
 const REAL_STRATEGIES = ["migration"];
 // MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
 const STATE_FILE = process.env.STATE_FILE
@@ -161,7 +167,7 @@ const MIG_TOP_FLOOR = 0.65;
 
 // ── KILL-SWITCH DE PORTAFOLIO ──
 const RISK = {
-  maxDailyLossSol: 1.5,
+  maxDailyLossSol: 0.8,   // experimento 0.1: ~8-15 ops malas paran el día
   maxConsecutiveLosses: 12,
   cooldownAfterStreakMs: 60 * 60 * 1000,
 };
@@ -293,6 +299,15 @@ const state = {
   mcoRecordings: new Map(),
   liveRecordings: new Map(),
   signals: [],
+  // ── REGISTRO DE PnL POR HORA ──
+  horaActual: null,        // "2026-07-04 14" (año-mes-día hora)
+  horaPnlSol: 0,           // PnL SOL acumulado de la hora en curso
+  horaOps: 0,              // operaciones cerradas en la hora en curso
+  horaWins: 0,             // ganadoras en la hora en curso
+  diaPnlSol: 0,            // PnL SOL acumulado del día
+  diaOps: 0,               // operaciones del día
+  diaInicio: null,         // "2026-07-04" para detectar cambio de día
+  historialHoras: [],      // [{hora, pnl, ops, wins}] para el resumen final
   demoTrades: [],
   realTrades: [],
   movements: [],
@@ -932,6 +947,39 @@ function liveRecFinish(mint, cierreRealPct) {
   addLog(`[MIGREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% pts=${ptsRaw}`, "rec");
 }
 
+// Registra el PnL de una operación cerrada en el acumulador por hora.
+// Cuando cambia la hora del reloj, vuelca el resumen de la hora anterior al log.
+// Cuando cambia el día, vuelca también el total del día.
+function registrarPnlHorario(pnlSol, esWin) {
+  const ahora = new Date();
+  // clave de hora: "2026-07-04 14"  (usa hora local del servidor)
+  const y = ahora.getFullYear(), mo = String(ahora.getMonth()+1).padStart(2,"0");
+  const d = String(ahora.getDate()).padStart(2,"0"), h = String(ahora.getHours()).padStart(2,"0");
+  const claveHora = `${y}-${mo}-${d} ${h}`;
+  const claveDia = `${y}-${mo}-${d}`;
+
+  // ¿cambió la hora? → volcar resumen de la hora que acaba de terminar
+  if (state.horaActual !== null && state.horaActual !== claveHora) {
+    const wr = state.horaOps > 0 ? Math.round(state.horaWins / state.horaOps * 100) : 0;
+    addLog(`📊 RESUMEN HORA ${state.horaActual}h → ${state.horaOps} ops · ${state.horaWins}W/${state.horaOps-state.horaWins}L (WR ${wr}%) · PnL ${state.horaPnlSol>=0?"+":""}${state.horaPnlSol.toFixed(3)} SOL · acumulado día ${state.diaPnlSol>=0?"+":""}${state.diaPnlSol.toFixed(2)} SOL`, "accept");
+    state.historialHoras.push({ hora: state.horaActual, pnl: +state.horaPnlSol.toFixed(3), ops: state.horaOps, wins: state.horaWins });
+    // reset de la hora
+    state.horaPnlSol = 0; state.horaOps = 0; state.horaWins = 0;
+  }
+
+  // ¿cambió el día? → volcar total del día que termina y resetear
+  if (state.diaInicio !== null && state.diaInicio !== claveDia) {
+    const totalOps = state.diaOps, totalPnl = state.diaPnlSol;
+    addLog(`🌙 RESUMEN DÍA ${state.diaInicio} → ${totalOps} ops · PnL TOTAL ${totalPnl>=0?"+":""}${totalPnl.toFixed(2)} SOL. Nuevo día empieza.`, "accept");
+    state.diaPnlSol = 0; state.diaOps = 0; state.historialHoras = [];
+  }
+
+  // acumular esta operación
+  state.horaActual = claveHora; state.diaInicio = claveDia;
+  state.horaPnlSol += pnlSol; state.horaOps++; if (esWin) state.horaWins++;
+  state.diaPnlSol += pnlSol; state.diaOps++;
+}
+
 function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
@@ -1078,7 +1126,12 @@ async function openRealTrade(signal) {
   if (openReal.length >= MAX_REAL_TRADES) return;
   const stratOpen = openReal.filter(t => t.strategy === signal.strategy).length;
   if (stratOpen >= MAX_MIG_REAL) { addLog(`⚠️ Límite real [migración]: ${stratOpen}/${MAX_MIG_REAL}`, "warn"); return; }
-  const solAmount = SOL_PER_TRADE_MIG;
+  const mcEntryReal = signal.price * 1_000_000_000;
+  if (mcEntryReal > MIG_MAX_MC_REAL) {
+    addLog(`🛑 REAL saltada (MC ${formatMC(mcEntryReal)} > tope real ${formatMC(MIG_MAX_MC_REAL)}) — solo demo`, "warn");
+    return;
+  }
+  const solAmount = SOL_PER_TRADE_REAL;
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount+0.01).toFixed(2)})`, "warn"); return; }
   const buy = await buyToken(signal.mint, solAmount, 15);
@@ -1139,6 +1192,9 @@ async function closeRealTrade(trade, price, reason) {
   const pnlPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.pnlPct = +pnlPct.toFixed(2); trade.pnlSol = realPnlSol; trade.slipFeeSol = slipFeeSol;
   addLog(`📊 PnL real: ${realPnlSol>=0?"+":""}${realPnlSol} SOL (coste ${costSol} → recibido ${proceedsSol}) | tick: ${tickPnlSol>=0?"+":""}${tickPnlSol} | slip+fee: ${slipFeeSol>=0?"+":""}${slipFeeSol}`, "real");
+  // [REALREC] línea parseable para el análisis de fricción del experimento
+  const slipPctLote = costSol > 0 ? +(slipFeeSol / costSol * 100).toFixed(2) : 0;
+  addLog(`[REALREC] sym=${trade.symbol} reason=${reason} dur=${Math.round((trade.closeTime - trade.openTime)/1000)}s tickPct=${pnlPct.toFixed(1)}% cost=${costSol} recv=${proceedsSol} realSol=${realPnlSol} slipFee=${slipFeeSol} slipPct=${slipPctLote}%`, "real");
   riskRecordClose(realPnlSol);
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const expWinPct = MIG_EXPIRED_WIN_PCT;
@@ -1503,6 +1559,9 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
     else { trade.result = "EXPIRED"; state.stats.mig_demoExpired++; addLog(`⏱️ EXP [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct>0?"+":""}${trade.pnlPct}%`, "expire"); }
   }
   state.stats.demoOpen = Math.max(0, state.stats.demoOpen - 1);
+  // registrar en el acumulador por hora (PnL en SOL con el lote actual)
+  const pnlSolOp = SOL_PER_TRADE_MIG * trade.pnlPct / 100;
+  registrarPnlHorario(pnlSolOp, trade.result === "WIN");
   state.stats.mig_maxGainSum += trade.maxGainPct || 0;
   state.stats.mig_maxLossSum += Math.abs(trade.maxLossPct || 0);
   state.stats.mig_closedCount++;
