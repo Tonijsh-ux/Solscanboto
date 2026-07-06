@@ -19,16 +19,16 @@ const PORT = process.env.PORT || 3001;
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
 const DEMO_ONLY = false;
-const BUILD_VERSION = "v7.0-guard-barrendero"; // etiqueta para verificar qué archivo corre
+const BUILD_VERSION = "v7.0-guard-barrendero";
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
 // real. NO es para ganar dinero todavía. Requiere: keys ROTADAS + wallet dedicada.
-const SOL_PER_TRADE_REAL = 0.1;
+const SOL_PER_TRADE_REAL = 0.15;
 const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
 const SOL_PER_TRADE_MIG = 0.5;
-const MAX_REAL_TRADES = 6;
-const MAX_MIG_REAL = 6;
+const MAX_REAL_TRADES = 10;
+const MAX_MIG_REAL = 10;
 const REAL_STRATEGIES = ["migration"];
 // MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
 const STATE_FILE = process.env.STATE_FILE
@@ -482,7 +482,7 @@ function formatMC(n) {
 }
 
 function unsubscribeToken(mint) {
-  // GUARD (7-jul): la suscripcion al feed es COMPARTIDA por mint. No desuscribir si el token sigue en uso.
+  // GUARD: la suscripcion al feed es compartida por mint. No desuscribir si sigue en uso.
   if (state.migMonitored.has(mint)) return;
   if (state.migWatching.has(mint)) return;
   if (state.mcoRecordings.has(mint)) return;
@@ -1135,7 +1135,7 @@ async function openRealTrade(signal) {
   if (stratOpen >= MAX_MIG_REAL) { addLog(`⚠️ Límite real [migración]: ${stratOpen}/${MAX_MIG_REAL}`, "warn"); return; }
   const mcEntryReal = signal.price * 1_000_000_000;
   if (mcEntryReal > MIG_MAX_MC_REAL) {
-    addLog(`🛑 REAL saltada (MC ${formatMC(mcEntryReal)} > tope real ${formatMC(MIG_MAX_MC_REAL)}) - solo demo`, "warn");
+    addLog(`🛑 REAL saltada (MC ${formatMC(mcEntryReal)} > tope real ${formatMC(MIG_MAX_MC_REAL)}) — solo demo`, "warn");
     return;
   }
   const solAmount = SOL_PER_TRADE_REAL;
@@ -1189,7 +1189,7 @@ async function closeRealTrade(trade, price, reason) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
     trade.status = "SELL_FAILED"; trade.result = "SELL_FAILED"; trade.closeTime = Date.now();
-    addLog(`[AVISO] POSICION HUERFANA: ${trade.symbol} - venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. Reintento cada 2 min (o vende a mano desde Phantom).`, "error");
+    addLog(`[AVISO] POSICION HUERFANA: ${trade.symbol} - venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. Reintento automatico cada 2 min (o vende a mano desde Phantom).`, "error");
     broadcast({ event: "realTradeClosed", data: trade }); return;
   }
   const proceedsSol = sell.proceedsSol;
@@ -1326,10 +1326,9 @@ setInterval(() => {
   }
 }, 10_000);
 
-// ── BARRENDERO DE HUÉRFANAS (7-jul): trades cuya venta falló (SELL_FAILED) quedaban
-// abandonados con los tokens en la wallet y sin gestión. Cada 2 min: si los tokens ya
-// no están (vendidos a mano) → cerrar como MANUAL; si están → reintentar venta con
-// slippage 30 (rescate) y registrar el PnL real.
+// BARRENDERO: trades con venta fallida (SELL_FAILED) quedaban abandonados con los
+// tokens en la wallet. Cada 2 min: si los tokens ya no estan (vendidos a mano) ->
+// cerrar como MANUAL; si estan -> reintentar venta con slippage 30 y registrar PnL.
 setInterval(async () => {
   if (!wallet || !connection) return;
   for (const trade of state.realTrades) {
@@ -1338,12 +1337,12 @@ setInterval(async () => {
       const bal = await getTokenBalance(trade.mint);
       if (bal <= 0) {
         trade.status = "CLOSED"; trade.result = "MANUAL"; trade.closeTime = trade.closeTime || Date.now();
-        addLog(`[BARRENDERO] Huerfana resuelta externamente: ${trade.symbol} (tokens ya no estan - vendida a mano). PnL no registrado por el bot.`, "info");
+        addLog(`[BARRENDERO] Huerfana resuelta externamente: ${trade.symbol} (tokens ya no estan). PnL no registrado por el bot.`, "info");
         broadcast({ event: "realTradeClosed", data: trade });
         continue;
       }
       const sell = await sellToken(trade.mint, 30);
-      if (!sell) continue; // seguirá intentando en el próximo ciclo
+      if (!sell) continue;
       const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
       const realPnlSol = +(sell.proceedsSol - costSol).toFixed(4);
       trade.sellSignature = sell.sig; trade.closeTime = Date.now(); trade.status = "CLOSED";
@@ -1355,9 +1354,12 @@ setInterval(async () => {
       addLog(`[BARRENDERO] RESCATE: ${trade.symbol} vendida con slippage 30 -> ${realPnlSol>=0?"+":""}${realPnlSol} SOL`, realPnlSol>=0?"realwin":"realloss");
       addLog(`[REALREC] sym=${trade.symbol} reason=RESCUE dur=${Math.round((trade.closeTime - trade.openTime)/1000)}s tickPct=0.0% cost=${costSol} recv=${sell.proceedsSol} realSol=${realPnlSol} slipFee=0 slipPct=0%`, "real");
       broadcast({ event: "realTradeClosed", data: trade });
-    } catch (e) { /* siguiente ciclo */ }
+    } catch (e) { }
   }
 }, 120_000);
+
+
+function openDemoTrade(signal) {
   const trade = {
     id: `demo-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
     strategy: signal.strategy, mint: signal.mint, symbol: signal.symbol, name: signal.name,
