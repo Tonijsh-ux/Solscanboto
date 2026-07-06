@@ -482,9 +482,7 @@ function formatMC(n) {
 }
 
 function unsubscribeToken(mint) {
-  // GUARD (7-jul): la suscripción al feed es COMPARTIDA por mint. Las grabadoras
-  // desuscribían al terminar y dejaban CIEGAS las posiciones abiertas del mismo token
-  // (causa de las "congeladas" y de huérfanas reales). No desuscribir si sigue en uso.
+  // GUARD (7-jul): la suscripcion al feed es COMPARTIDA por mint. No desuscribir si el token sigue en uso.
   if (state.migMonitored.has(mint)) return;
   if (state.migWatching.has(mint)) return;
   if (state.mcoRecordings.has(mint)) return;
@@ -1137,7 +1135,7 @@ async function openRealTrade(signal) {
   if (stratOpen >= MAX_MIG_REAL) { addLog(`⚠️ Límite real [migración]: ${stratOpen}/${MAX_MIG_REAL}`, "warn"); return; }
   const mcEntryReal = signal.price * 1_000_000_000;
   if (mcEntryReal > MIG_MAX_MC_REAL) {
-    addLog(`🛑 REAL saltada (MC ${formatMC(mcEntryReal)} > tope real ${formatMC(MIG_MAX_MC_REAL)}) — solo demo`, "warn");
+    addLog(`🛑 REAL saltada (MC ${formatMC(mcEntryReal)} > tope real ${formatMC(MIG_MAX_MC_REAL)}) - solo demo`, "warn");
     return;
   }
   const solAmount = SOL_PER_TRADE_REAL;
@@ -1191,7 +1189,7 @@ async function closeRealTrade(trade, price, reason) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
     trade.status = "SELL_FAILED"; trade.result = "SELL_FAILED"; trade.closeTime = Date.now();
-    addLog(`⚠️ POSICIÓN HUÉRFANA: ${trade.symbol} — venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. El barrendero reintentará cada 2 min (o vende a mano desde Phantom).`, "error");
+    addLog(`[AVISO] POSICION HUERFANA: ${trade.symbol} - venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. Reintento cada 2 min (o vende a mano desde Phantom).`, "error");
     broadcast({ event: "realTradeClosed", data: trade }); return;
   }
   const proceedsSol = sell.proceedsSol;
@@ -1340,7 +1338,7 @@ setInterval(async () => {
       const bal = await getTokenBalance(trade.mint);
       if (bal <= 0) {
         trade.status = "CLOSED"; trade.result = "MANUAL"; trade.closeTime = trade.closeTime || Date.now();
-        addLog(`🧹 Huérfana resuelta externamente: ${trade.symbol} (tokens ya no están — vendida a mano). PnL no registrado por el bot.`, "info");
+        addLog(`[BARRENDERO] Huerfana resuelta externamente: ${trade.symbol} (tokens ya no estan - vendida a mano). PnL no registrado por el bot.`, "info");
         broadcast({ event: "realTradeClosed", data: trade });
         continue;
       }
@@ -1354,7 +1352,7 @@ setInterval(async () => {
       if (realPnlSol >= 0) state.stats.mig_realWins++; else state.stats.mig_realLosses++;
       state.stats.mig_realPnLSol += realPnlSol;
       riskRecordClose(realPnlSol);
-      addLog(`🧹 RESCATE: ${trade.symbol} vendida con slippage 30 → ${realPnlSol>=0?"+":""}${realPnlSol} SOL`, realPnlSol>=0?"realwin":"realloss");
+      addLog(`[BARRENDERO] RESCATE: ${trade.symbol} vendida con slippage 30 -> ${realPnlSol>=0?"+":""}${realPnlSol} SOL`, realPnlSol>=0?"realwin":"realloss");
       addLog(`[REALREC] sym=${trade.symbol} reason=RESCUE dur=${Math.round((trade.closeTime - trade.openTime)/1000)}s tickPct=0.0% cost=${costSol} recv=${sell.proceedsSol} realSol=${realPnlSol} slipFee=0 slipPct=0%`, "real");
       broadcast({ event: "realTradeClosed", data: trade });
     } catch (e) { /* siguiente ciclo */ }
@@ -1634,7 +1632,7 @@ function connectPumpPortal() {
   addLog("🔌 Conectando a PumpPortal...", "info");
   pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
   pumpPortalWs.on("open", () => {
-    addLog(`✅ PumpPortal conectado — 🏷️ BUILD ${BUILD_VERSION}`, "info");
+    addLog(`✅ PumpPortal conectado | BUILD ${BUILD_VERSION}`, "info");
     pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
     for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
