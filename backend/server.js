@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 3001;
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
 const DEMO_ONLY = false;
+const BUILD_VERSION = "v7.0-guard-barrendero"; // etiqueta para verificar qué archivo corre
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -1633,7 +1634,7 @@ function connectPumpPortal() {
   addLog("🔌 Conectando a PumpPortal...", "info");
   pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
   pumpPortalWs.on("open", () => {
-    addLog("✅ PumpPortal conectado", "info");
+    addLog(`✅ PumpPortal conectado — 🏷️ BUILD ${BUILD_VERSION}`, "info");
     pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
     for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
