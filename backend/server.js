@@ -85,9 +85,16 @@ const MIG_EXCLUDE_BAND_HI = 40_000;
 // Regla: a los 15s de abrir, si el máximo alcanzado < +10%, salir ya.
 // Backtest: corta 36/49 perdedoras sacrificando solo 2/20 ganadoras (ratio 18:1).
 // Sube la media de +7.5%/op a ~+13.6%/op. Aplica en real y en demo.
-const MIG_LAUNCH_CHECK = false;      // DESACTIVADO: mataba 14 ganadoras (ratio 1:1.4 malo). Muchos cohetes despegan a los 5-11min, el corte a 18s los ejecutaba antes.
-const MIG_LAUNCH_CHECK_MS = 18_000;  // a los 18s de abrir (era 15s; subido a 18s tras ver que ganadoras que despegan justo en el límite —ej. +62% que a 15s iba +8%— se cortaban; 18s salva esas perdiendo solo 1 perdedora más)
-const MIG_LAUNCH_MIN_PCT = 10;       // exige haber tocado +10% (maxGainPct)
+// REGLA DE LOS 30s (7-jul, validada sobre 1299 ops): a los 30s de abrir, si el trade
+// está en ROJO (precio actual < 0%), vender. En julio (mercado con 54% rugs) esto
+// convierte +13.7 en +27.7 SOL demo: corta los rugs que no arrancan con poca fricción
+// (vender en ~0% cuesta menos que el SL en desplome). Aplica en real Y demo.
+// Nota: usa el precio ACTUAL a los 30s (no el máximo). Poner OFF para desactivar.
+const MIG_LAUNCH_CHECK = true;
+const MIG_LAUNCH_CHECK_MS = 30_000;  // a los 30 segundos de abrir
+const MIG_LAUNCH_MIN_PCT = 10;       // (legacy, ya no se usa con la regla de rojo)
+const MIG_R30_ON = true;             // regla de los 30s activada
+const MIG_R30_THRESHOLD = 0;         // vender si a los 30s el precio actual < 0%
 
 // ── MODO OBSERVADOR / GRABACIÓN EN VIVO ────────────────────────
 const OBSERVER_MODE = false;
@@ -253,6 +260,28 @@ function riskRolloverDay() {
     riskState.dailyPnlSol = 0;
     riskState.consecutiveLosses = 0;
   }
+}
+
+// FILTRO HORARIO (7-jul, validado sobre julio): evitar franjas malas consistentes.
+// Madrugada 1:00-8:30 España (bajo volumen, quedan rugs): negativa 3/4 días.
+// Hora 20:00 España (cena): mala 4/4 días. Juntas suben el PnL de julio notablemente.
+// El server corre en UTC; España = UTC+2. Convertimos a hora España para decidir.
+// Poner MIG_TIME_FILTER_ON=false para desactivar.
+const MIG_TIME_FILTER_ON = true;
+const MIG_TZ_OFFSET = 2; // España respecto a UTC (verano). Ajustar a 1 en invierno.
+function horaEspana() {
+  const utcH = new Date().getUTCHours();
+  const utcM = new Date().getUTCMinutes();
+  return ((utcH + MIG_TZ_OFFSET + 24) % 24) + utcM / 60;
+}
+function franjaHorariaEvitada() {
+  if (!MIG_TIME_FILTER_ON) return null;
+  const h = horaEspana();
+  // Madrugada 1:00 - 8:30
+  if (h >= 1 && h < 8.5) return "madrugada (1:00-8:30 ES)";
+  // Hora 20:00 - 21:00
+  if (h >= 20 && h < 21) return "hora 20h ES";
+  return null;
 }
 
 function tradingHalted() {
@@ -817,6 +846,12 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     return;
   }
   if (!MIG_QUAL_GATE) {
+    const franjaEvit1 = franjaHorariaEvitada();
+    if (franjaEvit1) {
+      addLog(`🕐 MIG HORARIO: ${entry.symbol} descartada | franja evitada: ${franjaEvit1}`, "filter");
+      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+      broadcast({ event: "stats", data: state.stats }); return;
+    }
     entry.entered = true; state.stats.mig_entered++;
     state.migWatching.delete(entry.mint); entry.firstPrice = entryPriceB;
     addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entryPriceB * 1_000_000_000)}`, "accept");
@@ -879,6 +914,12 @@ function migQualTick(entry, price) {
       }
       if (MIG_EXCLUDE_BAND_ON && mcEntryUsd >= MIG_EXCLUDE_BAND_LO && mcEntryUsd < MIG_EXCLUDE_BAND_HI) {
         addLog(`🚫 MIG BANDA EXCLUIDA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} en zona $30-40K (valle: WR 35%, -10.5 SOL histórico)`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
+      const franjaEvit2 = franjaHorariaEvitada();
+      if (franjaEvit2) {
+        addLog(`🕐 MIG HORARIO: ${entry.symbol} descartada | franja evitada: ${franjaEvit2}`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
@@ -1232,12 +1273,14 @@ function scheduleLaunchCheck(trade, kind) {
   if (trade.strategy !== "migration") return;
   setTimeout(() => {
     if (trade.status !== "OPEN") return;            // ya cerrado por TP/SL/etc
-    if (trade.maxGainPct >= MIG_LAUNCH_MIN_PCT) return; // despegó, se mantiene
     const token = state.migMonitored.get(trade.mint);
     const price = token?.price || trade.entryPrice;
-    addLog(`✂️ NO-DESPEGUE [${kind} ${trade.symbol}]: max ${trade.maxGainPct.toFixed(1)}% < ${MIG_LAUNCH_MIN_PCT}% a los ${MIG_LAUNCH_CHECK_MS/1000}s → salida`, kind === "real" ? "realloss" : "loss");
-    if (kind === "real") closeRealTrade(trade, price, "NO_LAUNCH");
-    else closeDemoTrade(trade, price, "NO_LAUNCH", MIG_TP);
+    // REGLA DE LOS 30s: mirar el precio ACTUAL (no el máximo). Si está en rojo, vender.
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    if (currentPct >= MIG_R30_THRESHOLD) return;    // está en verde (o plano) → se mantiene
+    addLog(`✂️ REGLA 30s [${kind} ${trade.symbol}]: en rojo ${currentPct.toFixed(1)}% a los ${MIG_LAUNCH_CHECK_MS/1000}s → salida (evita rug)`, kind === "real" ? "realloss" : "loss");
+    if (kind === "real") closeRealTrade(trade, price, "R30");
+    else closeDemoTrade(trade, price, "R30", MIG_TP);
   }, MIG_LAUNCH_CHECK_MS);
 }
 
@@ -1765,7 +1808,7 @@ server.listen(PORT, async () => {
     console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · ${MIG_STRUCT_ON?`estructura(arma+${MIG_STRUCT_ARM_PCT},valle${MIG_STRUCT_RETROCESO})`:MIG_TREND_ON?`tendencia(arma+${MIG_TREND_ARM_PCT},valle${MIG_TREND_RETROCESO})`:"sin trailing"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
     addLog(`📝 MODO DEMO — ${MIG_STRUCT_ON?"estructura":MIG_TREND_ON?"tendencia":"sin trailing"}+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF"}. NO toca wallet real. AGRESIVA.`, "accept");
   } else {
-    console.log(`🚀 SolScanBot MIGRACIÓN v6.20.3 — REAL | trailing arma +${MIG_LOCK_AT*100}% · breakeven +${MIG_BREAKEVEN_AT*100}% · corte no-despegue ${MIG_LAUNCH_CHECK ? `ON (${MIG_LAUNCH_CHECK_MS/1000}s/+${MIG_LAUNCH_MIN_PCT}%)` : "off"} | tope MC $${(MIG_MAX_MC_ENTRY/1000)}K | MAX_MIG_REAL ${MAX_MIG_REAL} × ${SOL_PER_TRADE_MIG} SOL | kill -${RISK.maxDailyLossSol} SOL/día ${RISK.maxConsecutiveLosses}L`);
+    console.log(`🚀 SolScanBot MIGRACIÓN v7.0-estrategia | REGLA 30s ${MIG_R30_ON ? "ON (vende si <"+MIG_R30_THRESHOLD+"% a "+MIG_LAUNCH_CHECK_MS/1000+"s)" : "off"} | HORARIO ${MIG_TIME_FILTER_ON ? "ON (evita madrugada 1-8:30 + 20h ES)" : "off"} | banda $30-40K ${MIG_EXCLUDE_BAND_ON ? "excluida" : "off"} | TP +${(MIG_TP-1)*100}% SL -${(1-MIG_SL)*100}% | freno ${RISK.maxDailyLossSol}/día + ventana ${RISK.maxWindowLossSol}/${RISK.windowHours}h`);
   }
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
