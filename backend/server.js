@@ -27,7 +27,7 @@ const SOL_PER_TRADE_REAL = 0.15;
 const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
 const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = 10;
-const MAX_MIG_REAL = 0;
+const MAX_MIG_REAL = 10;
 const REAL_STRATEGIES = ["migration"];
 // MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
 const STATE_FILE = process.env.STATE_FILE
@@ -1552,15 +1552,33 @@ function updateDemoTrades(mint, price, strategy) {
       addLog(`🛑 CAP LOSS [${strategy}]: ${trade.symbol} ${currentPct.toFixed(1)}%`, "loss");
       closeDemoTrade(trade, price, "SL", tp_pct); continue;
     }
-    // Nueva lógica: estructura + escalones (sube trade.sl)
-    aplicarEstructuraYEscalones(trade, price);
-    // Cierre
+    // SINCRONIZADO CON EL REAL (7-jul): misma lógica breakeven→lock→follow→floors.
+    // El demo debe ser espejo fiel del real para que el experimento tenga validez.
+    const breakeven = MIG_BREAKEVEN_AT;
+    const breakevenMargin = MIG_BREAKEVEN_MARGIN;
+    const lock = MIG_LOCK_AT;
+    const follow = MIG_FOLLOW_PCT;
+    const stepArmed = trade.maxGainPct >= MIG_STEP_TRIGGER * 100 - 1e-9;
+    const followEff = stepArmed ? migTrailingPct(trade.maxGainPct) : follow;
+    if (trade.trailingPhase === "FOLLOWING") {
+      const newSl = price * (1 - followEff); if (newSl > trade.sl) trade.sl = +newSl.toFixed(12);
+    } else if ((price - trade.entryPrice) / trade.entryPrice >= lock) {
+      trade.trailingPhase = "FOLLOWING";
+      trade.sl = +Math.max(trade.sl, price * (1 - followEff)).toFixed(12);
+    } else if ((price - trade.entryPrice) / trade.entryPrice >= breakeven && trade.trailingPhase === "INITIAL") {
+      trade.trailingPhase = "BREAKEVEN";
+      trade.sl = +(trade.entryPrice * (1 - breakevenMargin)).toFixed(12);
+    }
+    const stepFloorPrice = trade.entryPrice * (1 + MIG_STEP_FLOOR);
+    if (stepArmed && stepFloorPrice > trade.sl) trade.sl = +stepFloorPrice.toFixed(12);
+    if (trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
+      const topFloorPrice = trade.entryPrice * (1 + MIG_TOP_FLOOR);
+      if (topFloorPrice > trade.sl) trade.sl = +topFloorPrice.toFixed(12);
+    }
     if (price >= trade.tp) { trade._slBelowCount = 0; closeDemoTrade(trade, price, "TP", tp_pct); }
     else if (price <= trade.sl) {
-      const slPct = (trade.sl - trade.entryPrice) / trade.entryPrice * 100;
-      const reason = slPct > 0 ? (MIG_TREND_ON ? "TREND" : (trade._structArmed ? "STRUCT" : "STEP")) : "SL";
       if (trade.sl >= trade.entryPrice) {
-        closeDemoTrade(trade, trade.sl, reason, tp_pct);
+        closeDemoTrade(trade, price, (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL", tp_pct);
       } else {
         trade._slBelowCount = (trade._slBelowCount || 0) + 1;
         if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", tp_pct); }
