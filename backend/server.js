@@ -19,7 +19,6 @@ const PORT = process.env.PORT || 3001;
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
 const DEMO_ONLY = false;
-const BUILD_VERSION = "v7.0-guard-barrendero";
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -72,6 +71,12 @@ const MIG_MAX_MC_ENTRY = 1_000_000;
 // era ficción en ambos sentidos: 28 ops fantasma (+797% y -99% incluidos) que EN REAL
 // son inejecutables (no puedes comprar $75 de un token con $200 de MC total).
 const MIG_MIN_MC_ENTRY = 5_000;
+// BANDA EXCLUIDA (7-jul): $30-40K es el "valle de la muerte" — el 36% de las ops del
+// histórico (300) con WR ~35% y -10.5 SOL acumulados; perdedora los 4 dias validados.
+// Se excluye la entrada en ese rango de MC. Poner MIG_EXCLUDE_BAND_ON=false para revertir.
+const MIG_EXCLUDE_BAND_ON = true;
+const MIG_EXCLUDE_BAND_LO = 30_000;
+const MIG_EXCLUDE_BAND_HI = 40_000;
 
 // ── v6.20.3: CORTE POR NO-DESPEGUE ─────────────────────────────
 // Hallazgo clave (150 ops/7 días): el predictor real del éxito NO es el MC sino
@@ -170,6 +175,8 @@ const MIG_TOP_FLOOR = 0.65;
 const RISK = {
   maxDailyLossSol: 0.8,   // experimento 0.1: ~8-15 ops malas paran el día
   maxConsecutiveLosses: 12,
+  maxWindowLossSol: 0.8,        // tope por VENTANA MÓVIL (independiente de medianoche UTC)
+  windowHours: 6,              // ventana de las últimas 6 horas
   cooldownAfterStreakMs: 60 * 60 * 1000,
 };
 
@@ -232,6 +239,7 @@ async function getTokenBalance(mint) {
 const riskState = {
   dayKey: null,
   dailyPnlSol: 0,
+  recentCloses: [],            // [{t, pnl}] para la ventana móvil
   consecutiveLosses: 0,
   pausedUntil: 0,
 };
@@ -258,6 +266,20 @@ function tradingHalted() {
     }
     return true;
   }
+  // FRENO POR VENTANA MÓVIL (arregla el bug del reset a medianoche UTC): suma las últimas N horas
+  const nowW = Date.now();
+  const cutoffW = nowW - RISK.windowHours * 3600 * 1000;
+  const windowPnl = riskState.recentCloses.filter(x => x.t >= cutoffW).reduce((s, x) => s + x.pnl, 0);
+  if (windowPnl <= -RISK.maxWindowLossSol) {
+    if (!riskState._windowLogged) {
+      riskState._windowLogged = true;
+      riskState.pausedUntil = nowW + 3 * 3600 * 1000; // pausa 3h tras tocar el tope de ventana
+      addLog(`🛑 KILL-SWITCH VENTANA: pérdida ${windowPnl.toFixed(3)} SOL en ${RISK.windowHours}h ≥ tope ${RISK.maxWindowLossSol} — pausa 3h`, "error");
+      broadcast({ event: "risk", data: riskSnapshot() });
+    }
+    return true;
+  }
+  if (windowPnl > -RISK.maxWindowLossSol) riskState._windowLogged = false;
   if (riskState.consecutiveLosses >= RISK.maxConsecutiveLosses) {
     if (Date.now() >= riskState.pausedUntil) {
       riskState.pausedUntil = Date.now() + RISK.cooldownAfterStreakMs;
@@ -273,6 +295,11 @@ function tradingHalted() {
 function riskRecordClose(pnlSol) {
   riskRolloverDay();
   riskState.dailyPnlSol = +(riskState.dailyPnlSol + pnlSol).toFixed(6);
+  // ventana móvil: registrar y podar lo más viejo que la ventana
+  const nowMs = Date.now();
+  riskState.recentCloses.push({ t: nowMs, pnl: pnlSol });
+  const cutoff = nowMs - RISK.windowHours * 3600 * 1000;
+  riskState.recentCloses = riskState.recentCloses.filter(x => x.t >= cutoff);
   if (pnlSol < 0) riskState.consecutiveLosses++;
   else riskState.consecutiveLosses = 0;
   if (riskState.dailyPnlSol > -RISK.maxDailyLossSol) riskState._dailyLogged = false;
@@ -482,12 +509,6 @@ function formatMC(n) {
 }
 
 function unsubscribeToken(mint) {
-  // GUARD: la suscripcion al feed es compartida por mint. No desuscribir si sigue en uso.
-  if (state.migMonitored.has(mint)) return;
-  if (state.migWatching.has(mint)) return;
-  if (state.mcoRecordings.has(mint)) return;
-  if (state.obsRecordings.has(mint)) return;
-  if (state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING" || t.status === "SELL_FAILED"))) return;
   if (pumpPortalWs?.readyState === WebSocket.OPEN) {
     pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
   }
@@ -828,6 +849,11 @@ function migQualTick(entry, price) {
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
+      if (MIG_EXCLUDE_BAND_ON && mcEntryUsd >= MIG_EXCLUDE_BAND_LO && mcEntryUsd < MIG_EXCLUDE_BAND_HI) {
+        addLog(`🚫 MIG BANDA EXCLUIDA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} en zona $30-40K (valle: WR 35%, -10.5 SOL histórico)`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
       entry.entered = true; state.stats.mig_entered++;
       state.migWatching.delete(entry.mint); entry.firstPrice = precioB;
       addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} @ MC ${formatMC(mcEntryUsd)}`, "accept");
@@ -993,6 +1019,12 @@ function migOpenTrades(entry) {
   // CINTURÓN: bloquear la apertura si el MC supera el tope, venga por donde venga la entrada.
   // (El 3-jul entraron 2 ops con MC $423K y $514K saltándose el chequeo previo; ambas pérdidas gordas.)
   const mcOpen = price * 1_000_000_000;
+  if (MIG_EXCLUDE_BAND_ON && mcOpen >= MIG_EXCLUDE_BAND_LO && mcOpen < MIG_EXCLUDE_BAND_HI) {
+    addLog(`🚫 MIG BANDA EXCLUIDA (cinturón apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} en zona $30-40K`, "filter");
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+    return;
+  }
   if (mcOpen > MIG_MAX_MC_ENTRY || mcOpen < MIG_MIN_MC_ENTRY) {
     addLog(`🛑 MIG MC FUERA DE RANGO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} (rango válido ${formatMC(MIG_MIN_MC_ENTRY)}–${formatMC(MIG_MAX_MC_ENTRY)})`, "filter");
     state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
@@ -1098,14 +1130,14 @@ async function buyToken(mint, solAmount, slippage = 15) {
   } catch (e) { addLog(`❌ Compra: ${e.message}`, "error"); return null; }
 }
 
-async function sellToken(mint, slippage = 15) {
+async function sellToken(mint) {
   if (!wallet || !connection) return null;
   try {
     const bal = await getTokenBalance(mint);
     if (bal <= 0) { addLog(`⚠️ Sin tokens: ${shortAddr(mint)}`, "warn"); return null; }
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount: bal, slippage, priorityFee: 0.0005, pool: "auto" }),
+      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount: bal, slippage: 15, priorityFee: 0.0005, pool: "auto" }),
       signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) { addLog(`❌ Venta error: ${response.status}`, "error"); return null; }
@@ -1188,9 +1220,7 @@ async function closeRealTrade(trade, price, reason) {
   if (!sell) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
-    trade.status = "SELL_FAILED"; trade.result = "SELL_FAILED"; trade.closeTime = Date.now();
-    addLog(`[AVISO] POSICION HUERFANA: ${trade.symbol} - venta fallida 4 veces. Los tokens SIGUEN EN LA WALLET. Reintento automatico cada 2 min (o vende a mano desde Phantom).`, "error");
-    broadcast({ event: "realTradeClosed", data: trade }); return;
+    trade.status = "SELL_FAILED"; broadcast({ event: "realTradeClosed", data: trade }); return;
   }
   const proceedsSol = sell.proceedsSol;
   const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
@@ -1325,39 +1355,6 @@ setInterval(() => {
     closeRealTrade(trade, token?.price || trade.entryPrice, "EXPIRED");
   }
 }, 10_000);
-
-// BARRENDERO: trades con venta fallida (SELL_FAILED) quedaban abandonados con los
-// tokens en la wallet. Cada 2 min: si los tokens ya no estan (vendidos a mano) ->
-// cerrar como MANUAL; si estan -> reintentar venta con slippage 30 y registrar PnL.
-setInterval(async () => {
-  if (!wallet || !connection) return;
-  for (const trade of state.realTrades) {
-    if (trade.status !== "SELL_FAILED") continue;
-    try {
-      const bal = await getTokenBalance(trade.mint);
-      if (bal <= 0) {
-        trade.status = "CLOSED"; trade.result = "MANUAL"; trade.closeTime = trade.closeTime || Date.now();
-        addLog(`[BARRENDERO] Huerfana resuelta externamente: ${trade.symbol} (tokens ya no estan). PnL no registrado por el bot.`, "info");
-        broadcast({ event: "realTradeClosed", data: trade });
-        continue;
-      }
-      const sell = await sellToken(trade.mint, 30);
-      if (!sell) continue;
-      const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
-      const realPnlSol = +(sell.proceedsSol - costSol).toFixed(4);
-      trade.sellSignature = sell.sig; trade.closeTime = Date.now(); trade.status = "CLOSED";
-      trade.pnlSol = realPnlSol; trade.pnlPct = +((sell.proceedsSol / costSol - 1) * 100).toFixed(2);
-      trade.result = realPnlSol >= 0 ? "WIN" : "LOSS";
-      if (realPnlSol >= 0) state.stats.mig_realWins++; else state.stats.mig_realLosses++;
-      state.stats.mig_realPnLSol += realPnlSol;
-      riskRecordClose(realPnlSol);
-      addLog(`[BARRENDERO] RESCATE: ${trade.symbol} vendida con slippage 30 -> ${realPnlSol>=0?"+":""}${realPnlSol} SOL`, realPnlSol>=0?"realwin":"realloss");
-      addLog(`[REALREC] sym=${trade.symbol} reason=RESCUE dur=${Math.round((trade.closeTime - trade.openTime)/1000)}s tickPct=0.0% cost=${costSol} recv=${sell.proceedsSol} realSol=${realPnlSol} slipFee=0 slipPct=0%`, "real");
-      broadcast({ event: "realTradeClosed", data: trade });
-    } catch (e) { }
-  }
-}, 120_000);
-
 
 function openDemoTrade(signal) {
   const trade = {
@@ -1634,7 +1631,7 @@ function connectPumpPortal() {
   addLog("🔌 Conectando a PumpPortal...", "info");
   pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
   pumpPortalWs.on("open", () => {
-    addLog(`✅ PumpPortal conectado | BUILD ${BUILD_VERSION}`, "info");
+    addLog("✅ PumpPortal conectado", "info");
     pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
     for (const [mint] of state.migWatching.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
     for (const [mint] of state.migMonitored.entries()) pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
