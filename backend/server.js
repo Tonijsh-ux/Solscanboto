@@ -709,26 +709,29 @@ function mcoFinish(mint) {
 // ════════════════════════════════════════════════════════════════
 
 
-// ── REGISTRO DE EDAD/CALIDAD PRE-MIGRACION (7-jul, experimento) ──
-// Consulta a pump.fun la edad y holders del token al migrar. SOLO REGISTRA en el log
-// (no bloquea ninguna entrada). Objetivo: ver si los rugs migran mas jovenes / con menos
-// holders que los cohetes, para decidir despues si filtrar por ello.
+// ── REGISTRO DE EDAD PRE-MIGRACION via HELIUS (7-jul) ──
+// pump.fun bloquea consultas de servidor (Cloudflare 530), asi que sacamos la edad
+// on-chain: la primera transaccion del mint = su creacion. SOLO REGISTRA, no bloquea.
 async function registrarCalidadPremig(mint, symbol) {
   try {
-    const resp = await fetch(`https://frontend-api.pump.fun/coins/${mint}`, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
-      signal: AbortSignal.timeout(4000),
-    });
-    if (!resp.ok) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error http=${resp.status}`, "info"); return; }
-    const d = await resp.json();
-    const created = d.created_timestamp ? Number(d.created_timestamp) : null;
-    const ageMin = created ? Math.round((Date.now() - created) / 60000) : -1;
-    const holders = d.holder_count ?? d.holders ?? -1;
-    const replies = d.reply_count ?? -1;
-    const usdMc = d.usd_market_cap ? Math.round(d.usd_market_cap) : -1;
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} holders=${holders} replies=${replies} mcUsd=${usdMc}`, "info");
+    if (!connection) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=sin-conexion`, "info"); return; }
+    const pk = new PublicKey(mint);
+    // pedir firmas (vienen de mas reciente a mas antigua). Paginar hasta la mas antigua.
+    let before = undefined, oldest = null, total = 0, guard = 0;
+    while (guard < 10) {
+      guard++;
+      const sigs = await connection.getSignaturesForAddress(pk, { limit: 1000, before }, "confirmed");
+      if (!sigs || sigs.length === 0) break;
+      total += sigs.length;
+      oldest = sigs[sigs.length - 1];
+      if (sigs.length < 1000) break;      // ya llegamos al final
+      before = oldest.signature;
+    }
+    if (!oldest || !oldest.blockTime) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=sin-blocktime txs=${total}`, "info"); return; }
+    const ageMin = Math.round((Date.now() / 1000 - oldest.blockTime) / 60);
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}`, "info");
   } catch (e) {
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,40)}`, "info");
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,50)}`, "info");
   }
 }
 
@@ -737,7 +740,7 @@ function migStartWatching(coin) {
   if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
-  registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea la entrada
+  registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
   if (MC_OBSERVER) {
     const mcMigUsd = (coin.marketCapSol || 0) * solPriceUSD;
     broadcast({ event: "stats", data: state.stats });
