@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = false;
+const DEMO_ONLY = true;
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -27,7 +27,7 @@ const SOL_PER_TRADE_REAL = 0.15;
 const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
 const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = 10;
-const MAX_MIG_REAL = 10;
+const MAX_MIG_REAL = 0;
 const REAL_STRATEGIES = ["migration"];
 // MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
 const STATE_FILE = process.env.STATE_FILE
