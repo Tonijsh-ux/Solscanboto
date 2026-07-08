@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = true;
+const DEMO_ONLY = false;
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -1795,7 +1795,7 @@ function connectPumpPortal() {
         const price = calcPrice(data);
         if (price <= 0) return;
         const sol = data.solAmount || 0;
-        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint)) migUpdatePrice(data.mint, price, sol);
+        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint) || state.liveRecordings.has(data.mint)) migUpdatePrice(data.mint, price, sol); // LAB: +liveRecordings para que la grabación extendida reciba precios tras el cierre demo
         if (OBSERVER_MODE && state.obsRecordings.has(data.mint)) obsSample(data.mint, price);
         if (MC_OBSERVER && state.mcoRecordings.has(data.mint)) mcoSample(data.mint, price, sol * solPriceUSD);
       }
