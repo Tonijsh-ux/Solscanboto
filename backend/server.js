@@ -36,7 +36,7 @@ const STATE_FILE = process.env.STATE_FILE
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 6.00;                   // TP +500% (validado sobre 356 ops: mejor que +1000, muchos cohetes tocan +500 y caen antes de +1000)
 const MIG_SL = 0.60;                   // SL -40% desde entrada (validado sobre 356 ops: mejor que -60 en ambos días)
-const MIG_DURATION_MS = 30 * 60 * 1000; // red de seguridad 30min (antes 15). La posición se cierra por SL/escalón/estructura; esto solo evita quedarse colgado indefinidamente.
+const MIG_DURATION_MS = 12 * 60 * 1000; // LAB: 12min (era 30) — cubre la grabación de 10min y evita saturar suscripciones con el qual_gate abierto // red de seguridad 30min (antes 15). La posición se cierra por SL/escalón/estructura; esto solo evita quedarse colgado indefinidamente.
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
@@ -70,11 +70,11 @@ const MIG_MAX_MC_ENTRY = 1_000_000;
 // MC de $9-533 DÓLARES (glitch de precio o liquidez retirada). El bot entraba y el PnL
 // era ficción en ambos sentidos: 28 ops fantasma (+797% y -99% incluidos) que EN REAL
 // son inejecutables (no puedes comprar $75 de un token con $200 de MC total).
-const MIG_MIN_MC_ENTRY = 5_000;
+const MIG_MIN_MC_ENTRY = 2_500; // LAB: bajado de 5000 para ver todo el espectro
 // BANDA EXCLUIDA (7-jul): $30-40K es el "valle de la muerte" — el 36% de las ops del
 // histórico (300) con WR ~35% y -10.5 SOL acumulados; perdedora los 4 dias validados.
 // Se excluye la entrada en ese rango de MC. Poner MIG_EXCLUDE_BAND_ON=false para revertir.
-const MIG_EXCLUDE_BAND_ON = true;
+const MIG_EXCLUDE_BAND_ON = false; // LAB: off para grupo control
 const MIG_EXCLUDE_BAND_LO = 30_000;
 const MIG_EXCLUDE_BAND_HI = 40_000;
 
@@ -90,10 +90,10 @@ const MIG_EXCLUDE_BAND_HI = 40_000;
 // convierte +13.7 en +27.7 SOL demo: corta los rugs que no arrancan con poca fricción
 // (vender en ~0% cuesta menos que el SL en desplome). Aplica en real Y demo.
 // Nota: usa el precio ACTUAL a los 30s (no el máximo). Poner OFF para desactivar.
-const MIG_LAUNCH_CHECK = true;
+const MIG_LAUNCH_CHECK = false; // LAB: off, se simula con p30 del recorrido
 const MIG_LAUNCH_CHECK_MS = 30_000;  // a los 30 segundos de abrir
 const MIG_LAUNCH_MIN_PCT = 10;       // (legacy, ya no se usa con la regla de rojo)
-const MIG_R30_ON = true;             // regla de los 30s activada
+const MIG_R30_ON = false; // LAB: off             // regla de los 30s activada
 const MIG_R30_THRESHOLD = 0;         // vender si a los 30s el precio actual < 0%
 
 // ── MODO OBSERVADOR / GRABACIÓN EN VIVO ────────────────────────
@@ -139,7 +139,7 @@ const MIG_SL_CONFIRM_TICKS = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_QUAL_GATE = true;
-const MIG_QUAL_MOV2S_MIN = 10;         // qual_gate: exige mov2s > +10% (validado sobre 356 ops: mismo n° de cohetes, menos basura que +5)
+const MIG_QUAL_MOV2S_MIN = 0.5; // LAB: casi todo entra (era 10)         // qual_gate: exige mov2s > +10% (validado sobre 356 ops: mismo n° de cohetes, menos basura que +5)
 const MIG_QUAL_MAX_WAIT_MS = 600_000;  // qual_gate CONTINUO: vigila hasta 10 min esperando la señal (las entradas tardías aportan — validado)
 const MIG_QUAL_PEND15_ON = false;      // pend15 (pendiente 15s>0) DESACTIVADO — igualar al simulador, que solo usaba mov2s
 const MIG_QUAL_WINDOW_MS = 15_000;
@@ -267,7 +267,7 @@ function riskRolloverDay() {
 // Hora 20:00 España (cena): mala 4/4 días. Juntas suben el PnL de julio notablemente.
 // El server corre en UTC; España = UTC+2. Convertimos a hora España para decidir.
 // Poner MIG_TIME_FILTER_ON=false para desactivar.
-const MIG_TIME_FILTER_ON = true;
+const MIG_TIME_FILTER_ON = false; // LAB: off, se simulará después
 const MIG_TZ_OFFSET = 2; // España respecto a UTC (verano). Ajustar a 1 en invierno.
 function horaEspana() {
   const utcH = new Date().getUTCHours();
@@ -538,6 +538,12 @@ function formatMC(n) {
 }
 
 function unsubscribeToken(mint) {
+  // GUARD anti-ceguera: no desuscribir si el mint sigue en uso por otra parte del sistema
+  if (state.migMonitored.has(mint)) return;
+  if (state.migWatching.has(mint)) return;
+  if (state.liveRecordings.has(mint)) return;   // LAB: grabación extendida activa
+  if (state.obsRecordings?.has?.(mint)) return;
+  if (state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"))) return;
   if (pumpPortalWs?.readyState === WebSocket.OPEN) {
     pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
   }
@@ -758,9 +764,24 @@ async function registrarCalidadPremig(mint, symbol) {
     }
     if (!oldest || !oldest.blockTime) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=sin-blocktime txs=${total}`, "info"); return; }
     const ageMin = Math.round((Date.now() / 1000 - oldest.blockTime) / 60);
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}`, "info");
+    // LAB: añadir holders y concentración (lo que miran los snipers)
+    let holdersStr = "";
+    try {
+      const largest = await connection.getTokenLargestAccounts(new PublicKey(mint), "confirmed");
+      const accounts = largest?.value || [];
+      if (accounts.length > 0) {
+        let totalSupply = 0;
+        for (const a of accounts) totalSupply += Number(a.amount) || 0;
+        const topPct = totalSupply > 0 ? ((Number(accounts[0].amount) || 0) / totalSupply * 100) : -1;
+        const holders = accounts.filter(a => totalSupply > 0 && (Number(a.amount) / totalSupply) > 0.001).length;
+        holdersStr = ` holders=${holders} topPct=${topPct.toFixed(0)}`;
+      }
+    } catch (e) { holdersStr = " holders=err"; }
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}`, "info");
+    labStats.premigOk++;
   } catch (e) {
     addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,50)}`, "info");
+    labStats.premigErr++;
   }
 }
 
@@ -1019,10 +1040,11 @@ function liveRecStart(entry, entryPrice) {
   state.liveRecordings.set(entry.mint, rec);
 }
 
-function liveRecSample(mint, price) {
+function liveRecSample(mint, price, volUSD = 0) {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
+  rec.volPost = (rec.volPost || 0) + volUSD;  // LAB: volumen negociado DESPUÉS de migrar (cada trade, no solo samples)
   const dt = Date.now() - rec.t0;
   const interval = dt <= LIVE_REC_DENSE_MS ? LIVE_REC_DENSE_INTERVAL : LIVE_REC_NORMAL_INTERVAL;
   if (Date.now() - rec.lastSample < interval) return;
@@ -1032,11 +1054,18 @@ function liveRecSample(mint, price) {
   if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
 }
 
-function liveRecFinish(mint, cierreRealPct) {
-  if (!LIVE_RECORD) return;
+const LAB_EXTEND_MS = 10 * 60_000;
+// LAB: contadores de salud del experimento (volcados cada hora)
+const labStats = { premigOk: 0, premigErr: 0, migrecs: 0, inicio: Date.now() };
+setInterval(() => {
+  const h = ((Date.now() - labStats.inicio) / 3600000).toFixed(1);
+  addLog(`[LAB-SALUD] ${h}h de lab | migraciones=${state.stats.mig_migrations} entradas=${state.stats.mig_entered} MIGRECs=${labStats.migrecs} PREMIG ok=${labStats.premigOk} err=${labStats.premigErr}${labStats.premigErr > labStats.premigOk ? " ⚠️ HELIUS FALLANDO" : ""}`, "info");
+}, 3600_000); // LAB: la grabación sigue 10 min desde la entrada, aunque el demo cierre antes
+
+function liveRecEmit(mint) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished) return;
-  rec.finished = true; state.liveRecordings.delete(mint);
+  rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
   const pts = rec.puntos;
   if (pts.length < 2) return;
   let min=pts[0], max=pts[0];
@@ -1044,9 +1073,22 @@ function liveRecFinish(mint, cierreRealPct) {
   const orden = min.t<=max.t ? "lava-antes" : "lava-despues";
   const cruces = [10,15,20].map(u=>{let c=0;for(let i=1;i<pts.length;i++) if(pts[i-1].p<u&&pts[i].p>=u)c++;return c;});
   const mov2s = rec.mov2s===null?"n/a":`${rec.mov2s>=0?"+":""}${rec.mov2s}%`;
-  const cr = +(+cierreRealPct).toFixed(1);
+  const cd = rec.cierreDemo != null ? +(+rec.cierreDemo).toFixed(1) : null;
   const ptsRaw = pts.map(p=>`${p.t}:${p.p}`).join(",");
-  addLog(`[MIGREC] sym=${rec.symbol} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cr>=0?"+":""}${cr}% pts=${ptsRaw}`, "rec");
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)} pts=${ptsRaw}`, "rec");
+  labStats.migrecs++;
+}
+
+function liveRecFinish(mint, cierreRealPct) {
+  // LAB: el cierre del demo NO termina la grabación — solo apunta el cierre y
+  // programa la emisión cuando se cumpla LAB_EXTEND_MS desde la entrada.
+  if (!LIVE_RECORD) return;
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  if (rec.cierreDemo == null) rec.cierreDemo = cierreRealPct;
+  const restante = (rec.t0 + LAB_EXTEND_MS) - Date.now();
+  if (restante <= 0) { liveRecEmit(mint); return; }
+  if (!rec._emitTimer) rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
 }
 
 // Registra el PnL de una operación cerrada en el acumulador por hora.
@@ -1140,7 +1182,7 @@ function migUpdatePrice(mint, price, solAmount) {
   token.priceLow = Math.min(token.priceLow, price);
   token.tradeCount++; token.volumeUSD += solAmount*solPriceUSD;
   token.lastUpdate = Date.now();
-  liveRecSample(mint, price);
+  liveRecSample(mint, price, solAmount * solPriceUSD);
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
   broadcast({ event: "migTokenUpdate", data: token });
@@ -1826,7 +1868,7 @@ server.listen(PORT, async () => {
     console.log(`📝 SolScanBot MIGRACIÓN — MODO DEMO (NO toca wallet real) | SL ${((1-MIG_SL)*100).toFixed(0)}% · TP +${(MIG_TP*100-100).toFixed(0)}% · ${MIG_STRUCT_ON?`estructura(arma+${MIG_STRUCT_ARM_PCT},valle${MIG_STRUCT_RETROCESO})`:MIG_TREND_ON?`tendencia(arma+${MIG_TREND_ARM_PCT},valle${MIG_TREND_RETROCESO})`:"sin trailing"} · escalones ${MIG_ESCALONES_ON?MIG_ESCALONES.map(e=>`+${e[0]}→+${e[1]}`).join(" "):"off"} | vol ${MIG_VOL_FILTER_ON?`$${MIG_MIN_VOL_FAST}`:"OFF"} · qual_gate mov2s>+${MIG_QUAL_MOV2S_MIN}% | red ${MIG_DURATION_MS/60000}min | lote ${SOL_PER_TRADE_MIG} SOL`);
     addLog(`📝 MODO DEMO — ${MIG_STRUCT_ON?"estructura":MIG_TREND_ON?"tendencia":"sin trailing"}+escalones, SL -${((1-MIG_SL)*100).toFixed(0)}%, TP +${(MIG_TP*100-100).toFixed(0)}%${MIG_VOL_FILTER_ON?"":" · ⚠️ VOLUMEN OFF"}. NO toca wallet real. AGRESIVA.`, "accept");
   } else {
-    console.log(`🚀 SolScanBot MIGRACIÓN v7.0-estrategia | REGLA 30s ${MIG_R30_ON ? "ON (vende si <"+MIG_R30_THRESHOLD+"% a "+MIG_LAUNCH_CHECK_MS/1000+"s)" : "off"} | HORARIO ${MIG_TIME_FILTER_ON ? "ON (evita madrugada 1-8:30 + 20h ES)" : "off"} | banda $30-40K ${MIG_EXCLUDE_BAND_ON ? "excluida" : "off"} | TP +${(MIG_TP-1)*100}% SL -${(1-MIG_SL)*100}% | freno ${RISK.maxDailyLossSol}/día + ventana ${RISK.maxWindowLossSol}/${RISK.windowHours}h`);
+    console.log(`🚀 SolScanBot v8.0-LAB24H | MODO LABORATORIO: sin filtros (banda/horario/30s OFF) | MC min $2.5K | qual_gate 0.5% (casi todo entra) | grabación EXTENDIDA 10min con mint+holders | demo=real sync | Helius: edad+txs+holders`);
   }
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
