@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = true;
+const DEMO_ONLY = false;
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -1175,7 +1175,19 @@ function migUpdatePrice(mint, price, solAmount) {
   const entry = state.migWatching.get(mint);
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
   const token = state.migMonitored.get(mint);
-  if (!token) return;
+  if (!token) {
+    // LAB FIX: el cierre del demo llama a migCleanup (borra el token del monitoreo),
+    // pero la grabación extendida debe seguir hasta los 10 min. El guard mantiene la
+    // suscripción; aquí dejamos pasar los precios SOLO hacia la grabación.
+    const rec = state.liveRecordings.get(mint);
+    if (rec && !rec.finished && price > 0) {
+      // validación básica sin token de referencia: descartar ticks absurdos (>100x o <1/100 de la entrada)
+      if (price < rec.entryPrice * 100 && price > rec.entryPrice / 100) {
+        liveRecSample(mint, price, solAmount * solPriceUSD);
+      }
+    }
+    return;
+  }
   if (!isPriceValid(price, token.price, token.lastUpdate)) return;
   token.price = price; token.mc = price*1_000_000_000;
   token.priceHigh = Math.max(token.priceHigh, price);
