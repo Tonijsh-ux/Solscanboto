@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = false;
+const DEMO_ONLY = true;
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
