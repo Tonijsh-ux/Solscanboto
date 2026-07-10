@@ -75,7 +75,10 @@ const MIG_R30_THRESHOLD = 0;
 // (cierre medio -48% sobre 10 ops de 8-9 jul). Fail-open: si Helius no ha
 // respondido aún, se entra igualmente para no depender de su disponibilidad.
 const MIG_MIN_HOLDERS = 20;
-const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct }
+const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
+// [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
+// Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
+const creatorHist = new Map();       // wallet → { tokens, malas }
 
 // ── [v10] FRENO DE RÉGIMEN (validado walk-forward 11 días: recupera 0.5-1.3 SOL
 // en noches hostiles; 18/20 configs top de train también mejoran en test) ──
@@ -430,6 +433,7 @@ function saveState() {
       realTrades: state.realTrades,
       movements: state.movements,
       stats: state.stats,
+      creatorHist: [...creatorHist.entries()],
       riskState: {
         dayKey: riskState.dayKey,
         dailyPnlSol: riskState.dailyPnlSol,
@@ -449,6 +453,7 @@ function loadState() {
     if (saved.realTrades) state.realTrades = saved.realTrades;
     if (saved.movements) state.movements = saved.movements;
     if (saved.stats) state.stats = { ...state.stats, ...saved.stats };
+    if (saved.creatorHist) for (const [k, v] of saved.creatorHist) creatorHist.set(k, v);
     if (saved.riskState) {
       riskState.dayKey = saved.riskState.dayKey ?? null;
       riskState.dailyPnlSol = saved.riskState.dailyPnlSol ?? 0;
@@ -785,6 +790,15 @@ async function registrarCalidadPremig(mint, symbol) {
       return;
     }
     const ageMin = Math.round((Date.now() / 1000 - oldest.blockTime) / 60);
+    // [v10.1] la MARCA de acuñación: fee payer de la transacción más antigua = creador
+    let creator = null;
+    try {
+      const tx0 = await connection.getParsedTransaction(oldest.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+      const k0 = tx0?.transaction?.message?.accountKeys?.[0];
+      creator = k0?.pubkey ? k0.pubkey.toString() : (k0?.toString?.() || null);
+    } catch {}
+    const hCre = creator ? creatorHist.get(creator) : null;
+    const creStr = creator ? ` creator=${creator}${hCre ? ` creadorTokens=${hCre.tokens} creadorMalas=${hCre.malas}` : ""}` : "";
     let holdersStr = "";
     let holdersNum = null, topPctNum = null, top5Num = null, top10Num = null;
     try {
@@ -803,8 +817,8 @@ async function registrarCalidadPremig(mint, symbol) {
         holdersStr = ` holders=${holdersNum} topPct=${topPctNum.toFixed(0)} top5Pct=${top5Num.toFixed(0)} top10Pct=${top10Num.toFixed(0)}`;
       }
     } catch (e) { holdersStr = " holders=err"; }
-    premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num });
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}`, "info");
+    premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator });
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}`, "info");
     labStats.premigOk++;
   } catch (e) {
     addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,50)}`, "info");
@@ -1072,11 +1086,12 @@ function liveRecStart(entry, entryPrice) {
   const rec = { mint: entry.mint, symbol: entry.symbol, vel: +(velMs/1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice*1_000_000_000), vol: Math.round(entry.volumeUSD||0),
     t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, finished: false,
-    volSeg: [], lastVolSec: -1, minP: 0, reentered: false };  // [v10] vol60 + re-entrada
+    volSeg: [], lastVolSec: -1, minP: 0, reentered: false,
+    wallets: new Map() };  // [v10.1] wallet → {buyUsd, sellUsd, buys, sells} en 0-60s
   state.liveRecordings.set(entry.mint, rec);
 }
 
-function liveRecSample(mint, price, volUSD = 0) {
+function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
@@ -1086,6 +1101,12 @@ function liveRecSample(mint, price, volUSD = 0) {
   if (segNow >= 0 && segNow <= 60 && segNow > rec.lastVolSec) {
     for (let s = rec.lastVolSec + 1; s <= segNow; s++) rec.volSeg[s] = Math.round(rec.volPost);
     rec.lastVolSec = segNow;
+  }
+  // [v10.1] actores del primer minuto: quién compra y quién vende (cada tick)
+  if (trader && segNow <= 60 && rec.wallets) {
+    let w = rec.wallets.get(trader);
+    if (!w) { w = { buyUsd: 0, sellUsd: 0, buys: 0, sells: 0 }; rec.wallets.set(trader, w); }
+    if (isBuy) { w.buyUsd += volUSD; w.buys++; } else { w.sellUsd += volUSD; w.sells++; }
   }
   const dt = Date.now() - rec.t0;
   const interval = dt <= LIVE_REC_DENSE_MS ? LIVE_REC_DENSE_INTERVAL : LIVE_REC_NORMAL_INTERVAL;
@@ -1140,9 +1161,17 @@ function updateReentryTrades(mint, price) {
       if (cand > trade.sl) trade.sl = +cand.toFixed(12);
     }
     if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
-    else if (price <= trade.sl) { closeDemoTrade(trade, price, "SL", 21); }
-    else if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
-    else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    else if (price <= trade.sl) {
+      // [v10.1] confirmación de 2 ticks: el backtest se validó con muestras de 2-5s,
+      // así que las mechas de un solo tick no deben ejecutar (igual que el SL de migración)
+      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", 21); }
+    }
+    else {
+      trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
+      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
   }
 }
 
@@ -1171,7 +1200,17 @@ function liveRecEmit(mint) {
   const cd = rec.cierreDemo != null ? +(+rec.cierreDemo).toFixed(1) : null;
   const ptsRaw = pts.map(p=>`${p.t}:${p.p}`).join(",");
   const vol60 = (rec.volSeg && rec.volSeg.length) ? rec.volSeg.map((v,s)=>v!=null?`${s}:${v}`:null).filter(Boolean).join(",") : "";
-  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
+  // [v10.1] firma de actores del primer minuto
+  let wStr = "";
+  if (rec.wallets && rec.wallets.size) {
+    const ws = [...rec.wallets.values()];
+    const buyers = ws.filter(w => w.buys > 0);
+    const totalBuy = buyers.reduce((s, w) => s + w.buyUsd, 0);
+    const topBuy = buyers.length ? Math.max(...buyers.map(w => w.buyUsd)) : 0;
+    const wash = ws.filter(w => w.buys > 0 && w.sells > 0).length;
+    wStr = ` buyers60=${buyers.length} topBuyer=${totalBuy > 0 ? (100*topBuy/totalBuy).toFixed(0) : 0}% wash60=${wash}`;
+  }
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
   labStats.migrecs++;
 }
 
@@ -1256,7 +1295,7 @@ function migCleanup(mint, symbol) {
   addLog(`🗑️ ${symbol} eliminado`, "info");
 }
 
-function migUpdatePrice(mint, price, solAmount) {
+function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
   const entry = state.migWatching.get(mint);
   if (entry) { migUpdateWatching(mint, price, solAmount, entry); return; }
   const token = state.migMonitored.get(mint);
@@ -1264,7 +1303,7 @@ function migUpdatePrice(mint, price, solAmount) {
     const rec = state.liveRecordings.get(mint);
     if (rec && !rec.finished && price > 0) {
       if (price < rec.entryPrice * 100 && price > rec.entryPrice / 100) {
-        liveRecSample(mint, price, solAmount * solPriceUSD);
+        liveRecSample(mint, price, solAmount * solPriceUSD, trader, isBuy);
         // [v10] FIX ZOMBIE: si queda un demo OPEN de este mint (p.ej. el real cerró
         // antes y migCleanup borró el token del monitoreo), seguir gestionándolo.
         updateDemoTrades(mint, price, "migration");
@@ -1279,7 +1318,7 @@ function migUpdatePrice(mint, price, solAmount) {
   token.priceLow = Math.min(token.priceLow, price);
   token.tradeCount++; token.volumeUSD += solAmount*solPriceUSD;
   token.lastUpdate = Date.now();
-  liveRecSample(mint, price, solAmount * solPriceUSD);
+  liveRecSample(mint, price, solAmount * solPriceUSD, trader, isBuy);
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
   updateReentryTrades(mint, price);  // [v10]
@@ -1728,7 +1767,19 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   const loteOp = trade.sizeSol || SOL_PER_TRADE_MIG;
   const pnlSolOp = loteOp * trade.pnlPct / 100;
   registrarPnlHorario(pnlSolOp, trade.result === "WIN");
-  if (trade.strategy === "migration") brakeRecordClose(trade.pnlPct);  // [v10] alimenta el freno
+  if (trade.strategy === "migration") {
+    brakeRecordClose(trade.pnlPct);  // [v10] alimenta el freno
+    // [v10.1] memoria del creador: ¿este acuñador nos ha hecho daño antes?
+    const preC = premigData.get(trade.mint);
+    if (preC && preC.creator) {
+      let h = creatorHist.get(preC.creator);
+      if (!h) { h = { tokens: 0, malas: 0 }; creatorHist.set(preC.creator, h); }
+      h.tokens++;
+      const esMala = trade.pnlPct <= -30 || (trade.maxLossPct || 0) <= -60;
+      if (esMala) h.malas++;
+      addLog(`[CREATOR] wallet=${preC.creator} mint=${trade.mint} res=${esMala ? "MALA" : "ok"} pnl=${trade.pnlPct}% hist=${h.tokens}t/${h.malas}m${h.malas >= 2 ? " ⚠️ REINCIDENTE" : ""}`, "rec");
+    }
+  }
   state.stats.mig_maxGainSum += trade.maxGainPct || 0;
   state.stats.mig_maxLossSum += Math.abs(trade.maxLossPct || 0);
   state.stats.mig_closedCount++;
@@ -1790,7 +1841,7 @@ function connectPumpPortal() {
         const price = calcPrice(data);
         if (price <= 0) return;
         const sol = data.solAmount || 0;
-        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint) || state.liveRecordings.has(data.mint)) migUpdatePrice(data.mint, price, sol);
+        if (state.migWatching.has(data.mint) || state.migMonitored.has(data.mint) || state.liveRecordings.has(data.mint)) migUpdatePrice(data.mint, price, sol, data.traderPublicKey || null, data.txType === "buy");
         if (OBSERVER_MODE && state.obsRecordings.has(data.mint)) obsSample(data.mint, price);
         if (MC_OBSERVER && state.mcoRecordings.has(data.mint)) mcoSample(data.mint, price, sol * solPriceUSD);
       }
@@ -1872,8 +1923,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v10 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry demo + vol60 | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v10 DEMO — v9 + freno de régimen + tamaño por calor (0.3/0.5/0.7) + estrategia reentry en paralelo + vol60 + fix zombie. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v10.1 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    addLog(`📝 v10.1 DEMO — v10 + confirmación 2 ticks en reentry + wallets del primer minuto (buyers60/topBuyer/wash60) + memoria de creadores. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
