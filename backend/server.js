@@ -64,7 +64,7 @@ const MIG_EXCLUDE_BAND_HI = 40_000;
 // si el MÁXIMO alcanzado no ha tocado +10%, salir. Fue la palanca con mayor efecto
 // marginal de toda la rejilla (+6.3 mSOL/op). La variante por máximo a 30s ganó
 // tanto a la de 15s como a la R30 de "precio actual en rojo".
-const MIG_LAUNCH_CHECK = true;
+const MIG_LAUNCH_CHECK = false;  // [v11] OFF — validado: los 'cuchillazo y vuelo' se quedan dentro y el trailing ancho los cabalga (test +4.48 vs +0.21 con corte suave)
 const MIG_LAUNCH_CHECK_MS = 30_000;  // a los 30 segundos de abrir
 const MIG_LAUNCH_MIN_PCT = 10;       // exige que el MÁXIMO haya tocado +10%
 const MIG_R30_ON = false;            // legacy, sustituida por el chequeo de máximo
@@ -82,7 +82,7 @@ const creatorHist = new Map();       // wallet → { tokens, malas }
 
 // ── [v10] FRENO DE RÉGIMEN (validado walk-forward 11 días: recupera 0.5-1.3 SOL
 // en noches hostiles; 18/20 configs top de train también mejoran en test) ──
-const MIG_BRAKE_ON = true;
+const MIG_BRAKE_ON = false; // [v11] OFF — calibrado para la distribución de cierres de la v9, a la v11 le cuesta -10 SOL (bloquea los cuchillazos-que-vuelan y mata las reentries); recalibraciones = agujas no fiables. El kill-switch real (riskState) sigue activo.
 const MIG_BRAKE_N = 20;              // últimos 20 cierres demo de migración
 const MIG_BRAKE_SUM = -150;          // si suman menos de -150% en total...
 const MIG_BRAKE_PAUSE_MS = 30 * 60_000; // ...pausa de entradas 30 min (el LAB sigue grabando)
@@ -96,13 +96,13 @@ function brakeRecordClose(pnlPct) {
   const suma = brakeCloses.reduce((a, b) => a + b, 0);
   if (brakeCloses.length === MIG_BRAKE_N && suma < MIG_BRAKE_SUM && Date.now() >= brakePausedUntil) {
     brakePausedUntil = Date.now() + MIG_BRAKE_PAUSE_MS;
-    addLog(`🧊 FRENO DE RÉGIMEN: últimos ${MIG_BRAKE_N} cierres suman ${suma.toFixed(0)}% — pausa de entradas ${MIG_BRAKE_PAUSE_MS/60000}min (mercado en modo rug; la grabación sigue)`, "warn");
+    addLog(`🧊 MIG FRENO DE RÉGIMEN: últimos ${MIG_BRAKE_N} cierres suman ${suma.toFixed(0)}% — pausa de entradas ${MIG_BRAKE_PAUSE_MS/60000}min (mercado en modo rug; la grabación sigue)`, "warn");
   }
 }
 
 // ── [v10] TAMAÑO POR CALOR DEL MERCADO (validado: +2.5 SOL en 11 días a igual
 // capital medio; señal monótona consistente train/test) ──
-const MIG_HEAT_ON = true;
+const MIG_HEAT_ON = false;  // [v11] OFF — 3/3 días invertido en la era v10.1 (lote 0.7 → media -3.3%); vuelve el lote fijo 0.5
 const migFlowTimes = [];             // timestamps de migraciones detectadas
 function calorMercado() {            // migraciones en los últimos 15 min
   const cutoff = Date.now() - 15 * 60_000;
@@ -120,12 +120,12 @@ function factorCalor() {
 // pagan los billetes; fricción real ~4.5% ya considerada en la validación) ──
 const REENTRY_ON = true;
 const REENTRY_MIN_T = 45;            // no antes del segundo 45 de la grabación
-const REENTRY_DIP = -20;             // el token tuvo que tocar <= -20%
-const REENTRY_JUMP = 40;             // y recuperar 40 puntos desde el mínimo
+const REENTRY_DIP = -45;             // [v11] era -20 — solo resucitados de desplome profundo
+const REENTRY_JUMP = 60;             // [v11] era 40 — recuperación violenta exigida
 const REENTRY_ZONE = -5;             // hasta al menos la zona de entrada (>= -5%)
 const REENTRY_SL = -30;              // SL relativo a la re-entrada
 const REENTRY_ARM = 40;              // trailing ancho se arma a +40 relativo
-const REENTRY_TRAIL = 0.25;          // 25% multiplicativo desde el pico relativo
+const REENTRY_TRAIL = 0.30;          // [v11] era 0.25
 const REENTRY_MAX_OPEN = 10;
 const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
 
@@ -169,7 +169,7 @@ const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -
 const MIG_BREAKEVEN_AT = 0.20;        // breakeven al +20%: protege el suelo antes
 const MIG_BREAKEVEN_MARGIN = 0.03;
 const MIG_LOCK_AT = 0.25;             // trailing FOLLOWING se arma en +25%
-const MIG_FOLLOW_PCT = 0.20;
+const MIG_FOLLOW_PCT = 0.50;  // [v11] x2.5 — config del usuario validada (train +36 / test +4.5, 11/13 días)
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
@@ -185,7 +185,7 @@ const MIG_STEP_TRIGGER = 0.25;        // escalón (suelo +13%) se arma en +25%
 const MIG_STEP_FLOOR = 0.13;
 // [CAMBIO 9-jul] TIERS ANCHOS validados en backtest (192 configs, train/test):
 // el trailing fino devolvía las corredoras (Excel: topes reales +682% cerrados a +10).
-const MIG_FOLLOW_PCT_STEP = 0.20;     // era 0.15
+const MIG_FOLLOW_PCT_STEP = 0.50;     // [v11] era 0.20 — tiers anchos x2.5
 const MIG_HARD_CAP_LOSS = -20;
 const MIG_CAP_LOSS_ON = false;
 // ── TRAILING POR ESTRUCTURA ──
@@ -210,9 +210,9 @@ const MIG_VELO_DROP = 0.10;
 const MIG_VELO_ON = false;
 const MIG_VELO_MS = 2_000;
 const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;
-const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.15;   // [CAMBIO 9-jul] era 0.12
-const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.12;   // [CAMBIO 9-jul] era 0.08
-const MIG_TRAIL_P4 = 0.08;                             // [CAMBIO 9-jul] era 0.05
+const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.375;  // [v11] era 0.15
+const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.30;   // [v11] era 0.12
+const MIG_TRAIL_P4 = 0.20;                             // [v11] era 0.08
 const MIG_TOP_FLOOR_TRIGGER = 100;
 const MIG_TOP_FLOOR = 0.65;
 
@@ -1923,8 +1923,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v10.1 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v10.1 DEMO — v10 + confirmación 2 ticks en reentry + wallets del primer minuto (buyers60/topBuyer/wash60) + memoria de creadores. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v11 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    addLog(`📝 v11 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 (50/37.5/30/20) · reentry estricta (-45/+60, trail 30%) · calor OFF · freno OFF (dañino con esta config). Resto igual que v10.1. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
