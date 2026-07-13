@@ -79,6 +79,27 @@ const premigData = new Map();        // mint → { ageMin, total, holders, topPc
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
 const creatorHist = new Map();       // wallet → { tokens, malas }
+// [v11.1] VETO DE FÁBRICA: no entrar en tokens de creadores con 2+ malas con nosotros.
+// Quirúrgico: solo actúa sobre wallets que ya nos quemaron; un lanzador prolífico
+// benigno (p.ej. 7 tokens / 0 malas) jamás se veta.
+const MIG_CREATOR_VETO = true;
+const MIG_CREATOR_VETO_MALAS = 2;
+// [v11.1] SEMILLA a prueba de deploys: fábricas confirmadas por el censo de logs
+// (30-jun → 13-jul). El bot añade nuevas solo; actualizar esta lista con cada versión.
+const CREATOR_SEED = [
+  ["8gM4gnxdLdkvifM9TCwkGAxrnNw4NiSiHbAdE1RqY96e", { tokens: 3, malas: 3 }],  // 3 rugs: -96/-99/-70 (noche 10-11 jul)
+  ["niggerd597QYedtvjQDVHZTCCGyJrwHNm2i49dkm5zS",  { tokens: 5, malas: 3 }],  // fábrica activa (12-13 jul)
+  ["GXRNpTLczwZZpAocDXRyKgLTrvxWG8fs1diKSQ99FWMy", { tokens: 2, malas: 2 }],
+];
+function seedCreators() {
+  for (const [w, s] of CREATOR_SEED) {
+    const h = creatorHist.get(w) || { tokens: 0, malas: 0 };
+    h.tokens = Math.max(h.tokens, s.tokens);
+    h.malas  = Math.max(h.malas,  s.malas);
+    creatorHist.set(w, h);
+  }
+  addLog(`🏭 Semilla de creadores cargada: ${CREATOR_SEED.length} fábricas fichadas (veto a ${MIG_CREATOR_VETO_MALAS}+ malas: ${MIG_CREATOR_VETO ? "ON" : "off"})`, "info");
+}
 
 // ── [v10] FRENO DE RÉGIMEN (validado walk-forward 11 días: recupera 0.5-1.3 SOL
 // en noches hostiles; 18/20 configs top de train también mejoran en test) ──
@@ -978,6 +999,16 @@ function migQualTick(entry, price) {
         addLog(`🧊 MIG FRENO: ${entry.symbol} descartada | régimen hostil (pausa ${Math.ceil((brakePausedUntil-Date.now())/60000)}min restantes)`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
+      }
+      // [v11.1] VETO DE FÁBRICA: creador con 2+ malas con nosotros → ni tocarlo
+      if (MIG_CREATOR_VETO) {
+        const preV = premigData.get(entry.mint);
+        const hC = preV && preV.creator ? creatorHist.get(preV.creator) : null;
+        if (hC && hC.malas >= MIG_CREATOR_VETO_MALAS) {
+          addLog(`🏭 MIG VETO FÁBRICA: ${entry.symbol} descartada | creador ${preV.creator.slice(0,8)}… con ${hC.tokens} tokens / ${hC.malas} malas con nosotros`, "filter");
+          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          broadcast({ event: "stats", data: state.stats }); return;
+        }
       }
       // [CAMBIO 9-jul] FILTRO HOLDERS (validado train +35.5 / test +20.3 mSOL/op).
       // Fail-open: si el PREMIG aún no respondió, se entra igualmente.
@@ -1923,13 +1954,14 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v11 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v11 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 (50/37.5/30/20) · reentry estricta (-45/+60, trail 30%) · calor OFF · freno OFF (dañino con esta config). Resto igual que v10.1. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v11.1 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    addLog(`📝 v11.1 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas (semilla + aprendizaje). Resto igual que v10.1. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
   if (!HELIUS_API_KEY && !process.env.SOLANA_RPC) addLog("⚠️ Sin HELIUS_API_KEY ni SOLANA_RPC — usando RPC público (lento, puede limitar)", "warn");
   loadState();
+  seedCreators();  // [v11.1] la semilla se fusiona DESPUÉS del estado (máximo de ambos)
   initWallet();
   connectPumpPortal();
   if (!MC_OBSERVER) await reconcileStateOnBoot();
