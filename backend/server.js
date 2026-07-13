@@ -74,6 +74,15 @@ const MIG_R30_THRESHOLD = 0;
 // Validado (train +35.5 / test +20.3 mSOL/op): holders<20 en el PREMIG = veneno
 // (cierre medio -48% sobre 10 ops de 8-9 jul). Fail-open: si Helius no ha
 // respondido aún, se entra igualmente para no depender de su disponibilidad.
+// [v11.2] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
+// cotizadas en USDC con el mint del QUOTE — el bot llegó a "operar" el propio USDC
+// (fantasmas de -78/-81% en un activo de $1). Estos mints jamás se tocan.
+const QUOTE_BLACKLIST = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  "So11111111111111111111111111111111111111112",  // wSOL
+]);
+const MIG_MAX_PREMIG_TXS = 2000;     // [v11.2] un pump real pre-migración mueve 200-800 txs; más = token maduro/quote
 const MIG_MIN_HOLDERS = 20;
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
@@ -850,6 +859,10 @@ async function registrarCalidadPremig(mint, symbol) {
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
   if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
+  if (QUOTE_BLACKLIST.has(coin.mint)) {
+    addLog(`⚠️ MIG IGNORADA: el evento trae un QUOTE (${coin.symbol || coin.mint.slice(0,8)}…) como mint — pool no-SOL, no es un token pump`, "warn");
+    return;
+  }
   seenMigMints.add(coin.mint);
   state.stats.mig_migrations++;
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
@@ -999,6 +1012,15 @@ function migQualTick(entry, price) {
         addLog(`🧊 MIG FRENO: ${entry.symbol} descartada | régimen hostil (pausa ${Math.ceil((brakePausedUntil-Date.now())/60000)}min restantes)`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
+      }
+      // [v11.2] CORDURA: token con miles de txs "recién nacido" = maduro/quote mal etiquetado
+      {
+        const preS = premigData.get(entry.mint);
+        if (preS && preS.total != null && preS.total >= MIG_MAX_PREMIG_TXS) {
+          addLog(`⚠️ MIG CORDURA: ${entry.symbol} descartada | ${preS.total} txs pre-migración (imposible en un pump real — token maduro o quote)`, "filter");
+          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          broadcast({ event: "stats", data: state.stats }); return;
+        }
       }
       // [v11.1] VETO DE FÁBRICA: creador con 2+ malas con nosotros → ni tocarlo
       if (MIG_CREATOR_VETO) {
@@ -1954,8 +1976,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v11.1 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v11.1 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas (semilla + aprendizaje). Resto igual que v10.1. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v11.2 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    addLog(`📝 v11.2 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas + 🚫 blacklist de quotes (fix USDC). Resto igual que v10.1. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
