@@ -74,7 +74,7 @@ const MIG_R30_THRESHOLD = 0;
 // Validado (train +35.5 / test +20.3 mSOL/op): holders<20 en el PREMIG = veneno
 // (cierre medio -48% sobre 10 ops de 8-9 jul). Fail-open: si Helius no ha
 // respondido aún, se entra igualmente para no depender de su disponibilidad.
-// [v11.2] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
+// [v11.2b] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
 // cotizadas en USDC con el mint del QUOTE — el bot llegó a "operar" el propio USDC
 // (fantasmas de -78/-81% en un activo de $1). Estos mints jamás se tocan.
 const QUOTE_BLACKLIST = new Set([
@@ -82,12 +82,16 @@ const QUOTE_BLACKLIST = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
   "So11111111111111111111111111111111111111112",  // wSOL
 ]);
-const MIG_MAX_PREMIG_TXS = 2000;     // [v11.2] un pump real pre-migración mueve 200-800 txs; más = token maduro/quote
+// [v11.2b] CORDURA txs RETIRADA: el retro demostró que vetaba ~110 tokens/día legítimos
+// (57% ganadores, incluido el +1274 del 13-jul con 2107 txs). Queda solo la lista negra de quotes.
+const MIG_ABYSS_VETO = true;         // [v11.2b] ☠️ lista negra DE POR VIDA para creadores de pulls
+const MIG_ABYSS_PNL  = -80;          // cierre demo <= -80% = retirada de liquidez -> su creador, vetado para siempre
 const MIG_MIN_HOLDERS = 20;
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
 const creatorHist = new Map();       // wallet → { tokens, malas }
+const abyssCreators = new Set();     // [v11.2b] ☠️ creadores vetados de por vida (nos hicieron un ≤-80%)
 // [v11.1] VETO DE FÁBRICA: no entrar en tokens de creadores con 2+ malas con nosotros.
 // Quirúrgico: solo actúa sobre wallets que ya nos quemaron; un lanzador prolífico
 // benigno (p.ej. 7 tokens / 0 malas) jamás se veta.
@@ -464,6 +468,7 @@ function saveState() {
       movements: state.movements,
       stats: state.stats,
       creatorHist: [...creatorHist.entries()],
+      abyssCreators: [...abyssCreators],
       riskState: {
         dayKey: riskState.dayKey,
         dailyPnlSol: riskState.dailyPnlSol,
@@ -484,6 +489,8 @@ function loadState() {
     if (saved.movements) state.movements = saved.movements;
     if (saved.stats) state.stats = { ...state.stats, ...saved.stats };
     if (saved.creatorHist) for (const [k, v] of saved.creatorHist) creatorHist.set(k, v);
+    if (saved.abyssCreators) { for (const w of saved.abyssCreators) abyssCreators.add(w);
+      if (abyssCreators.size) addLog(`☠️ Lista negra de por vida cargada: ${abyssCreators.size} creador(es)`, "info"); }
     if (saved.riskState) {
       riskState.dayKey = saved.riskState.dayKey ?? null;
       riskState.dailyPnlSol = saved.riskState.dailyPnlSol ?? 0;
@@ -1013,21 +1020,21 @@ function migQualTick(entry, price) {
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
-      // [v11.2] CORDURA: token con miles de txs "recién nacido" = maduro/quote mal etiquetado
-      {
-        const preS = premigData.get(entry.mint);
-        if (preS && preS.total != null && preS.total >= MIG_MAX_PREMIG_TXS) {
-          addLog(`⚠️ MIG CORDURA: ${entry.symbol} descartada | ${preS.total} txs pre-migración (imposible en un pump real — token maduro o quote)`, "filter");
-          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-          broadcast({ event: "stats", data: state.stats }); return;
-        }
-      }
       // [v11.1] VETO DE FÁBRICA: creador con 2+ malas con nosotros → ni tocarlo
       if (MIG_CREATOR_VETO) {
         const preV = premigData.get(entry.mint);
         const hC = preV && preV.creator ? creatorHist.get(preV.creator) : null;
         if (hC && hC.malas >= MIG_CREATOR_VETO_MALAS) {
           addLog(`🏭 MIG VETO FÁBRICA: ${entry.symbol} descartada | creador ${preV.creator.slice(0,8)}… con ${hC.tokens} tokens / ${hC.malas} malas con nosotros`, "filter");
+          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          broadcast({ event: "stats", data: state.stats }); return;
+        }
+      }
+      // [v11.2b] ☠️ VETO ABISMO: si el creador está en la lista negra de por vida, ni tocarlo
+      if (MIG_ABYSS_VETO) {
+        const preA = premigData.get(entry.mint);
+        if (preA && preA.creator && abyssCreators.has(preA.creator)) {
+          addLog(`☠️ MIG VETO ABISMO: ${entry.symbol} descartada | creador ${preA.creator.slice(0,8)}… en lista negra de por vida (pull previo ≤${MIG_ABYSS_PNL}%)`, "filter");
           state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
           broadcast({ event: "stats", data: state.stats }); return;
         }
@@ -1831,6 +1838,12 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
       const esMala = trade.pnlPct <= -30 || (trade.maxLossPct || 0) <= -60;
       if (esMala) h.malas++;
       addLog(`[CREATOR] wallet=${preC.creator} mint=${trade.mint} res=${esMala ? "MALA" : "ok"} pnl=${trade.pnlPct}% hist=${h.tokens}t/${h.malas}m${h.malas >= 2 ? " ⚠️ REINCIDENTE" : ""}`, "rec");
+      // [v11.2b] ☠️ un cierre <= -80% = pull -> su creador entra en la lista negra DE POR VIDA
+      if (MIG_ABYSS_VETO && trade.pnlPct <= MIG_ABYSS_PNL && !abyssCreators.has(preC.creator)) {
+        abyssCreators.add(preC.creator);
+        addLog(`☠️ LISTA NEGRA DE POR VIDA: creador ${preC.creator.slice(0,8)}… vetado | su ${trade.symbol} cerró ${trade.pnlPct}% (retirada de liquidez)`, "filter");
+        saveState();
+      }
     }
   }
   state.stats.mig_maxGainSum += trade.maxGainPct || 0;
@@ -1976,8 +1989,8 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v11.2 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v11.2 DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas + 🚫 blacklist de quotes (fix USDC). Resto igual que v10.1. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v11.2b — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    addLog(`📝 v11.2b DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas + 🚫 blacklist de quotes (fix USDC). Resto igual que v10.1. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
