@@ -29,9 +29,49 @@ const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = 10;
 const MAX_MIG_REAL = 10;
 const REAL_STRATEGIES = ["migration"];
-// MISMO STATE_FILE que el server combinado: NO se pierde historial ni kill-switch.
-const STATE_FILE = process.env.STATE_FILE
-  || (fs.existsSync("/var/data") ? "/var/data/solscanbot_state.json" : "./solscanbot_state.json");
+
+// ── [v11.3] EJECUCIÓN REAL — obra de fricción ──────────────────────────────
+// EXEC_MODE: "pp" = PumpPortal trade-local (actual, 0.5%/lado)
+//            "hybrid" = compra por PP (velocidad en el seg 3) + VENTAS por Jupiter (0% router)
+//            "jup" = todo por Jupiter (requiere que indexe el pool; puede fallar en entradas tempranas)
+// Las ventas por Jupiter llevan fallback automático a PP si no hay ruta.
+const EXEC_MODE = (process.env.EXEC_MODE || "pp").toLowerCase();
+const JUP_BASE  = process.env.JUP_BASE || "https://quote-api.jup.ag/v6";
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+// Slippage por URGENCIA (%): la salida tranquila no debe pagar el peaje de la salida de pánico
+const SLIP_ENTRY = +(process.env.SLIP_ENTRY || 15);   // entrada sniper: ancho, hay que entrar
+const SLIP_PANIC = +(process.env.SLIP_PANIC || 30);   // SL / NO_LAUNCH / DEAD_FEED: salir como sea
+const SLIP_CALM  = +(process.env.SLIP_CALM  || 6);    // STEP / RUNNER_END / TP / EXPIRED: sin prisa
+// Priority fee por URGENCIA (SOL). El 0.0005 plano era barato para sniping: cada slot tarde ≈ 0.5-1% de precio
+const PRIO_ENTRY = +(process.env.PRIO_ENTRY || 0.003);
+const PRIO_PANIC = +(process.env.PRIO_PANIC || 0.004);
+const PRIO_CALM  = +(process.env.PRIO_CALM  || 0.0005);
+const execParams = (u) => u === "entry" ? { slip: SLIP_ENTRY, prio: PRIO_ENTRY }
+                   : u === "panic" ? { slip: SLIP_PANIC, prio: PRIO_PANIC }
+                   : { slip: SLIP_CALM, prio: PRIO_CALM };
+const urgencyByReason = (r) => (r === "SL" || r === "NO_LAUNCH" || r === "DEAD_FEED") ? "panic" : "calm";
+
+// [v11.3] STATE_FILE robusto: sonda de escritura al arrancar + fallback anunciado.
+// Si el Volume de Railway no está montado/escribible, se ve EN EL LOG DEL BOT (antes moría en silencio).
+const _stateCandidates = [
+  process.env.STATE_FILE,
+  "/data/solscanbot_state.json",
+  "/var/data/solscanbot_state.json",
+  "./solscanbot_state.json",
+].filter(Boolean);
+function _resolveStateFile() {
+  for (const cand of _stateCandidates) {
+    try {
+      const dir = cand.includes("/") ? cand.slice(0, cand.lastIndexOf("/")) || "/" : ".";
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(cand + ".probe", "ok"); fs.unlinkSync(cand + ".probe");
+      return { path: cand, persistent: cand.startsWith("/data") || !!process.env.STATE_FILE };
+    } catch (e) { console.log(`💾 Ruta de estado NO escribible: ${cand} (${e.message})`); }
+  }
+  return { path: "./solscanbot_state.json", persistent: false };
+}
+const _stateInfo = _resolveStateFile();
+const STATE_FILE = _stateInfo.path;
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 21.00;                  // [CAMBIO 9-jul] TP simbólico +2000%: el trailing+runner son el techo natural; el TP solo queda como seguridad técnica
@@ -74,7 +114,7 @@ const MIG_R30_THRESHOLD = 0;
 // Validado (train +35.5 / test +20.3 mSOL/op): holders<20 en el PREMIG = veneno
 // (cierre medio -48% sobre 10 ops de 8-9 jul). Fail-open: si Helius no ha
 // respondido aún, se entra igualmente para no depender de su disponibilidad.
-// [v11.2b] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
+// [v11.3] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
 // cotizadas en USDC con el mint del QUOTE — el bot llegó a "operar" el propio USDC
 // (fantasmas de -78/-81% en un activo de $1). Estos mints jamás se tocan.
 const QUOTE_BLACKLIST = new Set([
@@ -82,16 +122,16 @@ const QUOTE_BLACKLIST = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
   "So11111111111111111111111111111111111111112",  // wSOL
 ]);
-// [v11.2b] CORDURA txs RETIRADA: el retro demostró que vetaba ~110 tokens/día legítimos
+// [v11.3] CORDURA txs RETIRADA: el retro demostró que vetaba ~110 tokens/día legítimos
 // (57% ganadores, incluido el +1274 del 13-jul con 2107 txs). Queda solo la lista negra de quotes.
-const MIG_ABYSS_VETO = true;         // [v11.2b] ☠️ lista negra DE POR VIDA para creadores de pulls
+const MIG_ABYSS_VETO = true;         // [v11.3] ☠️ lista negra DE POR VIDA para creadores de pulls
 const MIG_ABYSS_PNL  = -80;          // cierre demo <= -80% = retirada de liquidez -> su creador, vetado para siempre
 const MIG_MIN_HOLDERS = 20;
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
 const creatorHist = new Map();       // wallet → { tokens, malas }
-const abyssCreators = new Set();     // [v11.2b] ☠️ creadores vetados de por vida (nos hicieron un ≤-80%)
+const abyssCreators = new Set();     // [v11.3] ☠️ creadores vetados de por vida (nos hicieron un ≤-80%)
 // [v11.1] VETO DE FÁBRICA: no entrar en tokens de creadores con 2+ malas con nosotros.
 // Quirúrgico: solo actúa sobre wallets que ya nos quemaron; un lanzador prolífico
 // benigno (p.ej. 7 tokens / 0 malas) jamás se veta.
@@ -477,7 +517,13 @@ function saveState() {
       },
     }));
     fs.renameSync(tmp, STATE_FILE);
-  } catch (e) { console.log("Error guardando estado:", e.message); }
+  } catch (e) {
+    console.log("Error guardando estado:", e.message);
+    if (!global._lastSaveErr || Date.now() - global._lastSaveErr > 600000) {
+      global._lastSaveErr = Date.now();
+      addLog(`🚨 ERROR GUARDANDO ESTADO en ${STATE_FILE}: ${e.message} — historial/lista negra en riesgo`, "error");
+    }
+  }
 }
 
 function loadState() {
@@ -1030,7 +1076,7 @@ function migQualTick(entry, price) {
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
-      // [v11.2b] ☠️ VETO ABISMO: si el creador está en la lista negra de por vida, ni tocarlo
+      // [v11.3] ☠️ VETO ABISMO: si el creador está en la lista negra de por vida, ni tocarlo
       if (MIG_ABYSS_VETO) {
         const preA = premigData.get(entry.mint);
         if (preA && preA.creator && abyssCreators.has(preA.creator)) {
@@ -1413,12 +1459,45 @@ async function getSolDeltaFromTx(sig, retries = 6) {
   return null;
 }
 
-async function buyToken(mint, solAmount, slippage = 15) {
+// [v11.3] Swap vía Jupiter v6: quote → swap tx serializada → firmar y enviar con nuestro RPC.
+// Sin comisión de router. prioritizationFeeLamports va dentro de la propia tx.
+async function jupSwap(inputMint, outputMint, amountRaw, slipPct, prioSol) {
+  const q = await fetch(`${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${Math.round(slipPct*100)}&onlyDirectRoutes=false`, { signal: AbortSignal.timeout(8000) });
+  if (!q.ok) throw new Error(`quote ${q.status}`);
+  const quote = await q.json();
+  if (!quote || !quote.routePlan || !quote.routePlan.length) throw new Error("sin ruta");
+  const s = await fetch(`${JUP_BASE}/swap`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toString(),
+      wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: Math.round(prioSol * 1e9) }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!s.ok) throw new Error(`swap ${s.status}`);
+  const { swapTransaction } = await s.json();
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+  tx.sign([wallet]);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+
+async function buyToken(mint, solAmount, urgency = "entry") {
   if (!wallet || !connection) return null;
+  const P = execParams(urgency);
+  if (EXEC_MODE === "jup") {
+    try {
+      const sig = await jupSwap(WSOL_MINT, mint, Math.round(solAmount * LAMPORTS_PER_SOL), P.slip, P.prio);
+      const delta = await getSolDeltaFromTx(sig);
+      const costSol = delta != null ? +(-delta).toFixed(6) : solAmount;
+      addLog(`✅ COMPRA [jup]: ${shortAddr(mint)} | coste real ${costSol} SOL | ${sig}`, "real");
+      return { sig, costSol };
+    } catch (e) { addLog(`⚠️ Compra Jupiter falló (${e.message}) → PumpPortal`, "warn"); }
+  }
   try {
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "buy", mint, denominatedInSol: "true", amount: solAmount, slippage, priorityFee: 0.0005, pool: "auto" }),
+      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "buy", mint, denominatedInSol: "true", amount: solAmount, slippage: execParams(urgency).slip, priorityFee: execParams(urgency).prio, pool: "auto" }),
       signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) {
@@ -1440,16 +1519,26 @@ async function buyToken(mint, solAmount, slippage = 15) {
 
 // [CAMBIO 9-jul] sellToken acepta fracción (para el moon-bag en real, cuando se
 // active). fraction=1 = venta total (comportamiento idéntico al anterior).
-async function sellToken(mint, fraction = 1) {
+async function sellToken(mint, fraction = 1, urgency = "calm") {
   if (!wallet || !connection) return null;
   try {
     const bal = await getTokenBalance(mint);
     if (bal <= 0) { addLog(`⚠️ Sin tokens: ${shortAddr(mint)}`, "warn"); return null; }
     const amount = fraction >= 1 ? bal : Math.floor(bal * fraction);
     if (amount <= 0) { addLog(`⚠️ Fracción demasiado pequeña: ${shortAddr(mint)}`, "warn"); return null; }
+    const P = execParams(urgency);
+    if (EXEC_MODE === "hybrid" || EXEC_MODE === "jup") {
+      try {
+        const sig = await jupSwap(mint, WSOL_MINT, amount, P.slip, P.prio);
+        const delta = await getSolDeltaFromTx(sig);
+        const proceedsSol = delta != null ? +delta.toFixed(6) : 0;
+        addLog(`✅ VENTA [jup]${fraction < 1 ? ` (${Math.round(fraction*100)}%)` : ""} [${urgency}]: ${shortAddr(mint)} | recibido ${proceedsSol} SOL | ${sig}`, "real");
+        return { sig, proceedsSol };
+      } catch (e) { addLog(`⚠️ Venta Jupiter falló (${e.message}) → fallback PumpPortal`, "warn"); }
+    }
     const response = await fetch("https://pumpportal.fun/api/trade-local", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount, slippage: 15, priorityFee: 0.0005, pool: "auto" }),
+      body: JSON.stringify({ publicKey: wallet.publicKey.toString(), action: "sell", mint, denominatedInSol: "false", amount, slippage: execParams(urgency).slip, priorityFee: execParams(urgency).prio, pool: "auto" }),
       signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) { addLog(`❌ Venta error: ${response.status}`, "error"); return null; }
@@ -1486,7 +1575,7 @@ async function openRealTrade(signal) {
   const solAmount = +(SOL_PER_TRADE_REAL * factorCalor()).toFixed(3);
   const balance = await getWalletBalance();
   if (balance < solAmount + 0.01) { addLog(`⚠️ Balance insuficiente: ${balance.toFixed(3)} SOL (necesito ${(solAmount+0.01).toFixed(2)})`, "warn"); return; }
-  const buy = await buyToken(signal.mint, solAmount, 15);
+  const buy = await buyToken(signal.mint, solAmount, "entry");
   if (!buy) return;
   const trade = {
     id: `real-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
@@ -1530,7 +1619,7 @@ function scheduleLaunchCheck(trade, kind) {
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
-  const sell = await sellToken(trade.mint);
+  const sell = await sellToken(trade.mint, 1, urgencyByReason(reason));
   if (!sell) {
     trade.sellRetries = (trade.sellRetries || 0) + 1;
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
@@ -1838,7 +1927,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
       const esMala = trade.pnlPct <= -30 || (trade.maxLossPct || 0) <= -60;
       if (esMala) h.malas++;
       addLog(`[CREATOR] wallet=${preC.creator} mint=${trade.mint} res=${esMala ? "MALA" : "ok"} pnl=${trade.pnlPct}% hist=${h.tokens}t/${h.malas}m${h.malas >= 2 ? " ⚠️ REINCIDENTE" : ""}`, "rec");
-      // [v11.2b] ☠️ un cierre <= -80% = pull -> su creador entra en la lista negra DE POR VIDA
+      // [v11.3] ☠️ un cierre <= -80% = pull -> su creador entra en la lista negra DE POR VIDA
       if (MIG_ABYSS_VETO && trade.pnlPct <= MIG_ABYSS_PNL && !abyssCreators.has(preC.creator)) {
         abyssCreators.add(preC.creator);
         addLog(`☠️ LISTA NEGRA DE POR VIDA: creador ${preC.creator.slice(0,8)}… vetado | su ${trade.symbol} cerró ${trade.pnlPct}% (retirada de liquidez)`, "filter");
@@ -1989,8 +2078,10 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v11.2b — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
-    addLog(`📝 v11.2b DEMO — config del usuario validada: no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas + 🚫 blacklist de quotes (fix USDC). Resto igual que v10.1. NO toca wallet real.`, "accept");
+    console.log(`📝 SolScanBot v11.3 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+      if (_stateInfo.persistent) addLog(`💾 Estado persistente OK: ${STATE_FILE}`, "accept");
+  else addLog(`🚨 VOLUMEN NO DISPONIBLE: guardando en ${STATE_FILE} (EFÍMERO — el historial y la lista negra SE PERDERÁN en cada redeploy). Revisa el Volume de Railway.`, "error");
+  addLog(`📝 v11.3 DEMO — no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas · 🚫 blacklist de quotes · ☠️ lista negra de por vida (cierre ≤${MIG_ABYSS_PNL}% → creador vetado) · cordura txs RETIRADA · ⚡ ejecución v11.3: EXEC_MODE=${EXEC_MODE} slippage/prio por urgencia. NO toca wallet real.`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
