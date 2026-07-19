@@ -23,14 +23,14 @@ const DEMO_ONLY = true;
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
 // real. NO es para ganar dinero todavía. Requiere: keys ROTADAS + wallet dedicada.
-const SOL_PER_TRADE_REAL = 0.15;
-const MIG_MAX_MC_REAL = 200_000; // en real, tope bajo: honeypots/liquidez fina viven arriba
+const SOL_PER_TRADE_REAL = +(process.env.SOL_PER_TRADE_REAL || 0.25); // [v11.5] fase de medición
+const MIG_MAX_MC_REAL = 1_000_000; // [v11.5] IDÉNTICO al demo (antes 200K: divergencia eliminada)
 const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = 10;
 const MAX_MIG_REAL = 10;
-const REAL_STRATEGIES = ["migration"];
+const REAL_STRATEGIES = ["migration", "reentry", "fuerza"]; // [v11.5] real = demo
 
-// ── [v11.3] EJECUCIÓN REAL — obra de fricción ──────────────────────────────
+// ── [v11.5] EJECUCIÓN REAL — obra de fricción ──────────────────────────────
 // EXEC_MODE: "pp" = PumpPortal trade-local (actual, 0.5%/lado)
 //            "hybrid" = compra por PP (velocidad en el seg 3) + VENTAS por Jupiter (0% router)
 //            "jup" = todo por Jupiter (requiere que indexe el pool; puede fallar en entradas tempranas)
@@ -50,8 +50,18 @@ const execParams = (u) => u === "entry" ? { slip: SLIP_ENTRY, prio: PRIO_ENTRY }
                    : u === "panic" ? { slip: SLIP_PANIC, prio: PRIO_PANIC }
                    : { slip: SLIP_CALM, prio: PRIO_CALM };
 const urgencyByReason = (r) => (r === "SL" || r === "NO_LAUNCH" || r === "DEAD_FEED") ? "panic" : "calm";
+// [v11.5] FRANJA HORARIA — SOLO MODO REAL. Tribunal 16-jul: la 20-21h ES pierde en ambas
+// eras (-73/-64 mSOL/op), 9/10 días rojos, -70 mSOL/op con n=121. El demo SIGUE entrando
+// a esa hora (el laboratorio no pierde los ojos y la señal se re-valida semanalmente).
+const REAL_FRANJA_BLOCK = (process.env.REAL_FRANJA_BLOCK ?? "20").split(",").map(Number).filter(n => !isNaN(n));
+const REAL_TZ_OFFSET = +(process.env.REAL_TZ_OFFSET || 2);  // España verano = UTC+2
+const horaES = () => (new Date().getUTCHours() + REAL_TZ_OFFSET) % 24;
+const franjaRealBloqueada = () => REAL_FRANJA_BLOCK.includes(horaES());
+// [v11.5] Veto de VELOCIDAD solo-real: señal fichada (vel>=4.7s pierde en ambas eras, 7/8 dias,
+// ~+1.5 SOL/dia). APAGADO por defecto: activar con REAL_VEL_MAX=4.7 cuando el real arranque.
+const REAL_VEL_MAX = +(process.env.REAL_VEL_MAX || 0);
 
-// [v11.3] STATE_FILE robusto: sonda de escritura al arrancar + fallback anunciado.
+// [v11.5] STATE_FILE robusto: sonda de escritura al arrancar + fallback anunciado.
 // Si el Volume de Railway no está montado/escribible, se ve EN EL LOG DEL BOT (antes moría en silencio).
 const _stateCandidates = [
   process.env.STATE_FILE,
@@ -75,7 +85,7 @@ const STATE_FILE = _stateInfo.path;
 
 // ── CONFIG MIGRACIÓN ───────────────────────────────────────────
 const MIG_TP = 21.00;                  // [CAMBIO 9-jul] TP simbólico +2000%: el trailing+runner son el techo natural; el TP solo queda como seguridad técnica
-const MIG_SL = 0.60;                   // SL -40% desde entrada (validado sobre 356 ops: mejor que -60 en ambos días)
+const MIG_SL = 0.61;   // [v11.5] -39% (la del sofá)
 // [CAMBIO 9-jul] Expiración 12min → 3 HORAS: el Excel de revisión demostró que los
 // topes reales llegan a las 2h (ej. $33K→$416K a las 2h de entrar) y la expiración
 // corta decapitaba a las corredoras. Se mantiene como red de seguridad anti-zombi.
@@ -114,7 +124,7 @@ const MIG_R30_THRESHOLD = 0;
 // Validado (train +35.5 / test +20.3 mSOL/op): holders<20 en el PREMIG = veneno
 // (cierre medio -48% sobre 10 ops de 8-9 jul). Fail-open: si Helius no ha
 // respondido aún, se entra igualmente para no depender de su disponibilidad.
-// [v11.3] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
+// [v11.5] LISTA NEGRA DE QUOTES: PumpPortal puede emitir migraciones de pools
 // cotizadas en USDC con el mint del QUOTE — el bot llegó a "operar" el propio USDC
 // (fantasmas de -78/-81% en un activo de $1). Estos mints jamás se tocan.
 const QUOTE_BLACKLIST = new Set([
@@ -122,16 +132,16 @@ const QUOTE_BLACKLIST = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
   "So11111111111111111111111111111111111111112",  // wSOL
 ]);
-// [v11.3] CORDURA txs RETIRADA: el retro demostró que vetaba ~110 tokens/día legítimos
+// [v11.5] CORDURA txs RETIRADA: el retro demostró que vetaba ~110 tokens/día legítimos
 // (57% ganadores, incluido el +1274 del 13-jul con 2107 txs). Queda solo la lista negra de quotes.
-const MIG_ABYSS_VETO = true;         // [v11.3] ☠️ lista negra DE POR VIDA para creadores de pulls
+const MIG_ABYSS_VETO = true;         // [v11.5] ☠️ lista negra DE POR VIDA para creadores de pulls
 const MIG_ABYSS_PNL  = -80;          // cierre demo <= -80% = retirada de liquidez -> su creador, vetado para siempre
 const MIG_MIN_HOLDERS = 20;
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
 const creatorHist = new Map();       // wallet → { tokens, malas }
-const abyssCreators = new Set();     // [v11.3] ☠️ creadores vetados de por vida (nos hicieron un ≤-80%)
+const abyssCreators = new Set();     // [v11.5] ☠️ creadores vetados de por vida (nos hicieron un ≤-80%)
 // [v11.1] VETO DE FÁBRICA: no entrar en tokens de creadores con 2+ malas con nosotros.
 // Quirúrgico: solo actúa sobre wallets que ya nos quemaron; un lanzador prolífico
 // benigno (p.ej. 7 tokens / 0 malas) jamás se veta.
@@ -194,14 +204,22 @@ function factorCalor() {
 // pagan los billetes; fricción real ~4.5% ya considerada en la validación) ──
 const REENTRY_ON = true;
 const REENTRY_MIN_T = 45;            // no antes del segundo 45 de la grabación
-const REENTRY_DIP = -45;             // [v11] era -20 — solo resucitados de desplome profundo
-const REENTRY_JUMP = 60;             // [v11] era 40 — recuperación violenta exigida
+const REENTRY_DIP = -60;   // [v11.5]
+const REENTRY_JUMP = 45;   // [v11.5]
 const REENTRY_ZONE = -5;             // hasta al menos la zona de entrada (>= -5%)
 const REENTRY_SL = -30;              // SL relativo a la re-entrada
-const REENTRY_ARM = 40;              // trailing ancho se arma a +40 relativo
-const REENTRY_TRAIL = 0.30;          // [v11] era 0.25
+const REENTRY_ARM = 50;   // [v11.5]
+const REENTRY_TRAIL = 0.55;   // [v11.5]
 const REENTRY_MAX_OPEN = 10;
 const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
+
+// ── [v11.5] RE-ENTRADA POR FUERZA ("la del sofá") ──
+const FZ_ON = process.env.FZ_ON !== "false";
+const FZ_MARGIN = 0.50;
+const FZ_SL = -15;
+const FZ_ARM = 40;
+const FZ_TRAIL = 0.50;
+const FZ_MAX_OPEN = 10;
 
 // ── [CAMBIO 9-jul] MOON-BAG / RUNNER (solo DEMO por ahora) ──
 // Cuando el trailing va a cerrar una posición cuyo máximo tocó +50% y va en verde:
@@ -242,8 +260,9 @@ const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -
 
 const MIG_BREAKEVEN_AT = 0.20;        // breakeven al +20%: protege el suelo antes
 const MIG_BREAKEVEN_MARGIN = 0.03;
+const MIG_BE_ON = process.env.MIG_BE_ON === "true";   // [v11.5] BE OFF por defecto (la del sofá)
 const MIG_LOCK_AT = 0.25;             // trailing FOLLOWING se arma en +25%
-const MIG_FOLLOW_PCT = 0.50;  // [v11] x2.5 — config del usuario validada (train +36 / test +4.5, 11/13 días)
+const MIG_FOLLOW_PCT = 0.90;   // [v11.5] x6.3 (cap 90%)  // [v11] x2.5 — config del usuario validada (train +36 / test +4.5, 11/13 días)
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;
 const MIG_EXPIRED_WIN_PCT = 2;
@@ -259,7 +278,7 @@ const MIG_STEP_TRIGGER = 0.25;        // escalón (suelo +13%) se arma en +25%
 const MIG_STEP_FLOOR = 0.13;
 // [CAMBIO 9-jul] TIERS ANCHOS validados en backtest (192 configs, train/test):
 // el trailing fino devolvía las corredoras (Excel: topes reales +682% cerrados a +10).
-const MIG_FOLLOW_PCT_STEP = 0.50;     // [v11] era 0.20 — tiers anchos x2.5
+const MIG_FOLLOW_PCT_STEP = 0.90;   // [v11.5] x6.3 (cap 90%)
 const MIG_HARD_CAP_LOSS = -20;
 const MIG_CAP_LOSS_ON = false;
 // ── TRAILING POR ESTRUCTURA ──
@@ -284,15 +303,15 @@ const MIG_VELO_DROP = 0.10;
 const MIG_VELO_ON = false;
 const MIG_VELO_MS = 2_000;
 const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;
-const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.375;  // [v11] era 0.15
-const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.30;   // [v11] era 0.12
-const MIG_TRAIL_P4 = 0.20;                             // [v11] era 0.08
+const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.90;    // [v11.5] x6.3 (cap)  // [v11] era 0.15
+const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.756;   // [v11.5] 0.12×6.3
+const MIG_TRAIL_P4 = 0.504;   // [v11.5] 0.08×6.3
 const MIG_TOP_FLOOR_TRIGGER = 100;
 const MIG_TOP_FLOOR = 0.65;
 
 // ── KILL-SWITCH DE PORTAFOLIO ──
 const RISK = {
-  maxDailyLossSol: 0.8,   // experimento 0.1: ~8-15 ops malas paran el día
+  maxDailyLossSol: +(process.env.RISK_MAX_DAILY_LOSS || 3),   // [v11.5] escalado al lote 0.25
   maxConsecutiveLosses: 12,
   maxWindowLossSol: 0.8,        // tope por VENTANA MÓVIL (independiente de medianoche UTC)
   windowHours: 6,              // ventana de las últimas 6 horas
@@ -900,8 +919,40 @@ async function registrarCalidadPremig(mint, symbol) {
         holdersStr = ` holders=${holdersNum} topPct=${topPctNum.toFixed(0)} top5Pct=${top5Num.toFixed(0)} top10Pct=${top10Num.toFixed(0)}`;
       }
     } catch (e) { holdersStr = " holders=err"; }
-    premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator });
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}`, "info");
+    // ── [v11.5] PREMIG v2: calidad de las billeteras top-5 (identidad, no precio) ──
+    let hqStr = "";
+    try {
+      const pack = (async () => {
+        const largest = await connection.getTokenLargestAccounts(pk, "confirmed");
+        const cuentas = (largest?.value || []).slice(1, 6);   // la 1ª suele ser el pool: fuera
+        const owners = [];
+        for (const c of cuentas) {
+          const info = await connection.getParsedAccountInfo(c.address, "confirmed");
+          const ow = info?.value?.data?.parsed?.info?.owner;
+          if (ow) owners.push(ow);
+        }
+        const bals = [], births = []; let newW = 0;
+        for (const ow of owners) {
+          const opk = new PublicKey(ow);
+          const [lam, sigs] = await Promise.all([
+            connection.getBalance(opk, "confirmed"),
+            connection.getSignaturesForAddress(opk, { limit: 25 }, "confirmed"),
+          ]);
+          bals.push(lam / 1e9);
+          if ((sigs?.length || 0) <= 2) newW++;
+          if (sigs && sigs.length > 0 && sigs.length < 25 && sigs[sigs.length - 1].blockTime)
+            births.push(sigs[sigs.length - 1].blockTime);
+        }
+        if (!bals.length) return "";
+        const sb = [...bals].sort((a, b) => a - b);
+        const med = sb[Math.floor(sb.length / 2)].toFixed(2), mn = sb[0].toFixed(2);
+        const spread = births.length >= 2 ? Math.round((Math.max(...births) - Math.min(...births)) / 60) + "m" : "n/a";
+        return ` topBalMed=${med} topBalMin=${mn} newW=${newW}/${owners.length} fundSpread=${spread}`;
+      })();
+      hqStr = await Promise.race([pack, new Promise(r => setTimeout(() => r(""), 3500))]);
+    } catch (e) { hqStr = ""; }
+    premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator, hq: hqStr.trim() });
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}${hqStr}`, "info");
     labStats.premigOk++;
   } catch (e) {
     addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,50)}`, "info");
@@ -1035,6 +1086,7 @@ function migQualTick(entry, price) {
     entry.qualGate = false; clearTimeout(entry.qualTimeout);
     const precioSenal = price;
     const tSenal = ((now - entry.startTime) / 1000).toFixed(0);
+    entry.sigMov2s = +mov2.toFixed(2); entry.sigT = +tSenal;   // [v11.5] la señal causal, apuntada
     addLog(`🎯 MIG SEÑAL: ${entry.symbol} | mov2s +${mov2.toFixed(1)}% a los ${tSenal}s — confirmando ${(MIG_ENTRY_DELAY_MS/1000).toFixed(0)}s`, "accept");
     setTimeout(() => {
       const precioB = entry.lastPrice;
@@ -1076,7 +1128,7 @@ function migQualTick(entry, price) {
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
-      // [v11.3] ☠️ VETO ABISMO: si el creador está en la lista negra de por vida, ni tocarlo
+      // [v11.5] ☠️ VETO ABISMO: si el creador está en la lista negra de por vida, ni tocarlo
       if (MIG_ABYSS_VETO) {
         const preA = premigData.get(entry.mint);
         if (preA && preA.creator && abyssCreators.has(preA.creator)) {
@@ -1191,7 +1243,7 @@ function liveRecStart(entry, entryPrice) {
   const velMs = Date.now() - entry.startTime;
   const rec = { mint: entry.mint, symbol: entry.symbol, vel: +(velMs/1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice*1_000_000_000), vol: Math.round(entry.volumeUSD||0),
-    t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, finished: false,
+    t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, sigMov2s: entry.sigMov2s ?? null, sigT: entry.sigT ?? null, finished: false,
     volSeg: [], lastVolSec: -1, minP: 0, reentered: false,
     wallets: new Map() };  // [v10.1] wallet → {buyUsd, sellUsd, buys, sells} en 0-60s
   state.liveRecordings.set(entry.mint, rec);
@@ -1220,6 +1272,11 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   rec.lastSample = Date.now();
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
   rec.puntos.push({ t: Math.round(dt/1000), p: pct });
+  // [v11.5] FUERZA: el precio supera el máximo previo en el margen -> perseguir
+  if (FZ_ON && rec.fzArmed && !rec.fzFired && pct >= rec.fzTrigPct) {
+    rec.fzFired = true;
+    fzOpenTrades(rec, price);
+  }
   if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
   if (pct < rec.minP) rec.minP = pct;
   maybeReentry(rec, price, pct, Math.round(dt/1000));  // [v10]
@@ -1250,6 +1307,9 @@ function maybeReentry(rec, price, pct, tSec) {
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
   addLog(`🔄 REENTRY [demo]: ${rec.symbol} | resucitado (mín ${rec.minP.toFixed(0)}% → ahora ${pct.toFixed(0)}%) | SL ${REENTRY_SL}% trail ${REENTRY_TRAIL*100}% desde pico`, "accept");
+  // [v11.5] real = demo: la reentry también se opera en real (mismo disparo, mismo token)
+  openRealTrade({ strategy: "reentry", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
+    price, tp: +(price * 21).toFixed(12), sl: +(price * (1 + REENTRY_SL/100)).toFixed(12) });
 }
 
 function updateReentryTrades(mint, price) {
@@ -1277,6 +1337,98 @@ function updateReentryTrades(mint, price) {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
       else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
+  }
+  // [v11.5] mismas reglas para las reentries REALES
+  for (const trade of state.realTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "reentry") continue;
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    if (trade.maxGainPct >= REENTRY_ARM) {
+      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
+      const cand = peakPrice * (1 - REENTRY_TRAIL);
+      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+    }
+    if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
+    else if (price <= trade.sl) {
+      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeRealTrade(trade, price, "SL"); }
+    } else {
+      trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
+      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
+  }
+}
+
+// ── [v11.5] FUERZA: apertura (demo + real) y gestión de salidas ──
+function fzOpenTrades(rec, price) {
+  const abiertos = state.demoTrades.filter(t => t.strategy === "fuerza" && t.status === "OPEN").length;
+  if (abiertos >= FZ_MAX_OPEN) { addLog(`⚡ FUERZA saltada (límite ${FZ_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
+  const trade = {
+    id: `fuerza-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+    strategy: "fuerza", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
+    entryPrice: price, tp: +(price * 21).toFixed(12),
+    sl: +(price * (1 + FZ_SL/100)).toFixed(12),
+    sizeSol: REENTRY_SIZE,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    trailingPhase: "FUERZA", status: "OPEN",
+    expiresAt: Date.now() + MIG_DURATION_MS, mov1s: null, mov2s: null,
+  };
+  state.demoTrades.unshift(trade);
+  if (state.demoTrades.length > 500) state.demoTrades.pop();
+  broadcast({ event: "demoTradeOpened", data: trade });
+  addLog(`⚡ FUERZA [demo]: ${rec.symbol} | rompió su máximo previo (disparo a +${rec.fzTrigPct}%) | SL ${FZ_SL}% trail ${FZ_TRAIL*100}%@+${FZ_ARM}`, "accept");
+  openRealTrade({ strategy: "fuerza", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
+    price, tp: +(price * 21).toFixed(12), sl: +(price * (1 + FZ_SL/100)).toFixed(12) });
+}
+
+function updateFuerzaTrades(mint, price) {
+  if (!FZ_ON) return;
+  const now = Date.now();
+  for (const trade of state.demoTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "fuerza") continue;
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    if (trade.maxGainPct >= FZ_ARM) {
+      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
+      const cand = peakPrice * (1 - FZ_TRAIL);
+      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+    }
+    if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
+    else if (price <= trade.sl) {
+      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", 21); }
+    } else {
+      trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
+      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+    }
+  }
+  for (const trade of state.realTrades) {
+    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "fuerza") continue;
+    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
+    trade.currentPct = +currentPct.toFixed(2);
+    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
+    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    if (trade.maxGainPct >= FZ_ARM) {
+      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
+      const cand = peakPrice * (1 - FZ_TRAIL);
+      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+    }
+    if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
+    else if (price <= trade.sl) {
+      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeRealTrade(trade, price, "SL"); }
+    } else {
+      trade._slBelowCount = 0;
+      if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
+      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
     }
   }
 }
@@ -1316,7 +1468,7 @@ function liveRecEmit(mint) {
     const wash = ws.filter(w => w.buys > 0 && w.sells > 0).length;
     wStr = ` buyers60=${buyers.length} topBuyer=${totalBuy > 0 ? (100*topBuy/totalBuy).toFixed(0) : 0}% wash60=${wash}`;
   }
-  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
   labStats.migrecs++;
 }
 
@@ -1377,7 +1529,9 @@ function migOpenTrades(entry) {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price*MIG_TP).toFixed(12), sl: +(price*MIG_SL).toFixed(12),
-    mcUsd: price*1_000_000_000, volumeUSD: entry.volumeUSD, time: Date.now(),
+    mcUsd: price*1_000_000_000, volumeUSD: entry.volumeUSD,
+    vel: +(((Date.now()-entry.startTime)/1000).toFixed(1)),   // [v11.5] para el veto de lentos
+    time: Date.now(),
   };
   state.signals.unshift(signal);
   if (state.signals.length > 100) state.signals.pop();
@@ -1414,6 +1568,7 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
         // antes y migCleanup borró el token del monitoreo), seguir gestionándolo.
         updateDemoTrades(mint, price, "migration");
         updateReentryTrades(mint, price);
+        updateFuerzaTrades(mint, price);
       }
     }
     return;
@@ -1428,6 +1583,7 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
   updateReentryTrades(mint, price);  // [v10]
+  updateFuerzaTrades(mint, price);  // [v11.5]
   broadcast({ event: "migTokenUpdate", data: token });
 }
 
@@ -1459,7 +1615,7 @@ async function getSolDeltaFromTx(sig, retries = 6) {
   return null;
 }
 
-// [v11.3] Swap vía Jupiter v6: quote → swap tx serializada → firmar y enviar con nuestro RPC.
+// [v11.5] Swap vía Jupiter v6: quote → swap tx serializada → firmar y enviar con nuestro RPC.
 // Sin comisión de router. prioritizationFeeLamports va dentro de la propia tx.
 async function jupSwap(inputMint, outputMint, amountRaw, slipPct, prioSol) {
   const q = await fetch(`${JUP_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${Math.round(slipPct*100)}&onlyDirectRoutes=false`, { signal: AbortSignal.timeout(8000) });
@@ -1562,6 +1718,14 @@ async function openRealTrade(signal) {
     addLog(`🛑 Entrada real BLOQUEADA por kill-switch: ${signal.symbol} | diario ${snap.dailyPnlSol.toFixed(3)} SOL · pausa ${(snap.pausedMsLeft/60000).toFixed(0)}min`, "warn");
     return;
   }
+  if (franjaRealBloqueada()) {
+    addLog(`🕗 REAL saltada por franja horaria (${horaES()}h ES, bloqueadas: ${REAL_FRANJA_BLOCK.join(",")}h): ${signal.symbol} — el demo sí entra`, "filter");
+    return;
+  }
+  if (REAL_VEL_MAX > 0 && signal.vel != null && signal.vel >= REAL_VEL_MAX) {
+    addLog(`🐢 REAL saltada por señal lenta (vel ${signal.vel}s ≥ ${REAL_VEL_MAX}s): ${signal.symbol} — el demo sí entra`, "filter");
+    return;
+  }
   if (regimenPausado()) { addLog(`🧊 Entrada real BLOQUEADA por freno de régimen: ${signal.symbol}`, "warn"); return; }
   const openReal = state.realTrades.filter(t => t.status === "OPEN");
   if (openReal.length >= MAX_REAL_TRADES) return;
@@ -1616,6 +1780,19 @@ function scheduleLaunchCheck(trade, kind) {
   }, MIG_LAUNCH_CHECK_MS);
 }
 
+// [v11.5] vende el 75% y deja el 25% corriendo (moon-bag real, espejo del demo)
+async function realRunnerConvert(trade, price) {
+  trade.runner = true; trade.trailingPhase = "RUNNER";
+  trade.sl = +Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL)).toFixed(12);
+  addLog(`🌙 MOON-BAG [real]: ${trade.symbol} vende 75% a +${trade.currentPct.toFixed(1)}% | 25% sigue (trail ${MIG_RUNNER_TRAIL*100}%, suelo BE)`, "real");
+  const sell = await sellToken(trade.mint, 0.75, "calm");
+  if (sell && sell.proceedsSol != null) { trade.partialProceedsSol = sell.proceedsSol; saveState(); }
+  else {
+    addLog(`⚠️ MOON-BAG real: venta parcial falló → cierro entera por seguridad: ${trade.symbol}`, "warn");
+    trade.runner = false; closeRealTrade(trade, price, "SL");
+  }
+}
+
 async function closeRealTrade(trade, price, reason) {
   if (trade.status !== "OPEN") return;
   trade.status = "CLOSING";
@@ -1625,7 +1802,7 @@ async function closeRealTrade(trade, price, reason) {
     if (trade.sellRetries <= 3) { trade.status = "OPEN"; setTimeout(() => closeRealTrade(trade, price, reason), 15000); return; }
     trade.status = "SELL_FAILED"; broadcast({ event: "realTradeClosed", data: trade }); return;
   }
-  const proceedsSol = sell.proceedsSol;
+  const proceedsSol = +(((sell.proceedsSol || 0) + (trade.partialProceedsSol || 0))).toFixed(6); // [v11.5] incluye moon-bag
   const costSol = (trade.costSol != null && trade.costSol > 0) ? trade.costSol : trade.solAmount;
   const realPnlSol = +(proceedsSol - costSol).toFixed(4);
   const tickPnlSol = +(costSol * (price - trade.entryPrice) / trade.entryPrice).toFixed(4);
@@ -1639,14 +1816,14 @@ async function closeRealTrade(trade, price, reason) {
   riskRecordClose(realPnlSol);
   const dur = Math.round((trade.closeTime - trade.openTime) / 1000);
   const expWinPct = MIG_EXPIRED_WIN_PCT;
-  if (reason === "TP" || reason === "STEP" || (reason === "SL" && trade.pnlPct >= 0)) {
+  if (reason === "TP" || reason === "STEP" || reason === "RUNNER_END" || (reason === "SL" && trade.pnlPct >= 0)) {
     trade.result = "WIN"; state.stats.mig_realWins++;
     state.stats.mig_realPnL += trade.pnlPct; state.stats.mig_realPnLSol += trade.pnlSol;
-    addLog(`✅ REAL WIN [${reason==="STEP"?"🪜 ESCALÓN":"migration"}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
+    addLog(`✅ REAL WIN [${reason==="STEP"?"🪜 ESCALÓN":reason==="RUNNER_END"?"🌙 RUNNER":trade.strategy}]: ${trade.symbol} +${trade.pnlPct}% en ${dur}s`, "realwin");
   } else if (reason === "SL") {
     trade.result = "LOSS"; state.stats.mig_realLosses++;
     state.stats.mig_realPnL += trade.pnlPct; state.stats.mig_realPnLSol += trade.pnlSol;
-    addLog(`❌ REAL LOSS [migration]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "realloss");
+    addLog(`❌ REAL LOSS [${trade.strategy}]: ${trade.symbol} ${trade.pnlPct}% en ${dur}s`, "realloss");
   } else if (reason === "NO_LAUNCH") {
     trade.result = trade.pnlPct >= 0 ? "WIN" : "LOSS";
     if (trade.result === "WIN") state.stats.mig_realWins++; else state.stats.mig_realLosses++;
@@ -1690,7 +1867,7 @@ function veloDropTriggered(trade, price, strategy) {
 
 function updateRealTrades(mint, price, strategy) {
   const now = Date.now();
-  const breakeven = MIG_BREAKEVEN_AT;
+  const breakeven = MIG_BE_ON ? MIG_BREAKEVEN_AT : Infinity;   // [v11.5]
   const breakevenMargin = MIG_BREAKEVEN_MARGIN;
   const lock = MIG_LOCK_AT;
   const follow = MIG_FOLLOW_PCT;
@@ -1700,6 +1877,15 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    // [v11.5] modo MOON-BAG real: el 25% restante corre con trailing propio y suelo breakeven
+    if (trade.runner) {
+      const cand = Math.max(price * (1 - MIG_RUNNER_TRAIL), trade.entryPrice);
+      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+      if (price <= trade.sl) { closeRealTrade(trade, price, "RUNNER_END"); }
+      else if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
+      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, trailingPhase: trade.trailingPhase } });
+      continue;
+    }
     if (MIG_VELO_ON && veloDropTriggered(trade, price, strategy)) {
       addLog(`⚡🛑 VELO-EXIT [${strategy} real]: ${trade.symbol} caída rápida @ ${currentPct.toFixed(1)}%`, "realloss");
       closeRealTrade(trade, price, "SL"); continue;
@@ -1727,6 +1913,11 @@ function updateRealTrades(mint, price, strategy) {
     }
     if (price >= trade.tp) { trade._slBelowCount = 0; closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
+      // [v11.5] conversión a MOON-BAG (idéntico al demo): trailing salta con máx≥runner y en verde
+      if (MIG_RUNNER_ON && !trade.runner && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0 && strategy === "migration") {
+        void realRunnerConvert(trade, price);
+        continue;
+      }
       if (trade.sl >= trade.entryPrice) {
         closeRealTrade(trade, price, (stepArmed && Math.abs(trade.sl - stepFloorPrice) < 1e-9) ? "STEP" : "SL");
       } else {
@@ -1824,7 +2015,7 @@ function updateDemoTrades(mint, price, strategy) {
       continue;
     }
     // SINCRONIZADO CON EL REAL: misma lógica breakeven→lock→follow→floors.
-    const breakeven = MIG_BREAKEVEN_AT;
+    const breakeven = MIG_BE_ON ? MIG_BREAKEVEN_AT : Infinity;   // [v11.5]
     const breakevenMargin = MIG_BREAKEVEN_MARGIN;
     const lock = MIG_LOCK_AT;
     const follow = MIG_FOLLOW_PCT;
@@ -1885,6 +2076,16 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
   } else {
     trade.pnlPct = +pnlPct.toFixed(2);
   }
+  // [v11.5] armar la caza por FUERZA sobre la grabación viva (una vez por token)
+  if (FZ_ON && isMig(trade.strategy)) {
+    const recFz = state.liveRecordings.get(trade.mint);
+    if (recFz && !recFz.finished && !recFz.fzArmed) {
+      let maxAt = 0;
+      for (const p of recFz.puntos) if (p.p > maxAt) maxAt = p.p;
+      recFz.fzArmed = true; recFz.fzFired = false;
+      recFz.fzTrigPct = +(((1 + maxAt/100) * (1 + FZ_MARGIN) - 1) * 100).toFixed(2);
+    }
+  }
   const expWinPct = MIG_EXPIRED_WIN_PCT;
   if (reason === "TP") {
     trade.result = "WIN"; state.stats.mig_demoWins++;
@@ -1927,7 +2128,7 @@ function closeDemoTrade(trade, price, reason, tp_pct) {
       const esMala = trade.pnlPct <= -30 || (trade.maxLossPct || 0) <= -60;
       if (esMala) h.malas++;
       addLog(`[CREATOR] wallet=${preC.creator} mint=${trade.mint} res=${esMala ? "MALA" : "ok"} pnl=${trade.pnlPct}% hist=${h.tokens}t/${h.malas}m${h.malas >= 2 ? " ⚠️ REINCIDENTE" : ""}`, "rec");
-      // [v11.3] ☠️ un cierre <= -80% = pull -> su creador entra en la lista negra DE POR VIDA
+      // [v11.5] ☠️ un cierre <= -80% = pull -> su creador entra en la lista negra DE POR VIDA
       if (MIG_ABYSS_VETO && trade.pnlPct <= MIG_ABYSS_PNL && !abyssCreators.has(preC.creator)) {
         abyssCreators.add(preC.creator);
         addLog(`☠️ LISTA NEGRA DE POR VIDA: creador ${preC.creator.slice(0,8)}… vetado | su ${trade.symbol} cerró ${trade.pnlPct}% (retirada de liquidez)`, "filter");
@@ -2078,10 +2279,10 @@ server.listen(PORT, async () => {
     console.log(`🔬 SolScanBot — MODO OBSERVADOR PURO (NO OPERA) | graba ${MCO_RECORD_MS/60000}min por token`);
     addLog(`🔬 MODO OBSERVADOR PURO ACTIVO — el bot NO opera, solo graba [MCREC].`, "accept");
   } else if (DEMO_ONLY) {
-    console.log(`📝 SolScanBot v11.3 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
+    console.log(`📝 SolScanBot v11.5 — MODO DEMO | v9 intacta (SL -${((1-MIG_SL)*100).toFixed(0)} · tiers ${MIG_FOLLOW_PCT_STEP*100}/${MIG_TRAIL_P2*100}/${MIG_TRAIL_P3*100}/${MIG_TRAIL_P4*100} · 🌙 runner ${Math.round(MIG_RUNNER_FRACTION*100)}% · ✂️ 30s · 🚫 holders>=${MIG_MIN_HOLDERS}) + 🧊 freno(N=${MIG_BRAKE_N},${MIG_BRAKE_SUM}%,${MIG_BRAKE_PAUSE_MS/60000}m) + 🔥 lote por calor + 🔄 reentry(confirm ${MIG_SL_CONFIRM_TICKS} ticks) + 👛 buyers60/wash60 + 🏭 creator | ventana ${MIG_DURATION_MS/60000}min · grabación ${LAB_EXTEND_MS/60000}min`);
       if (_stateInfo.persistent) addLog(`💾 Estado persistente OK: ${STATE_FILE}`, "accept");
   else addLog(`🚨 VOLUMEN NO DISPONIBLE: guardando en ${STATE_FILE} (EFÍMERO — el historial y la lista negra SE PERDERÁN en cada redeploy). Revisa el Volume de Railway.`, "error");
-  addLog(`📝 v11.3 DEMO — no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas · 🚫 blacklist de quotes · ☠️ lista negra de por vida (cierre ≤${MIG_ABYSS_PNL}% → creador vetado) · cordura txs RETIRADA · ⚡ ejecución v11.3: EXEC_MODE=${EXEC_MODE} slippage/prio por urgencia. NO toca wallet real.`, "accept");
+  addLog(`📝 v11.5 DEMO — no-despegue OFF · trailing x2.5 · reentry estricta (-45/+60) · calor OFF · freno OFF · 🏭 veto de fábricas · 🚫 blacklist de quotes · ☠️ lista negra de por vida (cierre ≤${MIG_ABYSS_PNL}% → creador vetado) · cordura txs RETIRADA · ⚡ ejecución v11.5: EXEC_MODE=${EXEC_MODE} slippage/prio por urgencia · REAL=DEMO (moon-bag+reentry, MC 1M, lote ${SOL_PER_TRADE_REAL}) · 🕗 franja real bloqueada: ${REAL_FRANJA_BLOCK.join(",")}h ES · 🐢 velMax ${REAL_VEL_MAX>0?REAL_VEL_MAX+"s":"OFF"} · 📡 sig+PREMIGv2 · 🛋️ LA DEL SOFÁ: SL-39 · x6.3 · BEoff · RE -60/+45/arm50/tr55 · ⚡FZ +50/sl-15/tr50. ${DEMO_ONLY?"NO toca wallet real.":"⚠️ MODO REAL ACTIVO"}`, "accept");
   } else {
     console.log(`🚀 SolScanBot v9.0-FUSION REAL+DEMO | mismos parámetros en ambos | runner solo en demo`);
   }
