@@ -32,6 +32,7 @@ function useBackend() {
  const [log, setLog] = useState([]);
  const [stats, setStats] = useState({});
  const [shadow, setShadow] = useState(null);
+ const [fzJuicio, setFzJuicio] = useState(null);
  const [wsStatus, setWsStatus] = useState("connecting");
 
  useEffect(() => {
@@ -54,11 +55,13 @@ function useBackend() {
            setLog(data.log || []);
            setStats(data.stats || {});
            setShadow(data.shadow || null);
+           setFzJuicio(data.fzJuicio || null);
            setWsStatus(data.wsStatus || "connected");
            return;
          }
          if (event === "stats") { setStats(data); return; }
          if (event === "shadow") { setShadow(data); return; }
+         if (event === "fzJuicio") { setFzJuicio(data); return; }
          if (event === "migWatchUpdate") { setMigWatching(p => p.map(w => w.mint === data.mint ? { ...w, ...data } : w)); return; }
          if (event === "newMigToken") { setMigMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
          if (event === "migTokenUpdate") { setMigMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
@@ -84,7 +87,7 @@ function useBackend() {
    return () => { ws?.close(); clearTimeout(t); };
  }, []);
 
- return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus };
+ return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus };
 }
 
 // ── COMPONENTES ────────────────────────────────────────────────
@@ -507,7 +510,7 @@ function Calendar({ realTrades, movements, setMovements }) {
 
 // ── APP PRINCIPAL ──────────────────────────────────────────────
 export default function App() {
- const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus } = useBackend();
+ const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus } = useBackend();
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
  const [demoStratFilter, setDemoStratFilter] = useState("all");
@@ -753,6 +756,25 @@ export default function App() {
              const maxS = Math.max(...segs.map(x => Math.abs(x.m)), 1);
              return (
                <>
+                 {shadow.propuesta && (
+                   <div style={{ background: "#1a1502", border: "1px solid #facc15", borderRadius: 10, padding: 12 }}>
+                     <div style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", fontWeight: 700, marginBottom: 6 }}>🏆 PROPUESTA DEL TRIBUNAL</div>
+                     <div style={{ fontFamily: "monospace", fontSize: 12, color: "#f1f5f9" }}><b>{shadow.propuesta.id}</b> supera a la sofá: <span style={{ color: "#22c55e", fontWeight: 700 }}>+{shadow.propuesta.delta} SOL</span> · días {shadow.propuesta.dias} · sin-top3 +{shadow.propuesta.sinTop3}</div>
+                     <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 4 }}>Todas las puertas pasadas (n≥300 · ≥7 días · día a día · sin-top3). La promoción es decisión humana.</div>
+                   </div>
+                 )}
+                 {fzJuicio && (
+                   <div style={{ background: "#0d1117", border: "1px solid #f472b644", borderRadius: 10, padding: 12 }}>
+                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                       <span style={{ fontFamily: "monospace", fontSize: 11, color: "#f472b6", fontWeight: 700 }}>⚖️ JUICIO DE LA FUERZA {fzJuicio.dictado ? "— SENTENCIA" : ""}</span>
+                       <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{Math.min(fzJuicio.n, 100)}/100</span>
+                     </div>
+                     <div style={{ height: 6, background: "#1e2d40", borderRadius: 3, overflow: "hidden", marginBottom: 6 }}>
+                       <div style={{ height: "100%", width: `${Math.min(100, fzJuicio.n)}%`, background: fzJuicio.dictado ? (fzJuicio.neto > 0 ? "#22c55e" : "#ef4444") : "#f472b6", borderRadius: 3 }} />
+                     </div>
+                     <div style={{ fontFamily: "monospace", fontSize: 11, color: pctColor(fzJuicio.neto) }}>neto {fzJuicio.neto >= 0 ? "+" : ""}{fzJuicio.neto.toFixed(2)} SOL · WR {fzJuicio.n ? Math.round(100 * fzJuicio.w / fzJuicio.n) : 0}%{fzJuicio.dictado ? (fzJuicio.neto > 0 ? " → ABSUELTA ✅" : " → CULPABLE ⚖️ (FZ_ON=false)") : ""}</div>
+                   </div>
+                 )}
                  <div style={{ background: "#0d1117", border: "1px solid #facc1544", borderRadius: 10, padding: 12 }}>
                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                      <span style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", fontWeight: 700 }}>🏟️ CLASIFICACIÓN</span>
@@ -762,7 +784,7 @@ export default function App() {
                      <div key={f.id} style={{ marginBottom: 6 }}>
                        <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 11, marginBottom: 2 }}>
                          <span style={{ color: "#f1f5f9" }}>{i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : ""}{f.id}{f.id === "sofa" ? " ⭐" : ""}</span>
-                         <span style={{ color: pctColor(f.neto), fontWeight: 700 }}>{f.neto >= 0 ? "+" : ""}{f.neto.toFixed(2)} SOL <span style={{ color: "#64748b", fontWeight: 400 }}>· {f.wr}% · {f.media.toFixed(0)}m/op</span></span>
+                         <span style={{ color: pctColor(f.neto), fontWeight: 700 }}>{f.neto >= 0 ? "+" : ""}{f.neto.toFixed(2)} SOL <span style={{ color: "#64748b", fontWeight: 400 }}>· {f.wr}% · {f.media.toFixed(0)}m/op{f.skip ? ` · 🚪${f.skip}` : ""}</span></span>
                        </div>
                        <div style={{ height: 5, background: "#1e2d40", borderRadius: 3, overflow: "hidden" }}>
                          <div style={{ height: "100%", width: `${Math.abs(f.neto) / maxAbs * 100}%`, background: f.neto >= 0 ? "#22c55e" : "#ef4444", borderRadius: 3 }} />
