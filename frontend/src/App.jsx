@@ -63,12 +63,12 @@ function useBackend() {
          if (event === "newMomToken") { setMomMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
          if (event === "momTokenUpdate") { setMomMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
          if (event === "newSignal") { setSignals(p => [data, ...p].slice(0, 100)); if (navigator.vibrate) navigator.vibrate([200,100,200]); return; }
-         if (event === "newDemoTrade") { setDemoTrades(p => [data, ...p].slice(0, 500)); return; }
-         if (event === "demoTradeUpdate") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...t, ...data } : t)); return; }
-         if (event === "demoTradeClosed") { setDemoTrades(p => p.map(t => t.id === data.id ? data : t)); return; }
-         if (event === "newRealTrade") { setRealTrades(p => [data, ...p].slice(0, 200)); return; }
-         if (event === "realTradeUpdate") { setRealTrades(p => p.map(t => t.id === data.id ? { ...t, ...data } : t)); return; }
-         if (event === "realTradeClosed") { setRealTrades(p => p.map(t => t.id === data.id ? data : t)); return; }
+         if (event === "newDemoTrade" || event === "demoTradeOpened") { const d = { ...data, _lastUp: Date.now() }; setDemoTrades(p => p.find(t => t.id === d.id) ? p : [d, ...p].slice(0, 500)); return; }
+         if (event === "demoTradeUpdate") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...t, ...data, _lastUp: Date.now() } : t)); return; }
+         if (event === "demoTradeClosed") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...data, _lastUp: Date.now() } : t)); return; }
+         if (event === "newRealTrade" || event === "realTradeOpened") { const d = { ...data, _lastUp: Date.now() }; setRealTrades(p => p.find(t => t.id === d.id) ? p : [d, ...p].slice(0, 200)); return; }
+         if (event === "realTradeUpdate") { setRealTrades(p => p.map(t => t.id === data.id ? { ...t, ...data, _lastUp: Date.now() } : t)); return; }
+         if (event === "realTradeClosed") { setRealTrades(p => p.map(t => t.id === data.id ? { ...data, _lastUp: Date.now() } : t)); return; }
          if (event === "newMovement") { setMovements(p => [...p, data]); return; }
          if (event === "movementDeleted") { setMovements(p => p.filter(m => m.id !== data.id)); return; }
          if (event === "log") { setLog(p => [data, ...p].slice(0, 200)); return; }
@@ -89,8 +89,10 @@ function StrategyBadge({ strategy }) {
  const map = {
    migration:   { label: "🌉 MIG",   color: "#facc15", bg: "#3b2f00" },
    momentum:    { label: "⚡ MOM",   color: "#a78bfa", bg: "#2d1b69" },
+   reentry:     { label: "🔄 RE",    color: "#38bdf8", bg: "#082f3f" },
+   fuerza:      { label: "⚡ FZ",    color: "#f472b6", bg: "#3f0a24" },
  };
- const s = map[strategy] || map.momentum;
+ const s = map[strategy] || { label: (strategy||"?").toUpperCase(), color: "#94a3b8", bg: "#1e2d40" };
  return (
    <span style={{ fontSize: 9, fontFamily: "monospace", color: s.color, background: s.bg, padding: "1px 5px", borderRadius: 6 }}>
      {s.label}
@@ -100,6 +102,12 @@ function StrategyBadge({ strategy }) {
 
 function TradeCard({ trade, isReal }) {
  const isOpen = trade.status === "OPEN";
+ const sym = trade.symbol && trade.symbol !== "???" ? trade.symbol : `${(trade.mint||"").slice(0,6)}…`;
+ const slPct = trade.slPct ?? (trade.sl && trade.entryPrice ? ((trade.sl / trade.entryPrice) - 1) * 100 : null);
+ const beat = isOpen && trade._lastUp ? Math.floor((Date.now() - trade._lastUp) / 1000) : null;
+ const beatFrio = beat !== null && beat > 45;
+ const restanteMs = isOpen && trade.expiresAt ? Math.max(0, trade.expiresAt - Date.now()) : null;
+ const restante = restanteMs !== null ? `${Math.floor(restanteMs/60000)}m` : null;
  const isWin = trade.result === "WIN";
  const isLoss = trade.result === "LOSS";
  const color = isOpen ? (isReal ? "#f97316" : "#38bdf8") : isWin ? "#22c55e" : isLoss ? "#ef4444" : "#64748b";
@@ -108,7 +116,7 @@ function TradeCard({ trade, isReal }) {
    <div style={{ background: "#0d1117", border: `1px solid ${color}${isOpen?"55":"33"}`, borderRadius: 10, padding: "10px 14px" }}>
      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-         <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{trade.symbol}</span>
+         <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{sym}</span>
          <span style={{ fontSize: 10, color, fontWeight: 700, background: `${color}22`, padding: "1px 6px", borderRadius: 10, fontFamily: "monospace" }}>{statusLabel}</span>
          <StrategyBadge strategy={trade.strategy} />
        </div>
@@ -119,10 +127,11 @@ function TradeCard({ trade, isReal }) {
          { label: "Actual", value: `${(trade.currentPct||0)>0?"+":""}${(trade.currentPct||0).toFixed(1)}%`, color: pctColor(trade.currentPct||0) },
          { label: "Max ↑", value: `+${(trade.maxGainPct||0).toFixed(1)}%`, color: "#22c55e" },
          { label: "Min ↓", value: `${(trade.maxLossPct||0).toFixed(1)}%`, color: "#ef4444" },
+         { label: "🛑 SL", value: slPct === null ? "—" : `${slPct >= 0 ? "+" : ""}${slPct.toFixed(1)}%`, color: slPct === null ? "#64748b" : slPct >= 0 ? "#22c55e" : "#ef4444" },
          { label: "Trailing", value: trade.trailingPhase||"INITIAL", color: trade.trailingPhase !== "INITIAL" ? "#facc15" : "#64748b" },
          { label: isOpen ? "⏱️" : "Dur", value: isOpen ? elapsed(trade.openTime) : `${Math.round(((trade.closeTime||Date.now())-trade.openTime)/1000)}s`, color: "#94a3b8" },
        ].map((m, i) => (
-         <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 4 ? "1px solid #1e2d40" : "none" }}>
+         <div key={i} style={{ flex: 1, padding: "5px 4px", textAlign: "center", borderRight: i < 5 ? "1px solid #1e2d40" : "none" }}>
            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 2 }}>{m.label}</div>
            <div style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 700, color: m.color }}>{m.value}</div>
          </div>
@@ -131,7 +140,15 @@ function TradeCard({ trade, isReal }) {
      {!isOpen && <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 4 }}>P&L: <span style={{ color: pctColor(trade.pnlPct||0) }}>{(trade.pnlPct||0)>0?"+":""}{(trade.pnlPct||0).toFixed(2)}%</span>{isReal && trade.pnlSol !== null && <span style={{ color: pctColor(trade.pnlSol||0), marginLeft: 8 }}>{(trade.pnlSol||0)>0?"+":""}{(trade.pnlSol||0).toFixed(4)} SOL</span>}</div>}
      {isReal && trade.buySignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 2 }}>Buy: <a href={`https://solscan.io/tx/${trade.buySignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.buySignature.slice(0,12)}…</a></div>}
      {isReal && trade.sellSignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 4 }}>Sell: <a href={`https://solscan.io/tx/${trade.sellSignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.sellSignature.slice(0,12)}…</a></div>}
-     <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
+     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+       <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
+       {isOpen && (
+         <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 9 }}>
+           {restante !== null && <span style={{ color: restanteMs < 300000 ? "#facc15" : "#475569" }}>⏳ {restante}</span>}
+           <span style={{ color: beatFrio ? "#f97316" : "#475569" }}>📶 {beat === null ? "—" : `${beat}s`}{beatFrio ? " 🥶" : ""}</span>
+         </div>
+       )}
+     </div>
    </div>
  );
 }
@@ -159,7 +176,7 @@ function FilterBar({ statusFilter, setStatusFilter, stratFilter, setStratFilter,
        ))}
      </div>
      <div style={{ display: "flex", gap: 6 }}>
-       {[{ id: "all", label: "Todas" }, { id: "migration", label: "🌉" }, { id: "momentum", label: "⚡" }].map(f => (
+       {[{ id: "all", label: "Todas" }, { id: "migration", label: "🌉" }, { id: "reentry", label: "🔄" }, { id: "fuerza", label: "⚡" }].map(f => (
          <button key={f.id} onClick={() => setStratFilter(f.id)} style={{ flex: 1, padding: "5px", border: `1px solid ${stratFilter === f.id ? "#94a3b8" : "#1e2d40"}`, borderRadius: 8, background: stratFilter === f.id ? "#1e2d4055" : "none", color: stratFilter === f.id ? "#f1f5f9" : "#64748b", fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>
            {f.label}
          </button>
@@ -526,7 +543,11 @@ export default function App() {
  });
 
  const migDemoOpen = demoTrades.filter(t => t.status === "OPEN" && t.strategy === "migration").length;
- const momDemoOpen = demoTrades.filter(t => t.status === "OPEN" && t.strategy === "momentum").length;
+ const reFzOpen = demoTrades.filter(t => t.status === "OPEN" && (t.strategy === "reentry" || t.strategy === "fuerza")).length;
+ const reFzTrades = demoTrades.filter(t => t.strategy === "reentry" || t.strategy === "fuerza");
+ const hoyKey = toDateKey(Date.now());
+ const cerradasHoy = demoTrades.filter(t => t.status !== "OPEN" && t.closeTime && toDateKey(t.closeTime) === hoyKey);
+ const hoyNeto = cerradasHoy.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
 
  return (
    <div style={{ background: "#080c14", minHeight: "100dvh", color: "#e2e8f0", fontFamily: "sans-serif", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto" }}>
@@ -553,7 +574,7 @@ export default function App() {
        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
          {[
            { label: "🌉 MIG W%", val: `${migWR}%`, color: migWR >= 50 ? "#22c55e" : "#ef4444" },
-           { label: "⚡ MOM W%", val: `${momWR}%`, color: momWR >= 50 ? "#22c55e" : "#ef4444" },
+           { label: `☀️ HOY (${cerradasHoy.length})`, val: `${hoyNeto >= 0 ? "+" : ""}${hoyNeto.toFixed(2)}`, color: pctColor(hoyNeto) },
            { label: "💰 DEMO", val: `${((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0)) >= 0 ? "+" : ""}${Math.round((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0))}%`, color: ((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0)) >= 0 ? "#22c55e" : "#ef4444" },
            { label: "🔴 REAL", val: `${totalPnlSol >= 0 ? "+" : ""}${totalPnlSol.toFixed(3)}`, color: pctColor(totalPnlSol) },
          ].map(s => (
@@ -569,7 +590,7 @@ export default function App() {
      <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40", overflowX: "auto" }}>
        {[
          { id: "migration", label: "🌉 Mig", badge: migWatching.length + migMonitored.length, accent: "#facc15" },
-         { id: "momentum", label: "⚡ Mom", badge: momMonitored.length, accent: "#a78bfa" },
+         { id: "momentum", label: "🔄⚡ Re/Fz", badge: reFzOpen, accent: "#a78bfa" },
          { id: "signals", label: "🎯", badge: signals.length, accent: "#38bdf8" },
          { id: "demo", label: "💰 Demo", badge: (stats.demoOpen||0) },
          { id: "real", label: "🔴 Real", badge: (stats.realOpen||0), accent: "#f97316" },
@@ -626,24 +647,30 @@ export default function App() {
 
        {tab === "momentum" && (
          <>
-           {momMonitored.length > 0 && (
-             <div style={{ background: "#0d1117", border: "1px solid #a78bfa44", borderRadius: 10, padding: 12 }}>
-               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#a78bfa", marginBottom: 8, fontWeight: 700 }}>⚡ MOMENTUM ACTIVO ({momMonitored.length})</div>
-               {momMonitored.map(t => (
-                 <div key={t.mint} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: "1px solid #1e2d4044" }}>
-                   <div>
-                     <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: "#f1f5f9" }}>{t.symbol}</span>
-                     <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginLeft: 8 }}>{formatMC(t.mc)}</span>
+           <div style={{ background: "#0d1117", border: "1px solid #a78bfa44", borderRadius: 10, padding: 12 }}>
+             <div style={{ fontFamily: "monospace", fontSize: 11, color: "#a78bfa", marginBottom: 8, fontWeight: 700 }}>🔄⚡ RE-ENTRADAS Y FUERZAS</div>
+             <div style={{ display: "flex", justifyContent: "space-around" }}>
+               {(() => {
+                 const cerradas = reFzTrades.filter(t => t.status !== "OPEN");
+                 const neto = cerradas.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
+                 const re = reFzTrades.filter(t => t.strategy === "reentry").length;
+                 const fz = reFzTrades.filter(t => t.strategy === "fuerza").length;
+                 return [
+                   { label: "Abiertas", val: reFzOpen, color: "#a78bfa" },
+                   { label: "🔄 RE", val: re, color: "#38bdf8" },
+                   { label: "⚡ FZ", val: fz, color: "#f472b6" },
+                   { label: "Neto SOL", val: `${neto >= 0 ? "+" : ""}${neto.toFixed(2)}`, color: pctColor(neto) },
+                 ].map(s => (
+                   <div key={s.label} style={{ textAlign: "center" }}>
+                     <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: s.color }}>{s.val}</div>
+                     <div style={{ fontSize: 9, color: "#64748b" }}>{s.label}</div>
                    </div>
-                   <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 11 }}>
-                     <span style={{ color: "#22c55e" }}>+{(t.pct1h||0).toFixed(1)}%</span>
-                     <span style={{ color: "#64748b" }}>{elapsed(t.detectedAt)}</span>
-                   </div>
-                 </div>
-               ))}
+                 ));
+               })()}
              </div>
-           )}
-           {momMonitored.length === 0 && <EmptyState icon="⚡" text="Escaneando tokens con momentum…" />}
+           </div>
+           {reFzTrades.length === 0 && <EmptyState icon="🔄" text="Las re-entradas (cazadora de resurrecciones) y las fuerzas (persecución de breakouts) aparecerán aquí…" />}
+           {[...reFzTrades.filter(t => t.status === "OPEN"), ...reFzTrades.filter(t => t.status !== "OPEN")].slice(0, 60).map(t => <TradeCard key={t.id} trade={t} isReal={false} />)}
          </>
        )}
 
@@ -678,8 +705,8 @@ export default function App() {
                <div style={{ fontSize: 9, color: "#64748b" }}>🌉 Mig abiertas</div>
              </div>
              <div style={{ flex: 1, background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
-               <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#a78bfa" }}>{momDemoOpen}</div>
-               <div style={{ fontSize: 9, color: "#64748b" }}>⚡ Mom abiertas</div>
+               <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#a78bfa" }}>{reFzOpen}</div>
+               <div style={{ fontSize: 9, color: "#64748b" }}>🔄⚡ Re/Fz abiertas</div>
              </div>
              <div style={{ flex: 1, background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
                <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{demoTrades.filter(t => t.status !== "OPEN").length}</div>
