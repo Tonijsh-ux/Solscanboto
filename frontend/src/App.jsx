@@ -847,22 +847,29 @@ export default function App() {
              )}
            </div>
 
-           <div style={{ background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 10, padding: 14 }}>
-             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#a78bfa", marginBottom: 10, fontWeight: 700 }}>⚡ MOMENTUM</div>
-             <StatsRow label="Señales" val={stats.mom_signals||0} color="#a78bfa" />
-             <StatsRow label="Entradas reales" val={stats.mom_entered||0} color="#22c55e" desc="Pasaron todos los filtros y abrieron operación" />
-             <StatsRow label="↳ Descartadas liquidez" val={stats.mom_disc_liquidity||0} color="#64748b" desc="Capa 1: liquidez baja/desconocida" />
-             <StatsRow label="↳ Descartadas drift" val={stats.mom_disc_drift||0} color="#64748b" desc="Precio ya movido >4% al entrar" />
-             <StatsRow label="↳ Descartadas mudo" val={stats.mom_disc_mute||0} color="#64748b" desc="Capa 2: precio congelado en entrada" />
-             <StatsRow label="↳ Sin precio" val={stats.mom_disc_noprice||0} color="#64748b" desc="Birdeye no devolvió precio" />
-             <StatsRow label="Expiradas mudas" val={stats.mom_demoExpired||0} color="#eab308" desc="Entraron pero murieron a 0.0%" />
-             <StatsRow label="Demo Wins" val={stats.mom_demoWins||0} color="#22c55e" />
-             <StatsRow label="Demo Losses" val={stats.mom_demoLosses||0} color="#ef4444" />
-             <StatsRow label="Win Rate" val={`${momWR}%`} color={momWR >= 50 ? "#22c55e" : "#ef4444"} />
-             <StatsRow label="P&L Demo" val={`${(stats.mom_demoPnL||0)>=0?"+":""}${Math.round(stats.mom_demoPnL||0)}%`} color={pctColor(stats.mom_demoPnL||0)} />
-             <StatsRow label="Ganancia máx media" val={`+${(stats.mom_avgMaxGain||0).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
-             <StatsRow label="Pérdida máx media" val={`-${(stats.mom_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
-           </div>
+           {(() => {
+             const calc = (strat) => {
+               const v = demoTrades.filter(t => t.strategy === strat && t.status !== "OPEN");
+               const w = v.filter(t => (t.pnlPct || 0) > 0).length;
+               const neto = v.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
+               const media = v.length ? v.reduce((s, t) => s + (t.pnlPct || 0), 0) / v.length : 0;
+               return { n: v.length, w, l: v.length - w, wr: v.length ? Math.round(w / v.length * 100) : 0, neto, media };
+             };
+             const re = calc("reentry"), fz = calc("fuerza");
+             return (
+               <div style={{ background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 10, padding: 14 }}>
+                 <div style={{ fontFamily: "monospace", fontSize: 12, color: "#a78bfa", marginBottom: 10, fontWeight: 700 }}>🔄⚡ RE-ENTRADA Y FUERZA (demo, en vivo)</div>
+                 <StatsRow label="🔄 RE cerradas" val={re.n} color="#38bdf8" />
+                 <StatsRow label="🔄 W / L" val={`${re.w} / ${re.l}`} color={re.wr >= 50 ? "#22c55e" : "#ef4444"} />
+                 <StatsRow label="🔄 Media bruta" val={`${re.media >= 0 ? "+" : ""}${re.media.toFixed(1)}%`} color={pctColor(re.media)} desc="La cazadora de resurrecciones: pocas balas, piezas grandes" />
+                 <StatsRow label="🔄 Neto" val={`${re.neto >= 0 ? "+" : ""}${re.neto.toFixed(2)} SOL`} color={pctColor(re.neto)} desc="Fricción 4.5% restada" />
+                 <StatsRow label="⚡ FZ cerradas" val={fz.n} color="#f472b6" />
+                 <StatsRow label="⚡ W / L" val={`${fz.w} / ${fz.l}`} color={fz.wr >= 50 ? "#22c55e" : "#ef4444"} />
+                 <StatsRow label="⚡ Media bruta" val={`${fz.media >= 0 ? "+" : ""}${fz.media.toFixed(1)}%`} color={pctColor(fz.media)} desc="Muchos peajes de -15 a cambio de premios raros enormes" />
+                 <StatsRow label="⚡ Neto" val={`${fz.neto >= 0 ? "+" : ""}${fz.neto.toFixed(2)} SOL`} color={pctColor(fz.neto)} desc="No juzgar antes de ~100 disparos con feed sano (v11.5e+)" />
+               </div>
+             );
+           })()}
 
            <div style={{ background: "#0d1117", border: "1px solid #f9741633", borderRadius: 10, padding: 14 }}>
              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#f97316", marginBottom: 10, fontWeight: 700 }}>🔴 REAL</div>
