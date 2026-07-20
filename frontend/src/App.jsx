@@ -31,6 +31,7 @@ function useBackend() {
  const [movements, setMovements] = useState([]);
  const [log, setLog] = useState([]);
  const [stats, setStats] = useState({});
+ const [shadow, setShadow] = useState(null);
  const [wsStatus, setWsStatus] = useState("connecting");
 
  useEffect(() => {
@@ -52,10 +53,12 @@ function useBackend() {
            setMovements(data.movements || []);
            setLog(data.log || []);
            setStats(data.stats || {});
+           setShadow(data.shadow || null);
            setWsStatus(data.wsStatus || "connected");
            return;
          }
          if (event === "stats") { setStats(data); return; }
+         if (event === "shadow") { setShadow(data); return; }
          if (event === "migWatchUpdate") { setMigWatching(p => p.map(w => w.mint === data.mint ? { ...w, ...data } : w)); return; }
          if (event === "newMigToken") { setMigMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
          if (event === "migTokenUpdate") { setMigMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
@@ -81,7 +84,7 @@ function useBackend() {
    return () => { ws?.close(); clearTimeout(t); };
  }, []);
 
- return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, wsStatus };
+ return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus };
 }
 
 // ── COMPONENTES ────────────────────────────────────────────────
@@ -504,7 +507,7 @@ function Calendar({ realTrades, movements, setMovements }) {
 
 // ── APP PRINCIPAL ──────────────────────────────────────────────
 export default function App() {
- const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, wsStatus } = useBackend();
+ const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus } = useBackend();
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
  const [demoStratFilter, setDemoStratFilter] = useState("all");
@@ -519,16 +522,8 @@ export default function App() {
 
  const migWR = (stats.mig_demoWins||0) + (stats.mig_demoLosses||0) > 0 ? Math.round((stats.mig_demoWins||0) / ((stats.mig_demoWins||0) + (stats.mig_demoLosses||0)) * 100) : 0;
  const momWR = (stats.mom_demoWins||0) + (stats.mom_demoLosses||0) > 0 ? Math.round((stats.mom_demoWins||0) / ((stats.mom_demoWins||0) + (stats.mom_demoLosses||0)) * 100) : 0;
- const movWR = (w, l) => (w + l) > 0 ? Math.round(w / (w + l) * 100) : null;
- const movUpWR = movWR(stats.mig_mov_up_win||0, stats.mig_mov_up_loss||0);
- const movFlatWR = movWR(stats.mig_mov_flat_win||0, stats.mig_mov_flat_loss||0);
- const movDownWR = movWR(stats.mig_mov_down_win||0, stats.mig_mov_down_loss||0);
- const movTotal = (stats.mig_mov_up_win||0)+(stats.mig_mov_up_loss||0)+(stats.mig_mov_flat_win||0)+(stats.mig_mov_flat_loss||0)+(stats.mig_mov_down_win||0)+(stats.mig_mov_down_loss||0);
  const totalPnlSol = (stats.mig_realPnLSol||0) + (stats.mom_realPnLSol||0);
 
- // Abortos: totales y % de acierto del filtro
- const abortTotal = (stats.abort_correct||0) + (stats.abort_missed||0);
- const abortAccuracy = abortTotal > 0 ? Math.round((stats.abort_correct||0) / abortTotal * 100) : 0;
 
  const filteredDemo = demoTrades.filter(t => {
    const statusOk = demoStatusFilter === "all" ? true : demoStatusFilter === "open" ? t.status === "OPEN" : t.status !== "OPEN";
@@ -594,6 +589,7 @@ export default function App() {
          { id: "signals", label: "🎯", badge: signals.length, accent: "#38bdf8" },
          { id: "demo", label: "💰 Demo", badge: (stats.demoOpen||0) },
          { id: "real", label: "🔴 Real", badge: (stats.realOpen||0), accent: "#f97316" },
+         { id: "shadow", label: "🏟️", badge: shadow?.n || 0, accent: "#facc15" },
          { id: "stats", label: "📈" },
          { id: "calendar", label: "📅" },
          { id: "log", label: "📋" },
@@ -743,6 +739,83 @@ export default function App() {
          </>
        )}
 
+       {tab === "shadow" && (
+         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+           {(!shadow || !shadow.n) && <EmptyState icon="🏟️" text="El torneo de sombras empieza a puntuar con las próximas grabaciones… (cada op se re-juega contra 6 configs, fuera-de-muestra desde el alta)" />}
+           {shadow && shadow.n > 0 && (() => {
+             const filas = Object.entries(shadow.libretas || {}).map(([id, L]) => ({ id, ...L, wr: L.n ? Math.round(100 * L.w / L.n) : 0, media: L.n ? L.neto / L.n * 1000 : 0 })).sort((a, b) => b.neto - a.neto);
+             const maxAbs = Math.max(...filas.map(f => Math.abs(f.neto)), 0.01);
+             const horas = Array.from({ length: 24 }, (_, h) => ({ h, ...(shadow.horas?.[h] || { n: 0, neto: 0 }) }));
+             const maxH = Math.max(...horas.map(x => Math.abs(x.neto)), 0.01);
+             const dnom = ["dom","lun","mar","mié","jue","vie","sáb"];
+             const dias = Array.from({ length: 7 }, (_, d) => ({ d, nom: dnom[d], ...(shadow.dias?.[d] || { n: 0, neto: 0 }) }));
+             const segs = Array.from({ length: 11 }, (_, s) => ({ s, ...(shadow.delays?.[s] || { n: 0, neto: 0 }) })).map(x => ({ ...x, m: x.n ? x.neto / x.n * 1000 : 0 }));
+             const maxS = Math.max(...segs.map(x => Math.abs(x.m)), 1);
+             return (
+               <>
+                 <div style={{ background: "#0d1117", border: "1px solid #facc1544", borderRadius: 10, padding: 12 }}>
+                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                     <span style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", fontWeight: 700 }}>🏟️ CLASIFICACIÓN</span>
+                     <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>n={shadow.n} · desde {new Date(shadow.alta).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" })}</span>
+                   </div>
+                   {filas.map((f, i) => (
+                     <div key={f.id} style={{ marginBottom: 6 }}>
+                       <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 11, marginBottom: 2 }}>
+                         <span style={{ color: "#f1f5f9" }}>{i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : ""}{f.id}{f.id === "sofa" ? " ⭐" : ""}</span>
+                         <span style={{ color: pctColor(f.neto), fontWeight: 700 }}>{f.neto >= 0 ? "+" : ""}{f.neto.toFixed(2)} SOL <span style={{ color: "#64748b", fontWeight: 400 }}>· {f.wr}% · {f.media.toFixed(0)}m/op</span></span>
+                       </div>
+                       <div style={{ height: 5, background: "#1e2d40", borderRadius: 3, overflow: "hidden" }}>
+                         <div style={{ height: "100%", width: `${Math.abs(f.neto) / maxAbs * 100}%`, background: f.neto >= 0 ? "#22c55e" : "#ef4444", borderRadius: 3 }} />
+                       </div>
+                     </div>
+                   ))}
+                 </div>
+                 <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 12 }}>
+                   <div style={{ fontFamily: "monospace", fontSize: 11, color: "#38bdf8", fontWeight: 700, marginBottom: 8 }}>🕐 POR HORA (ES) — neto sofá</div>
+                   <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 3 }}>
+                     {horas.map(x => {
+                       const inten = Math.min(1, Math.abs(x.neto) / maxH);
+                       const bg = x.n < 3 ? "#111827" : x.neto >= 0 ? `rgba(34,197,94,${0.12 + inten * 0.5})` : `rgba(239,68,68,${0.12 + inten * 0.5})`;
+                       return (
+                         <div key={x.h} style={{ background: bg, borderRadius: 6, padding: "5px 2px", textAlign: "center" }}>
+                           <div style={{ fontFamily: "monospace", fontSize: 9, color: "#94a3b8" }}>{x.h}h</div>
+                           <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, color: x.n < 3 ? "#475569" : pctColor(x.neto) }}>{x.n < 3 ? "·" : `${x.neto >= 0 ? "+" : ""}${x.neto.toFixed(1)}`}</div>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </div>
+                 <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 12 }}>
+                   <div style={{ fontFamily: "monospace", fontSize: 11, color: "#a78bfa", fontWeight: 700, marginBottom: 8 }}>📆 POR DÍA DE LA SEMANA</div>
+                   <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3 }}>
+                     {dias.map(x => (
+                       <div key={x.d} style={{ background: "#111827", borderRadius: 6, padding: "5px 2px", textAlign: "center" }}>
+                         <div style={{ fontFamily: "monospace", fontSize: 9, color: "#94a3b8" }}>{x.nom}</div>
+                         <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, color: x.n ? pctColor(x.neto) : "#475569" }}>{x.n ? `${x.neto >= 0 ? "+" : ""}${x.neto.toFixed(1)}` : "·"}</div>
+                         <div style={{ fontFamily: "monospace", fontSize: 8, color: "#475569" }}>{x.n || ""}</div>
+                       </div>
+                     ))}
+                   </div>
+                 </div>
+                 <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 12 }}>
+                   <div style={{ fontFamily: "monospace", fontSize: 11, color: "#f472b6", fontWeight: 700, marginBottom: 8 }}>⏱️ ESCALERA s0-s10 — mSOL/op entrando en cada segundo</div>
+                   {segs.map(x => (
+                     <div key={x.s} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                       <span style={{ fontFamily: "monospace", fontSize: 9, color: x.s === 0 ? "#38bdf8" : "#64748b", width: 22, fontWeight: x.s === 0 ? 700 : 400 }}>s{x.s}</span>
+                       <div style={{ flex: 1, height: 7, background: "#1e2d40", borderRadius: 3, overflow: "hidden" }}>
+                         <div style={{ height: "100%", width: `${Math.abs(x.m) / maxS * 100}%`, background: x.m >= 0 ? (x.s === 0 ? "#38bdf8" : "#22c55e") : "#ef4444", borderRadius: 3 }} />
+                       </div>
+                       <span style={{ fontFamily: "monospace", fontSize: 9, color: pctColor(x.m), width: 40, textAlign: "right", fontWeight: 700 }}>{x.m >= 0 ? "+" : ""}{x.m.toFixed(0)}</span>
+                     </div>
+                   ))}
+                   <div style={{ fontSize: 9, color: "#475569", marginTop: 6 }}>Solo pata migración, config sofá. El s0 azul es la entrada real del bot.</div>
+                 </div>
+               </>
+             );
+           })()}
+         </div>
+       )}
+
        {tab === "stats" && (
          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
            {/* Gráfico P&L */}
@@ -766,85 +839,6 @@ export default function App() {
              <StatsRow label="P&L Demo" val={`${(stats.mig_demoPnL||0)>=0?"+":""}${Math.round(stats.mig_demoPnL||0)}%`} color={pctColor(stats.mig_demoPnL||0)} />
              <StatsRow label="Ganancia máx media" val={`+${(stats.mig_avgMaxGain||0).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
              <StatsRow label="Pérdida máx media" val={`-${(stats.mig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
-           </div>
-
-           {/* ── ABORTOS (instrumentación de filtros de entrada) ── */}
-           <div style={{ background: "#0d1117", border: "1px solid #38bdf833", borderRadius: 10, padding: 14 }}>
-             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#38bdf8", marginBottom: 4, fontWeight: 700 }}>🔭 ABORTOS (filtros de entrada)</div>
-             <div style={{ fontSize: 10, color: "#475569", marginBottom: 10 }}>¿Los filtros aciertan o cuestan ganadores? (5 min de observación tras abortar)</div>
-             {abortTotal === 0 ? (
-               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Sin abortos evaluados todavía</div>
-             ) : (
-               <>
-                 <StatsRow label="✅ Correctos" val={stats.abort_correct||0} color="#22c55e" desc="El token cayó o quedó plano: filtro acertó" />
-                 <StatsRow label="❌ Erróneos" val={stats.abort_missed||0} color="#ef4444" desc="Subió +20% tras abortar: ganador perdido" />
-                 <StatsRow label="Acierto del filtro" val={`${abortAccuracy}%`} color={abortAccuracy >= 70 ? "#22c55e" : abortAccuracy >= 50 ? "#facc15" : "#ef4444"} />
-                 <div style={{ marginTop: 10, padding: "8px 0", borderTop: "1px solid #1e2d40" }}>
-                   <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 8 }}>DESGLOSE POR MOTIVO (correcto / erróneo)</div>
-                   {[
-                     { motivo: "📉 Bajista", c: stats.abort_correct_bajista||0, m: stats.abort_missed_bajista||0, hint: "trend < 0 en 5s" },
-                     { motivo: "⬇️ Vertical", c: stats.abort_correct_vertical||0, m: stats.abort_missed_vertical||0, hint: "colapso >15% desde pico" },
-                     { motivo: "⏱️ Delay", c: stats.abort_correct_delay||0, m: stats.abort_missed_delay||0, hint: "cayó >5% en 3s" },
-                   ].map(r => {
-                     const tot = r.c + r.m;
-                     const badRatio = tot > 0 ? r.m / tot : 0;
-                     return (
-                       <div key={r.motivo} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderBottom: "1px solid #1e2d4044" }}>
-                         <div>
-                           <span style={{ fontSize: 11, color: "#94a3b8" }}>{r.motivo}</span>
-                           <span style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", marginLeft: 6 }}>{r.hint}</span>
-                         </div>
-                         <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 11 }}>
-                           <span style={{ color: "#22c55e" }}>{r.c}</span>
-                           <span style={{ color: "#475569" }}>/</span>
-                           <span style={{ color: r.m > 0 && badRatio >= 0.5 ? "#ef4444" : "#64748b" }}>{r.m}</span>
-                         </div>
-                       </div>
-                     );
-                   })}
-                 </div>
-                 {(stats.abort_missed_bajista||0) > (stats.abort_missed_vertical||0) + (stats.abort_missed_delay||0) && (stats.abort_missed_bajista||0) >= 2 && (
-                   <div style={{ marginTop: 8, padding: "8px 10px", background: "#1f1500", border: "1px solid #facc1533", borderRadius: 8, fontSize: 10, color: "#facc15", lineHeight: 1.5 }}>
-                     ⚠️ El motivo "bajista" domina en los errores. El check trend &lt; 0 puede ser demasiado estricto — considerar relajarlo a trend &lt; -0.03.
-                   </div>
-                 )}
-               </>
-             )}
-           </div>
-
-           {/* ── PRIMER MOVIMIENTO (instrumentación entrada migración, v6.13 paso 2) ── */}
-           <div style={{ background: "#0d1117", border: "1px solid #facc1533", borderRadius: 10, padding: 14 }}>
-             <div style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", marginBottom: 4, fontWeight: 700 }}>🔬 PRIMER MOVIMIENTO (migración)</div>
-             <div style={{ fontSize: 10, color: "#475569", marginBottom: 10 }}>¿La dirección del precio a 2s predice el resultado? (W/L por dirección temprana)</div>
-             {movTotal === 0 ? (
-               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", textAlign: "center", padding: 10 }}>Recogiendo datos…</div>
-             ) : (
-               <>
-                 {[
-                   { label: "⬆️ Subió en 2s", w: stats.mig_mov_up_win||0, l: stats.mig_mov_up_loss||0, wr: movUpWR, hint: ">+1%" },
-                   { label: "➡️ Plano en 2s", w: stats.mig_mov_flat_win||0, l: stats.mig_mov_flat_loss||0, wr: movFlatWR, hint: "-1% a +1%" },
-                   { label: "⬇️ Bajó en 2s", w: stats.mig_mov_down_win||0, l: stats.mig_mov_down_loss||0, wr: movDownWR, hint: "<-1%" },
-                 ].map(r => (
-                   <div key={r.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "1px solid #1e2d4044" }}>
-                     <div>
-                       <span style={{ fontSize: 11, color: "#94a3b8" }}>{r.label}</span>
-                       <span style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", marginLeft: 6 }}>{r.hint}</span>
-                     </div>
-                     <div style={{ display: "flex", gap: 8, fontFamily: "monospace", fontSize: 11, alignItems: "center" }}>
-                       <span style={{ color: "#22c55e" }}>{r.w}W</span>
-                       <span style={{ color: "#ef4444" }}>{r.l}L</span>
-                       <span style={{ color: r.wr === null ? "#475569" : r.wr >= 50 ? "#22c55e" : "#ef4444", minWidth: 34, textAlign: "right" }}>{r.wr === null ? "—" : `${r.wr}%`}</span>
-                     </div>
-                   </div>
-                 ))}
-                 <div style={{ marginTop: 8, fontSize: 10, color: "#475569", fontFamily: "monospace" }}>Total clasificadas: {movTotal}</div>
-                 {movDownWR !== null && movUpWR !== null && (movDownWR + 15) < movUpWR && movTotal >= 20 && (
-                   <div style={{ marginTop: 8, padding: "8px 10px", background: "#1f1500", border: "1px solid #facc1533", borderRadius: 8, fontSize: 10, color: "#facc15", lineHeight: 1.5 }}>
-                     💡 Las que bajan en 2s ganan mucho menos que las que suben. Confirma el hallazgo: la dirección temprana predice. Con más datos, base para el filtro de entrada.
-                   </div>
-                 )}
-               </>
-             )}
            </div>
 
            {(() => {
