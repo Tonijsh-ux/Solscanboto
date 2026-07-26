@@ -2515,6 +2515,7 @@ app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }
 
 app.get("/api/state", (req, res) => {
   res.json({
+    fzJuicio: state.fzJuicio || null,
     demoTrades: state.demoTrades.slice(0, 100),
     realTrades: state.realTrades.slice(0, 100),
     signals: state.signals.slice(0, 50),
@@ -2546,6 +2547,28 @@ app.post("/api/risk/resume", (req, res) => {
 });
 
 app.get("/api/movement", (req, res) => res.json(state.movements.slice(0, 200)));
+
+// [FIX 26-jul] el calendario del panel crea y borra movimientos (retiros/depósitos)
+app.post("/api/movement", (req, res) => {
+  const { date, amount, type, note } = req.body || {};
+  if (!date || !amount || isNaN(+amount) || !["deposit", "withdrawal"].includes(type)) {
+    return res.status(400).json({ error: "date, amount y type (deposit|withdrawal) son obligatorios" });
+  }
+  const mov = { id: `mov-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, date, amount: +amount, type, note: note || "" };
+  state.movements.push(mov);
+  broadcast({ event: "newMovement", data: mov });
+  saveState();
+  res.json({ ok: true, movement: mov });
+});
+
+app.delete("/api/movement/:id", (req, res) => {
+  const idx = state.movements.findIndex(m => m.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: "movimiento no encontrado" });
+  const [mov] = state.movements.splice(idx, 1);
+  broadcast({ event: "movementDeleted", data: { id: mov.id } });
+  saveState();
+  res.json({ ok: true });
+});
 
 app.get("/export/estado", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -2579,7 +2602,9 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({ event: "init", data: {
+  ws.send(JSON.stringify({ event: "fullState", data: {   // [FIX 26-jul] el frontend escucha "fullState", no "init"
+    wsStatus: "connected",
+    fzJuicio: state.fzJuicio || null,
     demoTrades: state.demoTrades.slice(0, 100),
     realTrades: state.realTrades.slice(0, 100),
     signals: state.signals.slice(0, 50),
