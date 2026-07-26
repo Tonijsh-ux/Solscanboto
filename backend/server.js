@@ -1016,7 +1016,7 @@ async function registrarCalidadPremig(mint, symbol) {
         tbMed = +med; tbMin = +mn; newWn = newW;   // [v11.9]
         return ` topBalMed=${med} topBalMin=${mn} newW=${newW}/${owners.length} fundSpread=${spread}`;
       })();
-      hqStr = await Promise.race([pack, new Promise(r => setTimeout(() => r(""), 3500))]);
+      hqStr = await Promise.race([pack, new Promise(r => setTimeout(() => r(""), 10000))]);   // [FIX 26-jul] 3.5s→10s: con 3.5s el topBal llegaba en ~1/3 de las ops y el filtro no veía al resto; la entrada tarda 20-60s, así que hay margen de sobra
     } catch (e) { hqStr = ""; }
     premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator, hq: hqStr.trim(),
       topBalMed: tbMed, topBalMin: tbMin, newW: newWn });   // [v11.9] campos numéricos para el filtro-sombra
