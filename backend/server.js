@@ -941,6 +941,20 @@ async function registrarCalidadPremig(mint, symbol) {
   try {
     if (!connection) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=sin-conexion`, "info"); return; }
     const pk = new PublicKey(mint);
+    // [FIX 26-jul] 🌐 REDES SOCIALES del token (pump.fun): el estudio arXiv 2607.02823 (833K
+    // lanzamientos) da Telegram ×9 en probabilidad de graduar. Se consulta EN PARALELO (no
+    // retrasa nada) y alimenta solo los filtros-sombra: cero riesgo hasta que los datos hablen.
+    const socP = (async () => {
+      try {
+        const r = await fetch(`https://frontend-api-v3.pump.fun/coins/${mint}`, {
+          headers: { accept: "application/json" }, signal: AbortSignal.timeout(4000) });
+        if (!r.ok) return null;
+        const j = await r.json();
+        if (!j) return null;
+        const tg = !!j.telegram, tw = !!j.twitter, web = !!j.website;
+        return { tg, tw, web, nSoc: (tg?1:0)+(tw?1:0)+(web?1:0) };
+      } catch { return null; }
+    })();
     let before = undefined, oldest = null, total = 0, guard = 0;
     while (guard < 10) {
       guard++;
@@ -1018,9 +1032,12 @@ async function registrarCalidadPremig(mint, symbol) {
       })();
       hqStr = await Promise.race([pack, new Promise(r => setTimeout(() => r(""), 10000))]);   // [FIX 26-jul] 3.5s→10s: con 3.5s el topBal llegaba en ~1/3 de las ops y el filtro no veía al resto; la entrada tarda 20-60s, así que hay margen de sobra
     } catch (e) { hqStr = ""; }
+    const soc = await Promise.race([socP, new Promise(r => setTimeout(() => r(null), 100))]);   // [FIX 26-jul] ya debería estar resuelta (corrió en paralelo)
+    const socStr = soc ? ` socials=${soc.nSoc}${soc.nSoc ? "(" + [soc.tg?"tg":null, soc.tw?"tw":null, soc.web?"web":null].filter(Boolean).join(",") + ")" : ""}` : "";
     premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator, hq: hqStr.trim(),
-      topBalMed: tbMed, topBalMin: tbMin, newW: newWn });   // [v11.9] campos numéricos para el filtro-sombra
-    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}${hqStr}`, "info");
+      topBalMed: tbMed, topBalMin: tbMin, newW: newWn,
+      nSoc: soc ? soc.nSoc : null, tg: soc ? soc.tg : null });   // [FIX 26-jul] redes para los filtros-sombra
+    addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}${hqStr}${socStr}`, "info");
     labStats.premigOk++;
   } catch (e) {
     addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=error ${String(e).slice(0,50)}`, "info");
@@ -1563,6 +1580,9 @@ const SHADOW_GRID = [
   { id:"sofa·topBal≥1", cfg: { ...SH_SOFA, fTopBal:1 } },
   { id:"sofa·topBal≥5", cfg: { ...SH_SOFA, fTopBal:5 } },
   { id:"sofa·topBal≥2", cfg: { ...SH_SOFA, fTopBal:2 } },
+  // [FIX 26-jul] 🌐 redes: ¿"tiene socials" separa rugs de cohetes en NUESTROS datos? (arXiv: Telegram ×9 en graduación)
+  { id:"sofa·redes≥1",  cfg: { ...SH_SOFA, fSocMin:1 } },
+  { id:"sofa·tgON",     cfg: { ...SH_SOFA, fTg:true } },
   { id:"sofa+CB5/60", cfg: { ...SH_SOFA, cb:{ n:5, win:20, pausa:60 } } },
   { id:"sofa+CB5/30", cfg: { ...SH_SOFA, cb:{ n:5, win:20, pausa:30 } } },
   { id:"sofa+CB7/60", cfg: { ...SH_SOFA, cb:{ n:7, win:20, pausa:60 } } },
@@ -1578,6 +1598,15 @@ function shFiltrada(rec, cfg){
     if (tb != null && tb < cfg.fTopBal) return true;
   }
   if (cfg.fVelMax && rec.vel != null && rec.vel >= cfg.fVelMax) return true;
+  // [FIX 26-jul] 🌐 filtros de redes: fail-open (sin dato = pasa), igual que el resto
+  if (cfg.fSocMin != null){
+    const pd = premigData.get(rec.mint);
+    if (pd && pd.nSoc != null && pd.nSoc < cfg.fSocMin) return true;
+  }
+  if (cfg.fTg){
+    const pd = premigData.get(rec.mint);
+    if (pd && pd.tg === false) return true;
+  }
   if (cfg.fSin20 && ((new Date(rec.t0).getUTCHours()+REAL_TZ_OFFSET)%24) === 20) return true;
   if (cfg.fSigMin != null && rec.sigMov2s != null && rec.sigMov2s < cfg.fSigMin) return true;
   if (cfg.fTpsMax){
