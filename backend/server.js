@@ -2524,6 +2524,10 @@ app.get("/api/state", (req, res) => {
     stats: state.stats,
     risk: riskSnapshot(),
     shadow: state.shadow || null,
+    movements: state.movements.slice(0, 200),
+    historialHoras: state.historialHoras,
+    horaActual: state.horaActual, horaPnlSol: state.horaPnlSol, horaOps: state.horaOps,
+    diaPnlSol: state.diaPnlSol, diaOps: state.diaOps, diaInicio: state.diaInicio,
     demoOnly: DEMO_ONLY,
     observerMode: OBSERVER_MODE || MC_OBSERVER,
   });
@@ -2585,6 +2589,10 @@ wss.on("connection", (ws) => {
     stats: state.stats,
     risk: riskSnapshot(),
     shadow: state.shadow || null,
+    movements: state.movements.slice(0, 200),
+    historialHoras: state.historialHoras,
+    horaActual: state.horaActual, horaPnlSol: state.horaPnlSol, horaOps: state.horaOps,
+    diaPnlSol: state.diaPnlSol, diaOps: state.diaOps, diaInicio: state.diaInicio,
     demoOnly: DEMO_ONLY,
     observerMode: OBSERVER_MODE || MC_OBSERVER,
   }}));
