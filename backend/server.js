@@ -1033,6 +1033,9 @@ async function registrarCalidadPremig(mint, symbol) {
       hqStr = await Promise.race([pack, new Promise(r => setTimeout(() => r(""), 10000))]);   // [FIX 26-jul] 3.5s→10s: con 3.5s el topBal llegaba en ~1/3 de las ops y el filtro no veía al resto; la entrada tarda 20-60s, así que hay margen de sobra
     } catch (e) { hqStr = ""; }
     const soc = await Promise.race([socP, new Promise(r => setTimeout(() => r(null), 100))]);   // [FIX 26-jul] ya debería estar resuelta (corrió en paralelo)
+    // [FIX 27-jul] si pump.fun aún no respondió cuando el PREMIG acaba (tokens con PREMIG rápido),
+    // no perder el dato: se parchea en premigData cuando llegue — las sombras lo leen 30 min después
+    socP.then(s2 => { if (s2) { const pd0 = premigData.get(mint); if (pd0 && pd0.nSoc == null) { pd0.nSoc = s2.nSoc; pd0.tg = s2.tg; } } }).catch(() => {});
     const socStr = soc ? ` socials=${soc.nSoc}${soc.nSoc ? "(" + [soc.tg?"tg":null, soc.tw?"tw":null, soc.web?"web":null].filter(Boolean).join(",") + ")" : ""}` : "";
     premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator, hq: hqStr.trim(),
       topBalMed: tbMed, topBalMin: tbMin, newW: newWn,
@@ -1419,7 +1422,7 @@ function updateReentryTrades(mint, price) {
     if (trade.maxGainPct >= REENTRY_ARM) {
       const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
       const cand = peakPrice * (1 - REENTRY_TRAIL);
-      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
     }
     if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
     else if (price <= trade.sl) {
@@ -1444,7 +1447,7 @@ function updateReentryTrades(mint, price) {
     if (trade.maxGainPct >= REENTRY_ARM) {
       const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
       const cand = peakPrice * (1 - REENTRY_TRAIL);
-      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
     }
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
@@ -1495,7 +1498,7 @@ function updateFuerzaTrades(mint, price) {
     if (trade.maxGainPct >= FZ_ARM) {
       const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
       const cand = peakPrice * (1 - FZ_TRAIL);
-      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
     }
     if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
     else if (price <= trade.sl) {
@@ -1516,7 +1519,7 @@ function updateFuerzaTrades(mint, price) {
     if (trade.maxGainPct >= FZ_ARM) {
       const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
       const cand = peakPrice * (1 - FZ_TRAIL);
-      if (cand > trade.sl) trade.sl = +cand.toFixed(12);
+      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
     }
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
@@ -1784,6 +1787,17 @@ function liveRecFinish(mint, cierreRealPct) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished) return;
   if (rec.cierreDemo == null) rec.cierreDemo = cierreRealPct;
+  // [FIX 27-jul] 🐛 ARMAR LA FUERZA: fzArmed/fzTrigPct se leían en liveRecSample pero nadie
+  // los escribía — la estrategia era una pistola sin percutor (jamás podía disparar, ni con
+  // FZ_ON=true). Se arma aquí, al cerrar la pata de migración: disparo si el precio supera
+  // el máximo visto hasta ahora en un +FZ_MARGIN (mismo criterio que el shFz del torneo).
+  if (!rec.fzArmed) {
+    let maxP = -1e9;
+    for (const q of rec.puntos) if (q.p > maxP) maxP = q.p;
+    rec.fzTrigPct = +(((1 + maxP / 100) * (1 + FZ_MARGIN) - 1) * 100).toFixed(1);
+    rec.fzArmed = true;
+    if (FZ_ON) addLog(`⚡ FUERZA armada: ${rec.symbol} — disparo si supera +${rec.fzTrigPct}% (máx visto ${maxP.toFixed(0)}% × margen ${FZ_MARGIN*100}%)`, "info");
+  }
   const restante = (rec.t0 + LAB_EXTEND_MS) - Date.now();
   if (restante <= 0) { liveRecEmit(mint); return; }
   if (!rec._emitTimer) rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
@@ -2070,7 +2084,7 @@ async function openRealTrade(signal) {
   if (!buyRes) return;
 
   const trade = {
-    id: `real-${signal.strategy}-${Date.now()}`, strategy: signal.strategy,
+    id: `real-${signal.strategy}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, strategy: signal.strategy,   // [FIX 27-jul] idem
     mint: signal.mint, symbol: signal.symbol, name: signal.name,
     entryPrice: signal.price, tp: signal.tp, sl: signal.sl,
     solIn: buyRes.costSol ?? solIn, txBuy: buyRes.sig,
@@ -2116,10 +2130,10 @@ async function realRunnerConvert(trade, price) {
   trade.runnerPartialSol = sellRes.proceedsSol;
   trade.runnerPartialPct = (price - trade.entryPrice) / trade.entryPrice * 100;
   trade.trailingPhase = "RUNNER";
-  trade.sl = Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL));
+  setSL(trade, Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL)), "runner-conv");
   trade.status = "OPEN";
   addLog(`🚀 RUNNER (real): ${trade.symbol} vendido ${Math.round((1-MIG_RUNNER_FRACTION)*100)}% a +${trade.runnerPartialPct.toFixed(1)}% (${sellRes.proceedsSol} SOL) — 25% corre con trailing ${MIG_RUNNER_TRAIL*100}%`, "real");
-  broadcast({ event: "realTradeUpdate", data: { id: trade.id, trailingPhase: "RUNNER", sl: trade.sl } });
+  broadcast({ event: "realTradeUpdate", data: { id: trade.id, trailingPhase: "RUNNER", sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1) } });   // [FIX 27-jul] idem
   return true;
 }
 
@@ -2184,6 +2198,22 @@ async function closeRealTrade(trade, price, reason) {
   if (!state.demoTrades.some(t => t.mint === trade.mint && t.status === "OPEN")) migCleanup(trade.mint, trade.symbol);
 }
 
+
+// [FIX 27-jul] 📼 CAJA NEGRA DEL SL: cada cambio queda apuntado (hora, valor, motivo) en
+// trade.slHist (últimos 60). Si el SL BAJA fuera de la conversión a runner, salta un ⚠️ en el
+// log — el tripwire que responde de una vez si "el SL baja solo" es bug o es el moon-bag.
+function setSL(trade, v, tag) {
+  const old = trade.sl;
+  if (!(v !== old)) return;
+  trade.slHist = trade.slHist || [];
+  trade.slHist.push({ t: Date.now(), sl: +(+v).toFixed(12), pct: +(((v - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), tag });
+  if (trade.slHist.length > 60) trade.slHist.shift();
+  if (v < old && tag !== "runner-conv") {
+    addLog(`⚠️ [SLTRACE] SL BAJÓ fuera del runner: ${trade.symbol} [${tag}] ${(((old - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1)}% → ${(((v - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1)}%`, "warn");
+  }
+  trade.sl = v;
+}
+
 function migTrailingPct(maxGainPct) {
   if (maxGainPct >= MIG_TRAIL_T3) return MIG_TRAIL_P4;
   if (maxGainPct >= MIG_TRAIL_T2) return MIG_TRAIL_P3;
@@ -2217,7 +2247,7 @@ function updateRealTrades(mint, price, strategy) {
       const gainRatio = price / trade.entryPrice;
       if (MIG_BE_ON && trade.trailingPhase === "INITIAL" && gainRatio >= 1 + MIG_BREAKEVEN_AT) {
         trade.trailingPhase = "BREAKEVEN";
-        trade.sl = trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN);
+        setSL(trade, trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN), "breakeven");
         addLog(`🔒 BE (real): ${trade.symbol}`, "real");
       }
       if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + MIG_LOCK_AT) {
@@ -2226,15 +2256,14 @@ function updateRealTrades(mint, price, strategy) {
       if (trade.trailingPhase === "FOLLOWING") {
         const trailPct = Math.min(0.90, migTrailingPct(trade.maxGainPct) );
         const newSL = price * (1 - trailPct);
-        if (newSL > trade.sl) trade.sl = newSL;
+        if (newSL > trade.sl) setSL(trade, newSL, "trail");
         if (trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
           const stepFloor = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-          if (stepFloor > trade.sl) trade.sl = stepFloor;
+          if (stepFloor > trade.sl) setSL(trade, stepFloor, "step13");
         }
         if (trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
-          const topFloor = trade.entryPrice * (1 + MIG_TOP_FLOOR / 100 * (MIG_TOP_FLOOR_TRIGGER / 100) * 100);
-          const floor65 = trade.entryPrice * 1.65;
-          if (floor65 > trade.sl) trade.sl = floor65;
+          const floor65 = trade.entryPrice * (1 + MIG_TOP_FLOOR);   // [FIX 27-jul] limpiada la línea muerta con la fórmula enrevesada (calculaba lo mismo por casualidad)
+          if (floor65 > trade.sl) setSL(trade, floor65, "suelo65");
         }
       }
     }
@@ -2279,7 +2308,7 @@ function openDemoTrade(signal) {
   if (openCount >= 50) return;
   const sizeSol = +(SOL_PER_TRADE_MIG * factorCalor()).toFixed(2);   // [v10] tamaño por calor
   const trade = {
-    id: `demo-${signal.strategy}-${Date.now()}`, strategy: signal.strategy,
+    id: `demo-${signal.strategy}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, strategy: signal.strategy,   // [FIX 27-jul] sufijo aleatorio: dos aperturas en el mismo ms compartían id y el panel mezclaba sus tarjetas
     mint: signal.mint, symbol: signal.symbol, name: signal.name,
     entryPrice: signal.price, tp: signal.tp, sl: signal.sl,
     sizeSol,
@@ -2313,7 +2342,7 @@ function updateDemoTrades(mint, price, strategy) {
       const gainRatio = price / trade.entryPrice;
       if (MIG_BE_ON && trade.trailingPhase === "INITIAL" && gainRatio >= 1 + MIG_BREAKEVEN_AT) {
         trade.trailingPhase = "BREAKEVEN";
-        trade.sl = trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN);
+        setSL(trade, trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN), "breakeven");
       }
       if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + MIG_LOCK_AT) {
         trade.trailingPhase = "FOLLOWING";
@@ -2322,20 +2351,20 @@ function updateDemoTrades(mint, price, strategy) {
       if (trade.trailingPhase === "FOLLOWING" || trade.trailingPhase === "RUNNER") {
         if (trade.trailingPhase === "RUNNER") {
           const cand = price * (1 - MIG_RUNNER_TRAIL);
-          if (cand > trade.sl) trade.sl = cand;
+          if (cand > trade.sl) setSL(trade, cand, "runner-trail");
           const floorBE = trade.entryPrice * (1 + MIG_RUNNER_FLOOR / 100);
-          if (floorBE > trade.sl) trade.sl = floorBE;
+          if (floorBE > trade.sl) setSL(trade, floorBE, "runner-floor");
         } else {
           const trailPct = Math.min(0.90, migTrailingPct(trade.maxGainPct) );
           const newSL = price * (1 - trailPct);
-          if (newSL > trade.sl) trade.sl = newSL;
+          if (newSL > trade.sl) setSL(trade, newSL, "trail");
           if (trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
             const stepFloor = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-            if (stepFloor > trade.sl) trade.sl = stepFloor;
+            if (stepFloor > trade.sl) setSL(trade, stepFloor, "step13");
           }
           if (trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
             const floor65 = trade.entryPrice * 1.65;
-            if (floor65 > trade.sl) trade.sl = floor65;
+            if (floor65 > trade.sl) setSL(trade, floor65, "suelo65");
           }
         }
       }
@@ -2361,9 +2390,10 @@ function updateDemoTrades(mint, price, strategy) {
       trade.runnerActive = true;
       trade.runnerPartialPct = currentPct;
       trade.trailingPhase = "RUNNER";
-      trade.sl = Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL));
-      addLog(`🚀 RUNNER (demo): ${trade.symbol} asegura 75% a +${currentPct.toFixed(1)}% — 25% corre (trail ${MIG_RUNNER_TRAIL*100}%, suelo BE)`, "demo");
-      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, trailingPhase: "RUNNER", sl: trade.sl } });
+      const slAntes = trade.sl;
+      setSL(trade, Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL)), "runner-conv");
+      addLog(`🚀 RUNNER (demo): ${trade.symbol} asegura 75% a +${currentPct.toFixed(1)}% — 25% corre · SL ${((slAntes-trade.entryPrice)/trade.entryPrice*100).toFixed(0)}%→${((trade.sl-trade.entryPrice)/trade.entryPrice*100).toFixed(0)}% (trail ${MIG_RUNNER_TRAIL*100}%, suelo BE)`, "demo");
+      broadcast({ event: "demoTradeUpdate", data: { id: trade.id, trailingPhase: "RUNNER", sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1) } });   // [FIX 27-jul] slPct incluido: el panel mostraba el viejo hasta el siguiente tick
       continue;
     }
 
