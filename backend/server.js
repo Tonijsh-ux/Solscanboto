@@ -287,7 +287,7 @@ const MIG_RUNNER_FLOOR = 0;          // el runner nunca cierra por debajo de bre
 // ── MODO OBSERVADOR / GRABACIÓN EN VIVO ────────────────────────
 const OBSERVER_MODE = false;
 const LIVE_RECORD = true;
-const LIVE_REC_DENSE_MS = 60_000;
+const LIVE_REC_DENSE_MS = 180_000;   // [FIX 27-jul] 1min→3min de muestreo a 1s: el 80% de las salidas se decide ahí y el lab divergía del bot justo en esa ventana (mediana real +3.6 vs simulada -5.0)
 const LIVE_REC_DENSE_INTERVAL = 1_000;   // [v11.9] 1s el primer minuto: escalera s0-s10 exacta, gratis
 const LIVE_REC_NORMAL_INTERVAL = 5_000;
 const OBS_MIN_VOL = 2_000;
@@ -318,6 +318,12 @@ const MIG_LOCK_AT = 0.25;             // trailing FOLLOWING se arma en +25%
 const MIG_FOLLOW_PCT = 0.90;   // [v11.9] x6.3 (cap 90%)  // [v11] x2.5 — config del usuario validada (train +36 / test +4.5, 11/13 días)
 const MIG_MAX_PRICE_RATIO = 2.0;
 const MIG_SL_CONFIRM_TICKS = 2;
+// [FIX 27-jul] 🪂 PERFORACIÓN PROFUNDA: la confirmación de 2 ticks protege de mechas CERCA del
+// stop, pero en un rug vertical cada tick llega cientos de puntos más abajo (caso 5nHepJY: stop
+// +535, salida real +12). Si el precio ATRAVIESA el stop más de un 12%, se ejecuta al instante
+// y no se convierte a runner (convertir en caída libre regala el 25% al abismo).
+const MIG_SL_PANIC_BREACH = +(process.env.MIG_SL_PANIC_BREACH || 0.12);
+const esPanico = (trade, price) => trade.sl > 0 && price <= trade.sl * (1 - MIG_SL_PANIC_BREACH);
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 const MIG_QUAL_GATE = true;
@@ -355,7 +361,7 @@ const MIG_ESCALONES = [
 const MIG_VELO_DROP = 0.10;
 const MIG_VELO_ON = false;
 const MIG_VELO_MS = 2_000;
-const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.15;
+const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.90;    // [FIX 27-jul] el ×6.3 de la v11.9 se aplicó a P2/P3/P4 pero NO a P1: quedaba un acantilado absurdo (máx 39→trailing 15%, máx 41→90%) que estranguló 232 de 236 ops de esa banda. Réplica sobre 1.227 ops: +1.9 SOL
 const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.90;    // [v11.9] x6.3 (cap)  // [v11] era 0.15
 const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.756;   // [v11.9] 0.12×6.3
 const MIG_TRAIL_P4 = 0.504;   // [v11.9] 0.08×6.3
@@ -1429,7 +1435,7 @@ function updateReentryTrades(mint, price) {
       // [v10.1] confirmación de 2 ticks: el backtest se validó con muestras de 2-5s,
       // así que las mechas de un solo tick no deben ejecutar (igual que el SL de migración)
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", 21); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeDemoTrade(trade, price, "SL", 21); }
     }
     else {
       trade._slBelowCount = 0;
@@ -1452,7 +1458,7 @@ function updateReentryTrades(mint, price) {
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeRealTrade(trade, price, "SL"); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeRealTrade(trade, price, "SL"); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
@@ -1503,7 +1509,7 @@ function updateFuerzaTrades(mint, price) {
     if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeDemoTrade(trade, price, "SL", 21); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeDemoTrade(trade, price, "SL", 21); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
@@ -1524,7 +1530,7 @@ function updateFuerzaTrades(mint, price) {
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) { closeRealTrade(trade, price, "SL"); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeRealTrade(trade, price, "SL"); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
@@ -1536,7 +1542,7 @@ function updateFuerzaTrades(mint, price) {
 // [CAMBIO 9-jul] Grabación extendida 10 → 30 MINUTOS: necesitamos curvas de la
 // región 10-30 min para backtestear el moon-bag y la ventana larga con datos
 // reales (los topes del Excel demostraron que ahí vive el recorrido grande).
-const LAB_EXTEND_MS = 30 * 60_000;
+const LAB_EXTEND_MS = 60 * 60_000;   // [FIX 27-jul] 30→60 min: la cámara ahora cubre la vida completa de la op (MIG_DURATION=60min); un 19% de las ops seguían vivas al apagarse la grabación y su final quedaba fuera de plano para el lab y el torneo
 // LAB: contadores de salud del experimento (volcados cada hora)
 const labStats = { premigOk: 0, premigErr: 0, migrecs: 0, inicio: Date.now() };
 setInterval(() => {
@@ -2273,8 +2279,9 @@ function updateRealTrades(mint, price, strategy) {
     if (price >= trade.tp) reason = "TP";
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) reason = "SL";
-    } else trade._slBelowCount = 0;
+      trade._slPanic = esPanico(trade, price);   // [FIX 27-jul]
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
+    } else { trade._slBelowCount = 0; trade._slPanic = false; }
     if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
     if (!reason && expired) {
       if (isMig(trade) && currentPct >= MIG_EXPIRED_WIN_PCT) reason = "TP_EXPIRED";
@@ -2282,7 +2289,7 @@ function updateRealTrades(mint, price, strategy) {
     }
 
     if (reason === "SL" && isMig(trade) && MIG_RUNNER_ON && !trade.runnerActive
-        && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0) {
+        && !trade._slPanic && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0) {   // [FIX 27-jul] en perforación profunda se cierra TODO
       realRunnerConvert(trade, price);
       continue;
     }
@@ -2375,8 +2382,9 @@ function updateDemoTrades(mint, price, strategy) {
     if (price >= trade.tp) reason = "TP";
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS) reason = "SL";
-    } else trade._slBelowCount = 0;
+      trade._slPanic = esPanico(trade, price);   // [FIX 27-jul]
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
+    } else { trade._slBelowCount = 0; trade._slPanic = false; }
     if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
     if (!reason && expired) {
       if (isMig(trade) && currentPct >= MIG_EXPIRED_WIN_PCT) reason = "TP_EXPIRED";
@@ -2386,7 +2394,7 @@ function updateDemoTrades(mint, price, strategy) {
     // [CAMBIO 9-jul] MOON-BAG: si el trailing dispara y el máximo tocó +50% en verde,
     // en vez de cerrar todo → vender 75% y dejar el 25% corriendo (solo demo).
     if (reason === "SL" && isMig(trade) && MIG_RUNNER_ON && !trade.runnerActive
-        && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0) {
+        && !trade._slPanic && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0) {   // [FIX 27-jul] en perforación profunda se cierra TODO
       trade.runnerActive = true;
       trade.runnerPartialPct = currentPct;
       trade.trailingPhase = "RUNNER";
