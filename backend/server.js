@@ -326,6 +326,14 @@ const MIG_SL_PANIC_BREACH = +(process.env.MIG_SL_PANIC_BREACH || 0.12);
 const esPanico = (trade, price) => trade.sl > 0 && price <= trade.sl * (1 - MIG_SL_PANIC_BREACH);
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
+// [FIX 28-jul] 🎓 EXAMEN DE 2s: tras pasar todos los filtros, el bot NO compra aún — espera
+// 2 segundos más y mide el movimiento desde ese instante. Si el token se está hundiendo más
+// de un -5%, no entra: vuelve al portero (sigue vigilado dentro de sus 10 min por si da un
+// tirón limpio después). Medido sobre 2.050 ops: -49.9 → -26.6 SOL conservando 40 de 47
+// monstruos+godzillas, con peaje medio de +3.1% en las que entran.
+const MIG_EX2S_ON = true;      // el examen SIEMPRE activo, forma parte de la estrategia
+const MIG_EX2S_MIN = -5;       // suspende si cae más de -5% en los 2s del examen
+const MIG_EX2S_MS = 2_000;
 const MIG_QUAL_GATE = true;
 const MIG_QUAL_MOV2S_MIN = 1.0; // [FIX 26-jul] mando del lab: señal solo si mov2s ≥ +1% (era 0.5). Backtest 1.696 ops: junto con topBal≥0.5 → cr medio +7.4, conserva 9/9 godzillas
 const MIG_QUAL_MAX_WAIT_MS = 600_000;  // qual_gate CONTINUO: vigila hasta 10 min esperando la señal
@@ -1147,10 +1155,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
       state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
       broadcast({ event: "stats", data: state.stats }); return;
     }
-    entry.entered = true; state.stats.mig_entered++;
-    state.migWatching.delete(entry.mint); entry.firstPrice = entryPriceB;
-    addLog(`✅ MIG ENTRADA: ${entry.symbol} @ MC ${formatMC(entryPriceB * 1_000_000_000)}`, "accept");
-    migOpenTrades(entry); return;
+    migExamThenOpen(entry, entryPriceB); return;   // [FIX 28-jul]
   }
   entry.qualStartPrice = (entry.priceHist && entry.priceHist.length) ? entry.priceHist[0][1] : entryPriceB;
   entry.qualGate = true;
@@ -1255,12 +1260,51 @@ function migQualTick(entry, price) {
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
-      entry.entered = true; state.stats.mig_entered++;
-      state.migWatching.delete(entry.mint); entry.firstPrice = precioB;
-      addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} @ MC ${formatMC(mcEntryUsd)}`, "accept");
-      migOpenTrades(entry);
+      migExamThenOpen(entry, precioB);   // [FIX 28-jul] el examen de 2s decide la entrada
     }, MIG_ENTRY_DELAY_MS);
   }
+}
+
+// [FIX 28-jul] 🎓 el examen de 2s antes de abrir. Fail-open: sin precio nuevo en 2s, mov=0 y entra.
+function migExamThenOpen(entry, precioBase) {
+  if (!MIG_EX2S_ON) {
+    entry.entered = true; state.stats.mig_entered++;
+    state.migWatching.delete(entry.mint); entry.firstPrice = precioBase;
+    addLog(`✅ MIG ENTRADA (calidad ✓): ${entry.symbol} @ MC ${formatMC(precioBase * 1_000_000_000)}`, "accept");
+    migOpenTrades(entry);
+    return;
+  }
+  const p0 = precioBase;
+  setTimeout(() => {
+    if (entry.entered) return;
+    const p2 = entry.lastPrice || p0;
+    const mov = p0 > 0 ? (p2 / p0 - 1) * 100 : 0;
+    entry.ex2s = +mov.toFixed(2);
+    if (mov >= MIG_EX2S_MIN) {
+      entry.entered = true; state.stats.mig_entered++;
+      state.migWatching.delete(entry.mint); entry.firstPrice = p2;
+      addLog(`✅ MIG ENTRADA (examen 2s ✓ ${mov >= 0 ? "+" : ""}${mov.toFixed(1)}%): ${entry.symbol} @ MC ${formatMC(p2 * 1_000_000_000)}`, "accept");
+      migOpenTrades(entry);
+      return;
+    }
+    // suspendido: NO se descarta — vuelve al portero por lo que quede de los 10 min
+    const resto = MIG_QUAL_MAX_WAIT_MS - (Date.now() - entry.startTime);
+    addLog(`🎓 MIG EXAMEN 2s SUSPENDIDO: ${entry.symbol} cayó ${mov.toFixed(1)}% (< ${MIG_EX2S_MIN}%) — ${resto > 5000 ? "vuelve al portero (" + Math.round(resto/60000) + "min restantes)" : "sin tiempo de portero, descartada"}`, "filter");
+    if (resto <= 5000) {
+      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+      broadcast({ event: "stats", data: state.stats });
+      return;
+    }
+    entry.qualStartPrice = p2;
+    entry.qualGate = true;
+    entry.qualTimeout = setTimeout(() => {
+      if (!entry.qualGate) return;
+      entry.qualGate = false;
+      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | sin tirón limpio tras el examen suspendido`, "filter");
+      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+      broadcast({ event: "stats", data: state.stats });
+    }, resto);
+  }, MIG_EX2S_MS);
 }
 
 function migEvaluate(mint) {
@@ -1347,7 +1391,7 @@ function liveRecStart(entry, entryPrice) {
   const velMs = Date.now() - entry.startTime;
   const rec = { mint: entry.mint, symbol: entry.symbol, vel: +(velMs/1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice*1_000_000_000), vol: Math.round(entry.volumeUSD||0),
-    t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, sigMov2s: entry.sigMov2s ?? null, sigT: entry.sigT ?? null, finished: false,
+    t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, sigMov2s: entry.sigMov2s ?? null, sigT: entry.sigT ?? null, ex2s: entry.ex2s ?? null, finished: false,
     volSeg: [], lastVolSec: -1, minP: 0, reentered: false,
     wallets: new Map() };  // [v10.1] wallet → {buyUsd, sellUsd, buys, sells} en 0-60s
   state.liveRecordings.set(entry.mint, rec);
@@ -1783,7 +1827,7 @@ function liveRecEmit(mint) {
     const wash = ws.filter(w => w.buys > 0 && w.sells > 0).length;
     wStr = ` buyers60=${buyers.length} topBuyer=${totalBuy > 0 ? (100*topBuy/totalBuy).toFixed(0) : 0}% wash60=${wash}`;
   }
-  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} ex2s=${rec.ex2s!=null?(rec.ex2s>=0?"+":"")+rec.ex2s+"%":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
   try { shadowProcesa(rec); } catch (e) { if (!state._shErr) { state._shErr = true; addLog(`⚠️ shadowProcesa error: ${e.message}`, "warn"); } }   // [v11.9]
   labStats.migrecs++;
 }
@@ -2699,6 +2743,7 @@ server.listen(PORT, () => {
   if (MC_OBSERVER) addLog("🔬 MC_OBSERVER: solo grabación MCREC", "warn");
   if (FZ_ON) addLog(`⚡ FUERZA ON: margen +${FZ_MARGIN*100}% SL ${FZ_SL}% trail ${FZ_TRAIL*100}%@+${FZ_ARM}`, "info");
   if (SHADOW_ON) addLog(`👥 TORNEO DE SOMBRAS ON: ${SHADOW_GRID.length} configs compitiendo`, "info");
+  if (MIG_EX2S_ON) addLog(`🎓 EXAMEN 2s ON: tras los filtros espera ${MIG_EX2S_MS/1000}s y solo entra si no cae más de ${MIG_EX2S_MIN}% (suspenso → vuelve al portero)`, "info");
   loadState();
   seedCreators();
   initWallet();
