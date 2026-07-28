@@ -1187,7 +1187,14 @@ function migQualTick(entry, price) {
     const tSenal = ((now - entry.startTime) / 1000).toFixed(0);
     entry.sigMov2s = +mov2.toFixed(2); entry.sigT = +tSenal;   // [v11.9] la señal causal, apuntada
     addLog(`🎯 MIG SEÑAL: ${entry.symbol} | mov2s +${mov2.toFixed(1)}% a los ${tSenal}s — confirmando ${(MIG_ENTRY_DELAY_MS/1000).toFixed(0)}s`, "accept");
+    const confT0 = Date.now();
     setTimeout(() => {
+      // [FIX 28-jul] frescura también en la confirmación: sin ticks en los 3s = feed mudo, no fiarse del precio congelado
+      if (entry.entered) return;
+      if (!entry.lastTickTs || entry.lastTickTs < confT0) {
+        volverAlPortero(entry, entry.lastPrice || precioSenal, "🔇 confirmación sin ticks (feed mudo tras la señal)");
+        return;
+      }
       const precioB = entry.lastPrice;
       if (precioB < precioSenal * (1 - MIG_MAX_CAIDA_DELAY)) {
         const caida = ((precioB / precioSenal - 1) * 100).toFixed(1);
@@ -1265,7 +1272,29 @@ function migQualTick(entry, price) {
   }
 }
 
-// [FIX 28-jul] 🎓 el examen de 2s antes de abrir. Fail-open: sin precio nuevo en 2s, mov=0 y entra.
+// [FIX 28-jul] devuelve un token al portero por lo que le quede de sus 10 minutos
+function volverAlPortero(entry, precioRef, motivo) {
+  const resto = MIG_QUAL_MAX_WAIT_MS - (Date.now() - entry.startTime);
+  addLog(`↩️ ${entry.symbol}: ${motivo} — ${resto > 5000 ? "vuelve al portero (" + Math.round(resto/60000) + "min restantes)" : "sin tiempo, descartada"}`, "filter");
+  if (resto <= 5000) {
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+    return;
+  }
+  entry.qualStartPrice = precioRef;
+  entry.qualGate = true;
+  entry.qualTimeout = setTimeout(() => {
+    if (!entry.qualGate) return;
+    entry.qualGate = false;
+    addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | sin tirón limpio tras volver al portero`, "filter");
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+  }, resto);
+}
+
+// [FIX 28-jul] 🎓 el examen de 2s antes de abrir. FAIL-CLOSED ante el silencio: si durante el
+// examen no llegó NI UN tick fresco, no se entra (el precio congelado del pump es una mentira:
+// caso 7DgDGg 28-jul, compró un precio que ya no existía y el 1er tick real fue -91.5%).
 function migExamThenOpen(entry, precioBase) {
   if (!MIG_EX2S_ON) {
     entry.entered = true; state.stats.mig_entered++;
@@ -1275,8 +1304,14 @@ function migExamThenOpen(entry, precioBase) {
     return;
   }
   const p0 = precioBase;
+  const examT0 = Date.now();
   setTimeout(() => {
     if (entry.entered) return;
+    // [FIX 28-jul] frescura obligatoria: al menos un tick DURANTE el examen
+    if (!entry.lastTickTs || entry.lastTickTs < examT0) {
+      volverAlPortero(entry, p0, "🔇 examen 2s sin ticks (feed mudo = rug o token muerto)");
+      return;
+    }
     const p2 = entry.lastPrice || p0;
     const mov = p0 > 0 ? (p2 / p0 - 1) * 100 : 0;
     entry.ex2s = +mov.toFixed(2);
@@ -1288,22 +1323,7 @@ function migExamThenOpen(entry, precioBase) {
       return;
     }
     // suspendido: NO se descarta — vuelve al portero por lo que quede de los 10 min
-    const resto = MIG_QUAL_MAX_WAIT_MS - (Date.now() - entry.startTime);
-    addLog(`🎓 MIG EXAMEN 2s SUSPENDIDO: ${entry.symbol} cayó ${mov.toFixed(1)}% (< ${MIG_EX2S_MIN}%) — ${resto > 5000 ? "vuelve al portero (" + Math.round(resto/60000) + "min restantes)" : "sin tiempo de portero, descartada"}`, "filter");
-    if (resto <= 5000) {
-      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-      broadcast({ event: "stats", data: state.stats });
-      return;
-    }
-    entry.qualStartPrice = p2;
-    entry.qualGate = true;
-    entry.qualTimeout = setTimeout(() => {
-      if (!entry.qualGate) return;
-      entry.qualGate = false;
-      addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | sin tirón limpio tras el examen suspendido`, "filter");
-      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-      broadcast({ event: "stats", data: state.stats });
-    }, resto);
+    volverAlPortero(entry, p2, `🎓 examen 2s suspendido: cayó ${mov.toFixed(1)}% (< ${MIG_EX2S_MIN}%)`);
   }, MIG_EX2S_MS);
 }
 
