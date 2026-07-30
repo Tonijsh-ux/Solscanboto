@@ -1500,7 +1500,11 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
 function maybeReentry(rec, price, pct, tSec) {
   if (!REENTRY_ON || rec.reentered || MC_OBSERVER || OBSERVER_MODE) return;
   if (tSec < REENTRY_MIN_T) return;
-  if (!(rec.minP <= REENTRY_DIP && pct >= rec.minP + REENTRY_JUMP && pct >= REENTRY_ZONE)) return;
+  if (!(rec.minP <= REENTRY_DIP && pct >= rec.minP + REENTRY_JUMP && pct >= REENTRY_ZONE)) { rec.reArmed = false; return; }
+  // [29-jul H78WEN] CONFIRMACIÓN ANTI-GLITCH: el rebote debe aguantar DOS ticks seguidos.
+  // Un print de lavado de 1 tick (−53% → −10% → −45%) disparaba la entrada y moría en 0s.
+  if (!rec.reArmed) { rec.reArmed = true; return; }   // primer tick que cumple: armar y esperar al siguiente
+  rec.reArmed = false;
   rec.reentered = true;  // una sola re-entrada por token
   const abiertos = state.demoTrades.filter(t => t.strategy === "reentry" && t.status === "OPEN").length;
   if (abiertos >= REENTRY_MAX_OPEN) { addLog(`🔄 REENTRY saltada (límite ${REENTRY_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
@@ -1999,6 +2003,17 @@ function migOpenTrades(entry) {
 }
 
 function migCleanup(mint, symbol) {
+  // [29-jul H78WEN] la cámara rodaba 60min (LAB_EXTEND) pero este unsubscribe la dejaba sin
+  // ticks al cerrar el último trade (dur_rec colapsaba, ej. 292s) y de paso cegaba a la
+  // re-caza — ese token resucitó a +4500% sin nadie mirando. Mientras la grabación siga
+  // viva, el feed no se toca; liveRecEmit desuscribe al terminar.
+  const rec = state.liveRecordings.get(mint);
+  if (LIVE_RECORD && rec && !rec.finished) {
+    state.migMonitored.delete(mint);
+    broadcast({ event: "removeToken", data: { mint } });
+    addLog(`🎥 ${symbol} fuera del panel — cámara y re-caza siguen ${Math.max(1, Math.round((rec.t0 + LAB_EXTEND_MS - Date.now()) / 60000))}min más`, "info");
+    return;
+  }
   unsubscribeToken(mint); state.migMonitored.delete(mint);
   broadcast({ event: "removeToken", data: { mint } });
   addLog(`🗑️ ${symbol} eliminado`, "info");
