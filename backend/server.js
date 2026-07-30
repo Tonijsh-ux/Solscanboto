@@ -233,12 +233,12 @@ function factorCalor() {
 // pagan los billetes; fricción real ~4.5% ya considerada en la validación) ──
 const REENTRY_ON = true;
 const REENTRY_MIN_T = 45;            // no antes del segundo 45 de la grabación
-const REENTRY_DIP = -60;   // [v11.9]
-const REENTRY_JUMP = 45;   // [v11.9]
-const REENTRY_ZONE = -5;             // hasta al menos la zona de entrada (>= -5%)
+const REENTRY_DIP = -51;   // [29-jul] tornillo del lab (era -60)
+const REENTRY_JUMP = 42;   // [29-jul] tornillo del lab (era 45)
+const REENTRY_ZONE = -32;            // [29-jul] tornillo del lab: entra ya desde -32% (era -5)
 const REENTRY_SL = -30;              // SL relativo a la re-entrada
-const REENTRY_ARM = 50;   // [v11.9]
-const REENTRY_TRAIL = 0.55;   // [v11.9]
+const REENTRY_ARM = 150;  // [29-jul] tornillo del lab: arma el trailing a +150 (era 50)
+const REENTRY_TRAIL = 0.80;   // [29-jul] tornillo del lab: anchura 80% (era 55)
 const REENTRY_MAX_OPEN = 10;
 const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
 
@@ -336,6 +336,43 @@ const MIG_EX2S_MIN = -5;       // suspende si cae más de -5% en los 2s del exam
 const MIG_EX2S_MS = 2_000;
 const MIG_QUAL_GATE = true;
 const MIG_QUAL_MOV2S_MIN = 1.0; // [FIX 26-jul] mando del lab: señal solo si mov2s ≥ +1% (era 0.5). Backtest 1.696 ops: junto con topBal≥0.5 → cr medio +7.4, conserva 9/9 godzillas
+const MIG_QUAL_ONE_STRIKE = 3.0; // [FIX 29-jul] REGLA A LA PRIMERA (lab, 2.332 ops): la 1ª señal es la que informa. Si el 1er cruce sale débil (<3%), token DESCARTADO para siempre — sin re-vigilancia. Umbral continuo a 3 ≈ −23 SOL (el 81% re-dispara a los ~16s y vuelve a perder); descarte a la primera ≈ −2 SOL vs −38.5 base.
+const MIG_MAX_VEL_S = 10;   // [29-jul tarde] mando del lab: 11 → 10
+
+// ═══ [29-jul] MOTOR POR CLASES (portado de las tarjetas del lab · 2.332 ops) ═══
+// El mov2s de los primeros 2s tras la entrada NO decide la entrada: a los 2s ya es
+// pasado, y se usa solo para ELEGIR el motor de salida. Prioridad: godzilla >
+// monstruo > cohete > mediana > Base. Condición con dato ausente = no encaja (Base),
+// igual que el lab. t10/t5/txs/edad del PREMIG; vel y MC de la señal; mov2s a los 2s.
+// La única diferencia con el lab: allí los tornillos de la clase aplican desde t=0;
+// en vivo solo se conocen a t=2s, así que los 2 primeros segundos corren con la Base.
+const MIG_CFG_BASE = { nom:"base", sl:-40, mult:4.5, piso1:20, piso2:60, pisoOn:true, runTrig:101, runTr:75, ndT:90, ndMin:30, tp:750 };
+const MIG_CFGS = [
+  { cond:d=> d.t10!=null&&d.t10>87 && d.mov!=null&&d.mov>1.12 && d.t5!=null&&d.t5>75,
+    C:{ nom:"godzilla", sl:-29, mult:6.0, piso1:24, piso2:80, pisoOn:false, runTrig:49, runTr:33, ndT:41, ndMin:58, tp:1e9 } },
+  { cond:d=> d.tx!=null&&d.tx<1801 && d.vel!=null&&d.vel>3.4 && d.ed!=null&&d.ed<1,
+    C:{ nom:"monstruo", sl:-30, mult:6.0, piso1:11, piso2:65, pisoOn:false, runTrig:61, runTr:31, ndT:30, ndMin:20, tp:2000 } },
+  { cond:d=> d.mc!=null&&d.mc>38100 && d.vel!=null&&d.vel<5.4 && d.mc<49000,
+    C:{ nom:"cohete", sl:-12, mult:6.3, piso1:30, piso2:60, pisoOn:true, runTrig:50, runTr:30, ndT:45, ndMin:30, tp:1000 } },
+  { cond:d=> d.vel!=null&&d.vel<3.8 && d.mov!=null&&d.mov>-10.4 && d.mc!=null&&d.mc<82200,
+    C:{ nom:"mediana", sl:-30, mult:5.0, piso1:20, piso2:100, pisoOn:true, runTrig:45, runTr:30, ndT:40, ndMin:40, tp:1500 } },
+];
+function migCfgTrailPct(maxGainPct, mult) {   // mismos tiers del lab: b(máx) × anchura, tope 90%
+  const b = maxGainPct >= 100 ? 0.08 : maxGainPct >= 60 ? 0.12 : maxGainPct >= 40 ? 0.15 : 0.20;
+  return Math.min(0.90, b * mult);
+}
+function migRouteCfg(trade) {
+  const pre = premigData.get(trade.mint) || {};
+  const d = { t10: pre.top10Pct ?? null, t5: pre.top5Pct ?? null, tx: pre.total ?? null, ed: pre.ageMin ?? null,
+              vel: trade.velSeg ?? null, mc: trade.mcOpenUsd ?? null, mov: trade.mov2s ?? null };
+  let C = MIG_CFG_BASE;
+  for (const c of MIG_CFGS) { if (c.cond(d)) { C = c.C; break; } }
+  trade.cfg = C;
+  const slCfg = trade.entryPrice * (1 + C.sl / 100);
+  if (slCfg > trade.sl) setSL(trade, slCfg, "cfg-" + C.nom);
+  trade.tp = +(trade.entryPrice * (1 + C.tp / 100)).toFixed(12);
+  addLog(`🎛️ MOTOR ${C.nom.toUpperCase()}: ${trade.symbol} | mov2s ${trade.mov2s != null ? (trade.mov2s >= 0 ? "+" : "") + trade.mov2s.toFixed(1) + "%" : "n/a"} → SL ${C.sl}% · anchura x${C.mult} · pisos ${C.pisoOn ? "+" + C.piso1 + "/+" + C.piso2 : "off"} · moon +${C.runTrig}%/${C.runTr}% · ND ${C.ndT}s/+${C.ndMin}% · TP ${C.tp >= 1e8 ? "sin" : "+" + C.tp + "%"}`, "demo");
+} // [FIX 29-jul] VETO DE LENTOS, mando del lab: vel = segundos migración→entrada (señal+confirmación+examen incluidos, la misma vel que graba el MIGREC). Si tarda más de 11s en entrar, fuera.
 const MIG_QUAL_MAX_WAIT_MS = 600_000;  // qual_gate CONTINUO: vigila hasta 10 min esperando la señal
 const MIG_QUAL_PEND15_ON = false;
 const MIG_QUAL_WINDOW_MS = 15_000;
@@ -1183,6 +1220,15 @@ function migQualTick(entry, price) {
   const mov2 = (price / p2s - 1) * 100;
   if (mov2 > MIG_QUAL_MOV2S_MIN && price > prevPrice && price > entry.qualStartPrice) {
     entry.qualGate = false; clearTimeout(entry.qualTimeout);
+    // [FIX 29-jul] UNA-STRIKE: primera señal débil = fuera para siempre (no vuelve a observación)
+    if (mov2 < MIG_QUAL_ONE_STRIKE) {
+      addLog(`🚫 MIG UNA-STRIKE: ${entry.symbol} descartada | 1ª señal mov2s +${mov2.toFixed(1)}% < +${MIG_QUAL_ONE_STRIKE}% (débil = fuera, sin los 10 min de re-vigilancia)`, "filter");
+      state.stats.mig_rejected++;
+      state.migWatching.delete(entry.mint);
+      unsubscribeToken(entry.mint);
+      broadcast({ event: "stats", data: state.stats });
+      return;
+    }
     const precioSenal = price;
     const tSenal = ((now - entry.startTime) / 1000).toFixed(0);
     entry.sigMov2s = +mov2.toFixed(2); entry.sigT = +tSenal;   // [v11.9] la señal causal, apuntada
@@ -1918,13 +1964,22 @@ function migOpenTrades(entry) {
     broadcast({ event: "stats", data: state.stats });
     return;
   }
+  // [FIX 29-jul] VETO DE LENTOS (mando del lab): la vel del MIGREC se mide aquí mismo.
+  // Si desde la migración hasta este punto (señal+confirmación+examen) pasaron >11s, fuera.
+  const velSeg = +(((Date.now() - entry.startTime) / 1000).toFixed(1));
+  if (velSeg > MIG_MAX_VEL_S) {
+    addLog(`🐢 MIG VETO LENTOS: ${entry.symbol} descartada | vel=${velSeg}s > ${MIG_MAX_VEL_S}s (migración→entrada demasiado lenta)`, "filter");
+    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats });
+    return;
+  }
   liveRecStart(entry, price);
   const signal = {
     id: `mig-${entry.mint}-${Date.now()}`, strategy: "migration",
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price*MIG_TP).toFixed(12), sl: +(price*MIG_SL).toFixed(12),
     mcUsd: price*1_000_000_000, volumeUSD: entry.volumeUSD,
-    vel: +(((Date.now()-entry.startTime)/1000).toFixed(1)),   // [v11.9] para el veto de lentos
+    vel: velSeg,   // [v11.9] para el veto de lentos (ya aplicado arriba)
     time: Date.now(),
   };
   state.signals.unshift(signal);
@@ -2389,8 +2444,15 @@ function openDemoTrade(signal) {
     expiresAt: Date.now() + MIG_DURATION_MS,
     mov1s: null, mov2s: null,
   };
+  if (signal.strategy === "migration") {   // [29-jul] motor por clases: abre con la Base y a los 2s se enruta
+    trade.cfg = MIG_CFG_BASE;
+    trade.velSeg = signal.vel ?? null;
+    trade.mcOpenUsd = signal.mcUsd ?? null;
+    trade.sl = +(trade.entryPrice * (1 + MIG_CFG_BASE.sl / 100)).toFixed(12);
+    trade.tp = +(trade.entryPrice * (1 + MIG_CFG_BASE.tp / 100)).toFixed(12);
+  }
   setTimeout(() => { if (trade.status === "OPEN") trade.mov1s = trade.currentPct; }, 1000);
-  setTimeout(() => { if (trade.status === "OPEN") trade.mov2s = trade.currentPct; }, 2000);
+  setTimeout(() => { if (trade.status === "OPEN") { trade.mov2s = trade.currentPct; if (isMig(trade)) migRouteCfg(trade); } }, 2000);
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
   state.stats.demoOpen++;
@@ -2420,22 +2482,25 @@ function updateDemoTrades(mint, price, strategy) {
         addLog(`📈 TRAILING: ${trade.symbol} +${((gainRatio-1)*100).toFixed(0)}%`, "demo");
       }
       if (trade.trailingPhase === "FOLLOWING" || trade.trailingPhase === "RUNNER") {
+        const cfgM = trade.cfg || MIG_CFG_BASE;   // [29-jul] tornillos de la clase
         if (trade.trailingPhase === "RUNNER") {
-          const cand = price * (1 - MIG_RUNNER_TRAIL);
+          const cand = price * (1 - cfgM.runTr / 100);
           if (cand > trade.sl) setSL(trade, cand, "runner-trail");
           const floorBE = trade.entryPrice * (1 + MIG_RUNNER_FLOOR / 100);
           if (floorBE > trade.sl) setSL(trade, floorBE, "runner-floor");
         } else {
-          const trailPct = Math.min(0.90, migTrailingPct(trade.maxGainPct) );
+          const trailPct = migCfgTrailPct(trade.maxGainPct, cfgM.mult);
           const newSL = price * (1 - trailPct);
           if (newSL > trade.sl) setSL(trade, newSL, "trail");
-          if (trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
-            const stepFloor = trade.entryPrice * (1 + MIG_STEP_FLOOR);
-            if (stepFloor > trade.sl) setSL(trade, stepFloor, "step13");
-          }
-          if (trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
-            const floor65 = trade.entryPrice * 1.65;
-            if (floor65 > trade.sl) setSL(trade, floor65, "suelo65");
+          if (cfgM.pisoOn !== false) {
+            if (trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+              const stepFloor = trade.entryPrice * (1 + cfgM.piso1 / 100);
+              if (stepFloor > trade.sl) setSL(trade, stepFloor, "piso1");
+            }
+            if (trade.maxGainPct >= MIG_TOP_FLOOR_TRIGGER) {
+              const floor2 = trade.entryPrice * (1 + cfgM.piso2 / 100);
+              if (floor2 > trade.sl) setSL(trade, floor2, "piso2");
+            }
           }
         }
       }
@@ -2443,8 +2508,13 @@ function updateDemoTrades(mint, price, strategy) {
 
     const expired = now >= trade.expiresAt;
     let reason = null;
-    if (price >= trade.tp) reason = "TP";
-    else if (price <= trade.sl) {
+    // [29-jul] no-despegue por clase (ndT/ndMin de la config, como en el lab)
+    if (isMig(trade) && !trade.runnerActive) {
+      const cfgND = trade.cfg || MIG_CFG_BASE;
+      if (cfgND.ndT && (now - trade.openTime) / 1000 >= cfgND.ndT && trade.maxGainPct < cfgND.ndMin) reason = "NO_LAUNCH";
+    }
+    if (!reason && price >= trade.tp) reason = "TP";
+    else if (!reason && price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
       trade._slPanic = esPanico(trade, price);   // [FIX 27-jul]
       if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
@@ -2458,12 +2528,12 @@ function updateDemoTrades(mint, price, strategy) {
     // [CAMBIO 9-jul] MOON-BAG: si el trailing dispara y el máximo tocó +50% en verde,
     // en vez de cerrar todo → vender 75% y dejar el 25% corriendo (solo demo).
     if (reason === "SL" && isMig(trade) && MIG_RUNNER_ON && !trade.runnerActive
-        && !trade._slPanic && trade.maxGainPct >= MIG_RUNNER_MIN_GAIN && currentPct > 0) {   // [FIX 27-jul] en perforación profunda se cierra TODO
+        && !trade._slPanic && trade.maxGainPct >= ((trade.cfg || MIG_CFG_BASE).runTrig) && currentPct > 0) {   // [FIX 27-jul] perforación profunda cierra TODO · [29-jul] gatillo por clase
       trade.runnerActive = true;
       trade.runnerPartialPct = currentPct;
       trade.trailingPhase = "RUNNER";
       const slAntes = trade.sl;
-      setSL(trade, Math.max(trade.entryPrice, price * (1 - MIG_RUNNER_TRAIL)), "runner-conv");
+      setSL(trade, Math.max(trade.entryPrice, price * (1 - ((trade.cfg || MIG_CFG_BASE).runTr) / 100)), "runner-conv");   // [29-jul] anchura por clase
       addLog(`🚀 RUNNER (demo): ${trade.symbol} asegura 75% a +${currentPct.toFixed(1)}% — 25% corre · SL ${((slAntes-trade.entryPrice)/trade.entryPrice*100).toFixed(0)}%→${((trade.sl-trade.entryPrice)/trade.entryPrice*100).toFixed(0)}% (trail ${MIG_RUNNER_TRAIL*100}%, suelo BE)`, "demo");
       broadcast({ event: "demoTradeUpdate", data: { id: trade.id, trailingPhase: "RUNNER", sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1) } });   // [FIX 27-jul] slPct incluido: el panel mostraba el viejo hasta el siguiente tick
       continue;
