@@ -324,6 +324,25 @@ const MIG_SL_CONFIRM_TICKS = 2;
 // y no se convierte a runner (convertir en caída libre regala el 25% al abismo).
 const MIG_SL_PANIC_BREACH = +(process.env.MIG_SL_PANIC_BREACH || 0.12);
 const esPanico = (trade, price) => trade.sl > 0 && price <= trade.sl * (1 - MIG_SL_PANIC_BREACH);
+// [31-jul CcYp2Y] GUARDIA ANTI-PINCHAZO EN LA SALIDA.
+// Un tick muy por debajo de la mediana reciente casi siempre es un print fantasma, no mercado:
+// en 2.370 ops solo el 1% de los pinchazos <-35% se recuperaba... pero de esos, 12 llegaban
+// luego a +50% o mas (uno a +1367%). Y esperar 2s en los pinchazos de verdad cuesta 0,58
+// puntos de media (189 peor / 178 mejor: moneda al aire). Conclusion: no vender en un tick
+// solitario. El panico se mantiene, pero solo si la MEDIANA tambien esta rota.
+const MIG_TICK_FANTASMA = 20;   // % por debajo de la mediana de 3s para considerar el tick sospechoso
+function precioRefTrade(trade, price) {
+  const h = trade._pHist || (trade._pHist = []);
+  h.push([Date.now(), price]);
+  while (h.length > 2 && Date.now() - h[0][0] > 3_000) h.shift();
+  if (h.length < 3) return null;
+  const v = h.map(x => x[1]).sort((a, b) => a - b);
+  return v[v.length >> 1];
+}
+function tickFantasma(trade, price) {
+  const ref = precioRefTrade(trade, price);
+  return ref != null && price < ref * (1 - MIG_TICK_FANTASMA / 100);
+}
 const MIG_EXPIRED_WIN_PCT = 2;
 const MIG_ENTRY_DELAY_MS = 3_000;
 // [FIX 28-jul] 🎓 EXAMEN DE 2s: tras pasar todos los filtros, el bot NO compra aún — espera
@@ -338,6 +357,9 @@ const MIG_QUAL_GATE = true;
 const MIG_QUAL_MOV2S_MIN = 1.0; // [FIX 26-jul] mando del lab: señal solo si mov2s ≥ +1% (era 0.5). Backtest 1.696 ops: junto con topBal≥0.5 → cr medio +7.4, conserva 9/9 godzillas
 const MIG_QUAL_ONE_STRIKE = 3.0; // [FIX 29-jul] REGLA A LA PRIMERA (lab, 2.332 ops): la 1ª señal es la que informa. Si el 1er cruce sale débil (<3%), token DESCARTADO para siempre — sin re-vigilancia. Umbral continuo a 3 ≈ −23 SOL (el 81% re-dispara a los ~16s y vuelve a perder); descarte a la primera ≈ −2 SOL vs −38.5 base.
 const MIG_MAX_VEL_S = 10;   // [29-jul tarde] mando del lab: 11 → 10
+const MIG_ENTRY_SPIKE_MAX = 30;   // [31-jul, relajado] ANTI-SPIKE DE ENTRADA: si el ultimo tick esta mas de un 15%
+                                  // por encima de la mediana de los ultimos ~3s, es un print de lavado, no precio real.
+                                  // Sin esto el bot 'compra' el pico y la op nace ya en -49%.
 
 // ═══ [29-jul] MOTOR POR CLASES (portado de las tarjetas del lab · 2.332 ops) ═══
 // El mov2s de los primeros 2s tras la entrada NO decide la entrada: a los 2s ya es
@@ -346,16 +368,16 @@ const MIG_MAX_VEL_S = 10;   // [29-jul tarde] mando del lab: 11 → 10
 // igual que el lab. t10/t5/txs/edad del PREMIG; vel y MC de la señal; mov2s a los 2s.
 // La única diferencia con el lab: allí los tornillos de la clase aplican desde t=0;
 // en vivo solo se conocen a t=2s, así que los 2 primeros segundos corren con la Base.
-const MIG_CFG_BASE = { nom:"base", sl:-40, mult:4.5, piso1:20, piso2:60, pisoOn:true, runTrig:101, runTr:75, ndT:90, ndMin:30, tp:750 };
+const MIG_CFG_BASE = { nom:"base", sl:-40, mult:4.5, arm:25, piso1:20, piso2:60, pisoOn:true, runTrig:101, runTr:75, ndT:90, ndMin:30, tp:750 };
 const MIG_CFGS = [
   { cond:d=> d.t10!=null&&d.t10>87 && d.mov!=null&&d.mov>1.12 && d.t5!=null&&d.t5>75,
-    C:{ nom:"godzilla", sl:-29, mult:6.0, piso1:24, piso2:80, pisoOn:false, runTrig:49, runTr:33, ndT:41, ndMin:58, tp:1e9 } },
+    C:{ nom:"godzilla", arm:25, sl:-29, mult:6.0, piso1:24, piso2:80, pisoOn:false, runTrig:49, runTr:33, ndT:41, ndMin:58, tp:1e9 } },
   { cond:d=> d.tx!=null&&d.tx<1801 && d.vel!=null&&d.vel>3.4 && d.ed!=null&&d.ed<1,
-    C:{ nom:"monstruo", sl:-30, mult:6.0, piso1:11, piso2:65, pisoOn:false, runTrig:61, runTr:31, ndT:30, ndMin:20, tp:2000 } },
+    C:{ nom:"monstruo", arm:25, sl:-30, mult:6.0, piso1:11, piso2:65, pisoOn:false, runTrig:61, runTr:31, ndT:30, ndMin:20, tp:2000 } },
   { cond:d=> d.mc!=null&&d.mc>38100 && d.vel!=null&&d.vel<5.4 && d.mc<49000,
-    C:{ nom:"cohete", sl:-12, mult:6.3, piso1:30, piso2:60, pisoOn:true, runTrig:50, runTr:30, ndT:45, ndMin:30, tp:1000 } },
+    C:{ nom:"cohete", arm:25, sl:-12, mult:6.3, piso1:30, piso2:60, pisoOn:true, runTrig:50, runTr:30, ndT:45, ndMin:30, tp:1000 } },
   { cond:d=> d.vel!=null&&d.vel<3.8 && d.mov!=null&&d.mov>-10.4 && d.mc!=null&&d.mc<82200,
-    C:{ nom:"mediana", sl:-30, mult:5.0, piso1:20, piso2:100, pisoOn:true, runTrig:45, runTr:30, ndT:40, ndMin:40, tp:1500 } },
+    C:{ nom:"mediana", arm:25, sl:-30, mult:5.0, piso1:20, piso2:100, pisoOn:true, runTrig:45, runTr:30, ndT:40, ndMin:40, tp:1500 } },
 ];
 function migCfgTrailPct(maxGainPct, mult) {   // mismos tiers del lab: b(máx) × anchura, tope 90%
   const b = maxGainPct >= 100 ? 0.08 : maxGainPct >= 60 ? 0.12 : maxGainPct >= 40 ? 0.15 : 0.20;
@@ -1229,6 +1251,7 @@ function migQualTick(entry, price) {
       broadcast({ event: "stats", data: state.stats });
       return;
     }
+    entry.sigPct = +mov2.toFixed(2);   // [31-jul] fuerza de la senal, para el MIGREC/MIGCLOSE
     const precioSenal = price;
     const tSenal = ((now - entry.startTime) / 1000).toFixed(0);
     entry.sigMov2s = +mov2.toFixed(2); entry.sigT = +tSenal;   // [v11.9] la señal causal, apuntada
@@ -1341,6 +1364,14 @@ function volverAlPortero(entry, precioRef, motivo) {
 // [FIX 28-jul] 🎓 el examen de 2s antes de abrir. FAIL-CLOSED ante el silencio: si durante el
 // examen no llegó NI UN tick fresco, no se entra (el precio congelado del pump es una mentira:
 // caso 7DgDGg 28-jul, compró un precio que ya no existía y el 1er tick real fue -91.5%).
+// [31-jul] precio de referencia: mediana de los ticks de los ultimos 3s (robusta a prints sueltos)
+function migRefPrice(entry) {
+  const h = entry.priceHist || [];
+  const t0 = Date.now() - 3_000;
+  const v = h.filter(x => x[0] >= t0).map(x => x[1]).sort((a, b) => a - b);
+  if (v.length < 3) return null;
+  return v[v.length >> 1];
+}
 function migExamThenOpen(entry, precioBase) {
   if (!MIG_EX2S_ON) {
     entry.entered = true; state.stats.mig_entered++;
@@ -1362,6 +1393,12 @@ function migExamThenOpen(entry, precioBase) {
     const mov = p0 > 0 ? (p2 / p0 - 1) * 100 : 0;
     entry.ex2s = +mov.toFixed(2);
     if (mov >= MIG_EX2S_MIN) {
+      // [31-jul CcYp2Y] ANTI-SPIKE: no comprar un print de lavado. Vuelve al portero, no descarta.
+      const ref = migRefPrice(entry);
+      if (ref && p2 > ref * (1 + MIG_ENTRY_SPIKE_MAX / 100)) {
+        volverAlPortero(entry, p2, `⚡ ENTRADA ANULADA (spike): tick ${(((p2 / ref) - 1) * 100).toFixed(0)}% sobre la mediana de 3s — print de lavado, no precio real`);
+        return;
+      }
       entry.entered = true; state.stats.mig_entered++;
       state.migWatching.delete(entry.mint); entry.firstPrice = p2;
       addLog(`✅ MIG ENTRADA (examen 2s ✓ ${mov >= 0 ? "+" : ""}${mov.toFixed(1)}%): ${entry.symbol} @ MC ${formatMC(p2 * 1_000_000_000)}`, "accept");
@@ -1549,7 +1586,7 @@ function updateReentryTrades(mint, price) {
       // [v10.1] confirmación de 2 ticks: el backtest se validó con muestras de 2-5s,
       // así que las mechas de un solo tick no deben ejecutar (igual que el SL de migración)
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeDemoTrade(trade, price, "SL", 21); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeDemoTrade(trade, price, "SL", 21); }
     }
     else {
       trade._slBelowCount = 0;
@@ -1572,7 +1609,7 @@ function updateReentryTrades(mint, price) {
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeRealTrade(trade, price, "SL"); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeRealTrade(trade, price, "SL"); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
@@ -1623,7 +1660,7 @@ function updateFuerzaTrades(mint, price) {
     if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeDemoTrade(trade, price, "SL", 21); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeDemoTrade(trade, price, "SL", 21); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
@@ -1644,7 +1681,7 @@ function updateFuerzaTrades(mint, price) {
     if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || esPanico(trade, price)) { closeRealTrade(trade, price, "SL"); }
+      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeRealTrade(trade, price, "SL"); }
     } else {
       trade._slBelowCount = 0;
       if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
@@ -1983,6 +2020,7 @@ function migOpenTrades(entry) {
     mint: entry.mint, name: entry.name, symbol: entry.symbol,
     price, tp: +(price*MIG_TP).toFixed(12), sl: +(price*MIG_SL).toFixed(12),
     mcUsd: price*1_000_000_000, volumeUSD: entry.volumeUSD,
+    sigPct: entry.sigPct ?? null,   // [31-jul]
     vel: velSeg,   // [v11.9] para el veto de lentos (ya aplicado arriba)
     time: Date.now(),
   };
@@ -2390,7 +2428,7 @@ function updateRealTrades(mint, price, strategy) {
         setSL(trade, trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN), "breakeven");
         addLog(`🔒 BE (real): ${trade.symbol}`, "real");
       }
-      if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + MIG_LOCK_AT) {
+      if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + (((trade.cfg || MIG_CFG_BASE).arm ?? 25) / 100)) {   // [29-jul] escalón por clase
         trade.trailingPhase = "FOLLOWING";
       }
       if (trade.trailingPhase === "FOLLOWING") {
@@ -2413,7 +2451,7 @@ function updateRealTrades(mint, price, strategy) {
     if (price >= trade.tp) reason = "TP";
     else if (price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      trade._slPanic = esPanico(trade, price);   // [FIX 27-jul]
+      trade._slPanic = esPanico(trade, price) && !tickFantasma(trade, price);   // [FIX 27-jul · 31-jul anti-pinchazo]
       if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
     } else { trade._slBelowCount = 0; trade._slPanic = false; }
     if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
@@ -2462,6 +2500,7 @@ function openDemoTrade(signal) {
   if (signal.strategy === "migration") {   // [29-jul] motor por clases: abre con la Base y a los 2s se enruta
     trade.cfg = MIG_CFG_BASE;
     trade.velSeg = signal.vel ?? null;
+    trade.sigPct = signal.sigPct ?? null;   // [31-jul] la senal que abrio la puerta, para el MIGCLOSE
     trade.mcOpenUsd = signal.mcUsd ?? null;
     trade.sl = +(trade.entryPrice * (1 + MIG_CFG_BASE.sl / 100)).toFixed(12);
     trade.tp = +(trade.entryPrice * (1 + MIG_CFG_BASE.tp / 100)).toFixed(12);
@@ -2492,7 +2531,7 @@ function updateDemoTrades(mint, price, strategy) {
         trade.trailingPhase = "BREAKEVEN";
         setSL(trade, trade.entryPrice * (1 + MIG_BREAKEVEN_MARGIN), "breakeven");
       }
-      if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + MIG_LOCK_AT) {
+      if ((trade.trailingPhase === "INITIAL" || trade.trailingPhase === "BREAKEVEN") && gainRatio >= 1 + (((trade.cfg || MIG_CFG_BASE).arm ?? 25) / 100)) {   // [29-jul] escalón por clase
         trade.trailingPhase = "FOLLOWING";
         addLog(`📈 TRAILING: ${trade.symbol} +${((gainRatio-1)*100).toFixed(0)}%`, "demo");
       }
@@ -2508,7 +2547,7 @@ function updateDemoTrades(mint, price, strategy) {
           const newSL = price * (1 - trailPct);
           if (newSL > trade.sl) setSL(trade, newSL, "trail");
           if (cfgM.pisoOn !== false) {
-            if (trade.maxGainPct >= MIG_STEP_TRIGGER * 100) {
+            if (trade.maxGainPct >= (cfgM.arm ?? 25)) {   // [29-jul] escalón por clase
               const stepFloor = trade.entryPrice * (1 + cfgM.piso1 / 100);
               if (stepFloor > trade.sl) setSL(trade, stepFloor, "piso1");
             }
@@ -2531,7 +2570,7 @@ function updateDemoTrades(mint, price, strategy) {
     if (!reason && price >= trade.tp) reason = "TP";
     else if (!reason && price <= trade.sl) {
       trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      trade._slPanic = esPanico(trade, price);   // [FIX 27-jul]
+      trade._slPanic = esPanico(trade, price) && !tickFantasma(trade, price);   // [FIX 27-jul · 31-jul anti-pinchazo]
       if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
     } else { trade._slBelowCount = 0; trade._slPanic = false; }
     if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
@@ -2618,6 +2657,10 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   broadcast({ event: "demoTradeClosed", data: trade });
   broadcast({ event: "stats", data: state.stats });
   saveState();
+  // [31-jul] MIGCLOSE de vuelta: linea parseable de cierre para cuadrar el lab con lo que hace el bot.
+  // El MIGREC se emite al acabar la camara (60min), asi que su cierre_real puede ir en n/a; esta linea
+  // permite cruzar por mint el resultado real de CADA cierre (migracion, re-caza y fuerza).
+  addLog(`[MIGCLOSE] mint=${trade.mint} sym=${trade.symbol} strat=${trade.strategy} pnl=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% reason=${reason} dur=${Math.round((Date.now() - trade.openTime) / 1000)}s runner=${trade.runnerActive ? 1 : 0} cfg=${(trade.cfg || {}).nom || "-"} sig=${trade.sigPct != null ? trade.sigPct : "n/a"} vel=${trade.velSeg != null ? trade.velSeg : "n/a"} mov2s=${trade.mov2s != null ? trade.mov2s.toFixed(2) : "n/a"} lote=${trade.sizeSol != null ? trade.sizeSol : "n/a"}`, "rec");
   if (isMig(trade)) {
     liveRecFinish(trade.mint, trade.pnlPct);
     if (!state.realTrades.some(t => t.mint === trade.mint && (t.status === "OPEN" || t.status === "CLOSING"))
