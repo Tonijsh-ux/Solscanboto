@@ -1698,7 +1698,7 @@ const LAB_EXTEND_MS = 60 * 60_000;   // [FIX 27-jul] 30→60 min: la cámara aho
 const labStats = { premigOk: 0, premigErr: 0, migrecs: 0, inicio: Date.now() };
 setInterval(() => {
   const h = ((Date.now() - labStats.inicio) / 3600000).toFixed(1);
-  addLog(`[LAB-SALUD] ${h}h de lab | migraciones=${state.stats.mig_migrations} entradas=${state.stats.mig_entered} MIGRECs=${labStats.migrecs} PREMIG ok=${labStats.premigOk} err=${labStats.premigErr}${labStats.premigErr > labStats.premigOk ? " ⚠️ HELIUS FALLANDO" : ""}`, "info");
+  addLog(`[LAB-SALUD] ${h}h de lab | migraciones=${state.stats.mig_migrations} entradas=${state.stats.mig_entered} MIGRECs=${labStats.migrecs} PREMIG ok=${labStats.premigOk} err=${labStats.premigErr}${labStats.premigErr > labStats.premigOk ? " ⚠️ HELIUS FALLANDO" : ""} | feed: ${Math.round((Date.now()-feedLastMigAt)/60000)}min sin migracion, reconexiones=${feedReconexiones}`, "info");
 }, 3600_000);
 
 // ═══════════════ [v11.9] TORNEO DE SOMBRAS ═══════════════
@@ -2717,12 +2717,41 @@ setInterval(async () => {
 // PUMPPORTAL WEBSOCKET
 // ════════════════════════════════════════════════════════════════
 
+// ═══ [1-ago] VIGILANTE DEL FEED ═══
+// Sintoma real (31-jul): el WS quedo zombi a las 6:00 — conectado, sin cerrarse y sin recibir
+// nada. El bot siguio "vivo" 9h con migraciones=257 congelado y ~35 entradas perdidas.
+// Aqui lo detectamos y forzamos reconexion. Dos relojes: mensajes (cualquier trade) y
+// migraciones (mas lentas: a ~1.150/dia, 20min sin ninguna ya es anomalo).
+let feedLastMsgAt = Date.now();
+let feedLastMigAt = Date.now();
+let feedReconexiones = 0;
+const FEED_MSG_TIMEOUT_MS = 3 * 60_000;    // 3 min sin ningun mensaje = feed muerto
+const FEED_MIG_TIMEOUT_MS = 20 * 60_000;   // 20 min sin ninguna migracion = sospechoso
+function feedWatchdog() {
+  const ahora = Date.now();
+  const sinMsg = ahora - feedLastMsgAt, sinMig = ahora - feedLastMigAt;
+  const estado = pumpPortalWs ? pumpPortalWs.readyState : -1;
+  let motivo = null;
+  if (sinMsg > FEED_MSG_TIMEOUT_MS) motivo = `${Math.round(sinMsg / 60000)}min sin NINGUN mensaje`;
+  else if (sinMig > FEED_MIG_TIMEOUT_MS) motivo = `${Math.round(sinMig / 60000)}min sin ninguna migracion`;
+  else if (estado !== 1 && estado !== 0) motivo = `socket en estado ${estado}`;
+  if (!motivo) return;
+  feedReconexiones++;
+  addLog(`🚨 FEED ZOMBI: ${motivo} — forzando reconexion (#${feedReconexiones})`, "error");
+  feedLastMsgAt = ahora; feedLastMigAt = ahora;   // margen para que la nueva conexion respire
+  try { if (pumpPortalWs) { pumpPortalWs.removeAllListeners(); pumpPortalWs.terminate(); } } catch {}
+  pumpPortalWs = null;
+  setTimeout(connectPumpPortal, 1000);
+}
+setInterval(feedWatchdog, 60_000);
+
 function connectPumpPortal() {
   addLog("🔌 Conectando PumpPortal…", "info");
   pumpPortalWs = new WebSocket(PUMPPORTAL_WS);
 
   pumpPortalWs.on("open", () => {
     addLog("✅ PumpPortal conectado", "info");
+    feedLastMsgAt = Date.now(); feedLastMigAt = Date.now();   // [1-ago] relojes a cero
     pumpPortalWs.send(JSON.stringify({ method: "subscribeMigration" }));
     const activeMints = [
       ...new Set([
@@ -2740,9 +2769,11 @@ function connectPumpPortal() {
   });
 
   pumpPortalWs.on("message", (raw) => {
+    feedLastMsgAt = Date.now();   // [1-ago] pulso del vigilante: cualquier mensaje cuenta
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.txType === "migrate" || msg.txType === "migration") {
+        feedLastMigAt = Date.now();   // [1-ago] pulso especifico de migraciones
         migStartWatching({ mint: msg.mint, name: msg.name, symbol: msg.symbol, marketCapSol: msg.marketCapSol });
         return;
       }
