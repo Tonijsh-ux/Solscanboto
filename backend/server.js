@@ -89,7 +89,9 @@ const MIG_SL = 0.61;   // [v11.9] -39% (la del sofá)
 // [CAMBIO 9-jul] Expiración 12min → 3 HORAS: el Excel de revisión demostró que los
 // topes reales llegan a las 2h (ej. $33K→$416K a las 2h de entrar) y la expiración
 // corta decapitaba a las corredoras. Se mantiene como red de seguridad anti-zombi.
-const MIG_DURATION_MS = 60 * 60 * 1000; // 60 min: punto medio entre los 30 propuestos y las 2h de los topes del Excel
+const MIG_DURATION_MS = 0;   // [4-ago] 0 = SIN EXPIRACIÓN: la op vive hasta que el trailing la cierre.
+                             // Antes 60min, pero cerraba cohetes vivos solo por el reloj.
+const MIG_HARD_MAX_MS = 6 * 60 * 60 * 1000;   // salvavidas: 6h de tope absoluto
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
@@ -141,6 +143,12 @@ const MIG_MIN_HOLDERS = 20;
 // top es < 0.5 SOL, perfil rug — fuera. Fail-open: sin dato del PREMIG, la op entra igual.
 // Poner MIG_MIN_TOPBAL=0 en el entorno para apagarlo.
 const MIG_MIN_TOPBAL = +(process.env.MIG_MIN_TOPBAL ?? 0.5);
+const MIG_DECIDE_ON = true;    // [4-ago] el bot decide EXACTAMENTE en los mismos instantes que graba
+                               // (ver cadenciaMs): 1s los 3 primeros min, 2s hasta los 30, 5s después.
+                               // Los ticks intermedios se descartan enteros: ni mueven el máximo ni
+                               // disparan el stop. false = tick a tick (comportamiento antiguo).
+const MIG_REQUIRE_TG = true;   // [4-ago] puerta de TELEGRAM (fail-open: sin dato de redes, pasa).
+                               // El lab la usa en su config validada; sin esto el bot entraría en ~2x más ops.
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
@@ -234,9 +242,9 @@ function factorCalor() {
 const REENTRY_ON = true;
 const REENTRY_MIN_T = 45;            // no antes del segundo 45 de la grabación
 const REENTRY_DIP = -51;   // [29-jul] tornillo del lab (era -60)
-const REENTRY_JUMP = 42;   // [29-jul] tornillo del lab (era 45)
-const REENTRY_ZONE = -32;            // [29-jul] tornillo del lab: entra ya desde -32% (era -5)
-const REENTRY_SL = -30;              // SL relativo a la re-entrada
+const REENTRY_JUMP = 40;   // [4-ago] tornillo del lab
+const REENTRY_ZONE = -45;            // [4-ago] tornillo del lab: entra desde -45%
+const REENTRY_SL = -31;              // [4-ago] tornillo del lab
 const REENTRY_ARM = 150;  // [29-jul] tornillo del lab: arma el trailing a +150 (era 50)
 const REENTRY_TRAIL = 0.80;   // [29-jul] tornillo del lab: anchura 80% (era 55)
 const REENTRY_MAX_OPEN = 10;
@@ -290,6 +298,19 @@ const LIVE_RECORD = true;
 const LIVE_REC_DENSE_MS = 180_000;   // [FIX 27-jul] 1min→3min de muestreo a 1s: el 80% de las salidas se decide ahí y el lab divergía del bot justo en esa ventana (mediana real +3.6 vs simulada -5.0)
 const LIVE_REC_DENSE_INTERVAL = 1_000;   // [v11.9] 1s el primer minuto: escalera s0-s10 exacta, gratis
 const LIVE_REC_NORMAL_INTERVAL = 5_000;
+// [4-ago] CADENCIA ÚNICA: la misma escalera gobierna la CÁMARA y las DECISIONES del bot.
+// Así el lab reproduce exactamente lo que hizo el bot: si la curva tiene un punto por segundo,
+// el bot decidió una vez por segundo; si tiene uno cada 5s, el bot también miró cada 5s.
+// dt = milisegundos desde la entrada · nPts = puntos ya grabados (salvavidas de tamaño).
+function cadenciaMs(dt, nPts) {
+  let i;
+  if (dt <= LIVE_REC_DENSE_MS) i = LIVE_REC_DENSE_INTERVAL;   // 0-3 min  → 1s
+  else if (dt <= 1_800_000)    i = 2_000;                     // 3-30 min → 2s
+  else                         i = LIVE_REC_NORMAL_INTERVAL;  // >30 min  → 5s
+  if (nPts > 3000) i = Math.max(i, 10_000);
+  if (nPts > 6000) i = Math.max(i, 30_000);
+  return i;
+}
 const OBS_MIN_VOL = 2_000;
 const OBS_MIN_MC = 20_000;
 const OBS_RECORD_MS = 600_000;
@@ -317,7 +338,9 @@ const MIG_BE_ON = process.env.MIG_BE_ON === "true";   // [v11.9] BE OFF por defe
 const MIG_LOCK_AT = 0.25;             // trailing FOLLOWING se arma en +25%
 const MIG_FOLLOW_PCT = 0.90;   // [v11.9] x6.3 (cap 90%)  // [v11] x2.5 — config del usuario validada (train +36 / test +4.5, 11/13 días)
 const MIG_MAX_PRICE_RATIO = 2.0;
-const MIG_SL_CONFIRM_TICKS = 2;
+const MIG_SL_CONFIRM_TICKS = 1;   // [4-ago] 2→1: el lab cierra en la PRIMERA muestra bajo el stop.
+                                  // Con la cadencia compartida, una mecha de milisegundos ya no llega
+                                  // a muestrearse, así que la confirmación extra solo generaba divergencia.
 // [FIX 27-jul] 🪂 PERFORACIÓN PROFUNDA: la confirmación de 2 ticks protege de mechas CERCA del
 // stop, pero en un rug vertical cada tick llega cientos de puntos más abajo (caso 5nHepJY: stop
 // +535, salida real +12). Si el precio ATRAVIESA el stop más de un 12%, se ejecuta al instante
@@ -368,7 +391,15 @@ const MIG_ENTRY_SPIKE_MAX = 30;   // [31-jul, relajado] ANTI-SPIKE DE ENTRADA: s
 // igual que el lab. t10/t5/txs/edad del PREMIG; vel y MC de la señal; mov2s a los 2s.
 // La única diferencia con el lab: allí los tornillos de la clase aplican desde t=0;
 // en vivo solo se conocen a t=2s, así que los 2 primeros segundos corren con la Base.
-const MIG_CFG_BASE = { nom:"base", sl:-40, mult:4.5, arm:25, piso1:20, piso2:60, pisoOn:true, runTrig:101, runTr:75, ndT:90, ndMin:30, tp:750 };
+// [4-ago] Base = la configuración validada en el lab (275 ops, sig>=3+vel<=10+topBal+telegram):
+// stop -40 · anchura x7 · escalón +30 · piso1 breakeven (0%) · piso2 +60 · SIN moon-bag · ND 90s/+25% · SIN take profit
+const MIG_CFG_BASE = { nom:"base", sl:-40, mult:7.0, arm:30, piso1:0, piso2:60, pisoOn:true, moonOn:false, runTrig:75, runTr:50, ndT:90, ndMin:25, tp:1e9 };
+// [4-ago] CLASES DESACTIVADAS. El lab valida la config Base sobre TODAS las ops; el server, en cambio,
+// enrutaba a 4 clases cuyas ventanas de vel (<3.8, <5.4) ya no encajan con la población actual
+// (mediana 5.8s), así que apenas se activaban y, cuando lo hacían, ejecutaban otra estrategia
+// distinta de la validada. Para que bot y lab hagan lo mismo, todo va a la Base.
+// Para reactivarlas: MIG_CLASES_ON = true y recalibrar sus condiciones en el lab primero.
+const MIG_CLASES_ON = false;
 const MIG_CFGS = [
   { cond:d=> d.t10!=null&&d.t10>87 && d.mov!=null&&d.mov>1.12 && d.t5!=null&&d.t5>75,
     C:{ nom:"godzilla", arm:25, sl:-29, mult:6.0, piso1:24, piso2:80, pisoOn:false, runTrig:49, runTr:33, ndT:41, ndMin:58, tp:1e9 } },
@@ -384,6 +415,7 @@ function migCfgTrailPct(maxGainPct, mult) {   // mismos tiers del lab: b(máx) �
   return Math.min(0.90, b * mult);
 }
 function migRouteCfg(trade) {
+  if (!MIG_CLASES_ON) { trade.cfg = MIG_CFG_BASE; return; }   // [4-ago] todo con la Base, como el lab
   const pre = premigData.get(trade.mint) || {};
   const d = { t10: pre.top10Pct ?? null, t5: pre.top5Pct ?? null, tx: pre.total ?? null, ed: pre.ageMin ?? null,
               vel: trade.velSeg ?? null, mc: trade.mcOpenUsd ?? null, mov: trade.mov2s ?? null };
@@ -1330,6 +1362,12 @@ function migQualTick(entry, price) {
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
+      // [4-ago] ✈️ PUERTA DE TELEGRAM (mando del lab, fail-open: sin dato de redes, pasa)
+      if (MIG_REQUIRE_TG && preD && preD.tg === false) {
+        addLog(`✈️ MIG SIN TELEGRAM: ${entry.symbol} descartada | el token no tiene canal de Telegram`, "filter");
+        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        broadcast({ event: "stats", data: state.stats }); return;
+      }
       const franjaEvit2 = franjaHorariaEvitada();
       if (franjaEvit2) {
         addLog(`🕐 MIG HORARIO: ${entry.symbol} descartada | franja evitada: ${franjaEvit2}`, "filter");
@@ -1518,9 +1556,14 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
     if (isBuy) { w.buyUsd += volUSD; w.buys++; } else { w.sellUsd += volUSD; w.sells++; }
   }
   const dt = Date.now() - rec.t0;
-  const interval = dt <= LIVE_REC_DENSE_MS ? LIVE_REC_DENSE_INTERVAL : LIVE_REC_NORMAL_INTERVAL;
+  // [4-ago] ESCALERA DE MUESTREO. El bot decide cada 1s (MIG_DECIDE_MS) durante TODA la vida de la op;
+  // si la cámara graba cada 5s, el lab no puede reproducir esas decisiones y diverge justo donde ahora
+  // vive la estrategia (sin expiración, las ops duran horas). Densificamos, con tope de puntos para
+  // que la línea de log no se dispare.
+  const interval = cadenciaMs(dt, rec.pts ? rec.pts.length : 0);
   if (Date.now() - rec.lastSample < interval) return;
   rec.lastSample = Date.now();
+  rec.sampleTick = rec.lastSample;   // [4-ago] sello: en ESTE tick sí hay muestra → el motor decide aquí
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
   rec.puntos.push({ t: Math.round(dt/1000), p: pct });
   // [v11.9] FUERZA: el precio supera el máximo previo en el margen -> perseguir
@@ -1554,7 +1597,7 @@ function maybeReentry(rec, price, pct, tSec) {
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "REENTRY", status: "OPEN",
-    expiresAt: Date.now() + MIG_DURATION_MS, mov1s: null, mov2s: null,
+    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS), mov1s: null, mov2s: null,
   };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
@@ -1631,7 +1674,7 @@ function fzOpenTrades(rec, price) {
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "FUERZA", status: "OPEN",
-    expiresAt: Date.now() + MIG_DURATION_MS, mov1s: null, mov2s: null,
+    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS), mov1s: null, mov2s: null,
   };
   state.demoTrades.unshift(trade);
   if (state.demoTrades.length > 500) state.demoTrades.pop();
@@ -1955,7 +1998,11 @@ function liveRecFinish(mint, cierreRealPct) {
     rec.fzArmed = true;
     if (FZ_ON) addLog(`⚡ FUERZA armada: ${rec.symbol} — disparo si supera +${rec.fzTrigPct}% (máx visto ${maxP.toFixed(0)}% × margen ${FZ_MARGIN*100}%)`, "info");
   }
-  const restante = (rec.t0 + LAB_EXTEND_MS) - Date.now();
+  // [4-ago] sin expiración, la cámara acompaña a la op mientras siga abierta (si no, el lab quedaría ciego)
+  const sigueAbierta = state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")
+                    || state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"));
+  const ventana = sigueAbierta ? Math.min(MIG_HARD_MAX_MS, LAB_EXTEND_MS * 6) : LAB_EXTEND_MS;
+  const restante = (rec.t0 + ventana) - Date.now();
   if (restante <= 0) { liveRecEmit(mint); return; }
   if (!rec._emitTimer) rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
 }
@@ -2270,7 +2317,7 @@ async function openRealTrade(signal) {
     status: "OPEN", result: null, pnlPct: null, pnlSol: null,
     maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: signal.strategy === "migration" ? "INITIAL" : signal.strategy.toUpperCase(),
-    expiresAt: Date.now() + MIG_DURATION_MS,
+    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS),
   };
   state.realTrades.unshift(trade);
   if (state.realTrades.length > 200) state.realTrades.pop();
@@ -2414,8 +2461,14 @@ function veloDropTriggered(trade, price) {
 }
 
 function updateRealTrades(mint, price, strategy) {
+  const nowR = Date.now();
   for (const trade of state.realTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
+    // [4-ago] idéntico al demo: solo se decide en los ticks grabados
+    if (MIG_DECIDE_ON && isMig(trade)) {
+      const rec = state.liveRecordings.get(trade.mint);
+      if (rec) { if (trade._lastEval === rec.sampleTick) continue; trade._lastEval = rec.sampleTick; }
+    }
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
@@ -2494,7 +2547,7 @@ function openDemoTrade(signal) {
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
-    expiresAt: Date.now() + MIG_DURATION_MS,
+    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS),
     mov1s: null, mov2s: null,
   };
   if (signal.strategy === "migration") {   // [29-jul] motor por clases: abre con la Base y a los 2s se enruta
@@ -2520,6 +2573,12 @@ function updateDemoTrades(mint, price, strategy) {
   const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
+    // [4-ago] el motor decide EXACTAMENTE en los ticks que la cámara graba (mismo sello, mismo instante).
+    // Si no hay muestra en este tick, se descarta entero: ni mueve el máximo ni dispara el stop.
+    if (MIG_DECIDE_ON && isMig(trade)) {
+      const rec = state.liveRecordings.get(trade.mint);
+      if (rec) { if (trade._lastEval === rec.sampleTick) continue; trade._lastEval = rec.sampleTick; }
+    }
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
@@ -2582,7 +2641,7 @@ function updateDemoTrades(mint, price, strategy) {
     // [CAMBIO 9-jul] MOON-BAG: si el trailing dispara y el máximo tocó +50% en verde,
     // en vez de cerrar todo → vender 75% y dejar el 25% corriendo (solo demo).
     if (reason === "SL" && isMig(trade) && MIG_RUNNER_ON && !trade.runnerActive
-        && !trade._slPanic && trade.maxGainPct >= ((trade.cfg || MIG_CFG_BASE).runTrig) && currentPct > 0) {   // [FIX 27-jul] perforación profunda cierra TODO · [29-jul] gatillo por clase
+        && !trade._slPanic && ((trade.cfg || MIG_CFG_BASE).moonOn !== false) && trade.maxGainPct >= ((trade.cfg || MIG_CFG_BASE).runTrig) && currentPct > 0) {   // [4-ago] moon-bag por clase   // [FIX 27-jul] perforación profunda cierra TODO · [29-jul] gatillo por clase
       trade.runnerActive = true;
       trade.runnerPartialPct = currentPct;
       trade.trailingPhase = "RUNNER";
