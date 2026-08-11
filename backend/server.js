@@ -147,8 +147,12 @@ const MIG_DECIDE_ON = true;    // [4-ago] el bot decide EXACTAMENTE en los mismo
                                // (ver cadenciaMs): 1s los 3 primeros min, 2s hasta los 30, 5s después.
                                // Los ticks intermedios se descartan enteros: ni mueven el máximo ni
                                // disparan el stop. false = tick a tick (comportamiento antiguo).
-const MIG_REQUIRE_TG = true;   // [4-ago] puerta de TELEGRAM (fail-open: sin dato de redes, pasa).
-                               // El lab la usa en su config validada; sin esto el bot entraría en ~2x más ops.
+// [5-ago] PUERTA DE REDES SOCIALES (fail-open: sin dato, pasa).
+//   "tg"      → exige Telegram. Lo tiene el 13% de los tokens; en el lab separa +37 vs -31 mSOL/op (11 ops).
+//   "tg_o_tw" → exige Telegram O Twitter. Twitter lo tiene el 90%, así que deja pasar casi todo:
+//               en el lab 131 de 135 ops, resultado casi idéntico a no filtrar (-29 vs -31 mSOL/op).
+//   "off"     → sin puerta de redes.
+const MIG_RED_MODO = "tg_o_tw";
 const premigData = new Map();        // mint → { ageMin, total, holders, topPct, top5Pct, top10Pct, creator }
 // [v10.1] MEMORIA DE CREADORES: wallet que acuñó cada token → resultados con nosotros.
 // Fase 1 = solo medir (¿los rugs vienen de reincidentes?). El filtro llegará si los datos lo validan.
@@ -294,6 +298,14 @@ const MIG_RUNNER_FLOOR = 0;          // el runner nunca cierra por debajo de bre
 
 // ── MODO OBSERVADOR / GRABACIÓN EN VIVO ────────────────────────
 const OBSERVER_MODE = false;
+// ═══ [5-ago] GRABADOR DE RECHAZADOS ═══
+// El bot solo graba las ops en las que ENTRA, así que no hay forma de saber si los filtros
+// eligen bien: solo vemos supervivientes. Esto graba una MUESTRA de los tokens rechazados
+// SIN operarlos, para poder comparar en el lab qué habrían hecho.
+const REJ_REC_ON = true;        // grabar rechazados (no opera: solo cámara)
+const REJ_REC_RATIO = 0.34;     // 1 de cada 3 aprox. (para no saturar suscripciones)
+const REJ_REC_MS = 30 * 60_000; // 30 min de grabación por token rechazado
+const REJ_REC_MAX = 12;         // máximo de rechazados grabándose a la vez
 const LIVE_RECORD = true;
 const LIVE_REC_DENSE_MS = 180_000;   // [FIX 27-jul] 1min→3min de muestreo a 1s: el 80% de las salidas se decide ahí y el lab divergía del bot justo en esa ventana (mediana real +3.6 vs simulada -5.0)
 const LIVE_REC_DENSE_INTERVAL = 1_000;   // [v11.9] 1s el primer minuto: escalera s0-s10 exacta, gratis
@@ -638,6 +650,7 @@ const state = {
   migWatching: new Map(),
   migMonitored: new Map(),
   obsRecordings: new Map(),
+  rejRecordings: new Map(),   // [5-ago] cámaras de tokens rechazados (no operados)
   mcoRecordings: new Map(),
   liveRecordings: new Map(),
   signals: [],
@@ -1144,7 +1157,8 @@ async function registrarCalidadPremig(mint, symbol) {
     const socStr = soc ? ` socials=${soc.nSoc}${soc.nSoc ? "(" + [soc.tg?"tg":null, soc.tw?"tw":null, soc.web?"web":null].filter(Boolean).join(",") + ")" : ""}` : "";
     premigData.set(mint, { ageMin, total, holders: holdersNum, topPct: topPctNum, top5Pct: top5Num, top10Pct: top10Num, creator, hq: hqStr.trim(),
       topBalMed: tbMed, topBalMin: tbMin, newW: newWn,
-      nSoc: soc ? soc.nSoc : null, tg: soc ? soc.tg : null });   // [FIX 26-jul] redes para los filtros-sombra
+      nSoc: soc ? soc.nSoc : null, tg: soc ? soc.tg : null,
+      tw: soc ? soc.tw : null, web: soc ? soc.web : null });   // [FIX 26-jul] redes · [5-ago] +tw/web para la puerta
     addLog(`[PREMIG] sym=${symbol} mint=${mint} edadMin=${ageMin} txsTotal=${total}${holdersStr}${creStr}${hqStr}${socStr}`, "info");
     labStats.premigOk++;
   } catch (e) {
@@ -1363,8 +1377,10 @@ function migQualTick(entry, price) {
         }
       }
       // [4-ago] ✈️ PUERTA DE TELEGRAM (mando del lab, fail-open: sin dato de redes, pasa)
-      if (MIG_REQUIRE_TG && preD && preD.tg === false) {
-        addLog(`✈️ MIG SIN TELEGRAM: ${entry.symbol} descartada | el token no tiene canal de Telegram`, "filter");
+      const redOK = MIG_RED_MODO === "off" || !preD || preD.tg == null
+        || (MIG_RED_MODO === "tg" ? preD.tg === true : (preD.tg === true || preD.tw === true));
+      if (!redOK) {
+        addLog(`✈️ MIG SIN REDES [${MIG_RED_MODO}]: ${entry.symbol} descartada | tg=${preD.tg?1:0} tw=${preD.tw?1:0}`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
@@ -1474,6 +1490,46 @@ function migEvaluate(mint) {
     addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
     state.stats.mig_rejected++; broadcast({ event: "stats", data: state.stats });
   }
+}
+
+// [5-ago] graba un token RECHAZADO sin operarlo. motivo = por qué puerta se cayó.
+function rejStartRecording(entry, price, motivo) {
+  if (!REJ_REC_ON || !price || price <= 0) return false;
+  if (state.rejRecordings.size >= REJ_REC_MAX) return false;
+  if (state.rejRecordings.has(entry.mint)) return false;
+  if (Math.random() > REJ_REC_RATIO) return false;
+  const pre = premigData.get(entry.mint) || {};
+  const rec = { mint: entry.mint, symbol: entry.symbol, motivo,
+    vel: +(((Date.now() - entry.startTime) / 1000).toFixed(1)),
+    mc: price * 1_000_000_000, vol: Math.round(entry.volumeUSD || 0),
+    sig: entry.sigPct ?? null, tb: pre.topBalMed ?? null, tg: pre.tg ?? null,
+    t0: Date.now(), entryPrice: price, puntos: [{ t: 0, p: 0 }], lastSample: Date.now(), finished: false };
+  state.rejRecordings.set(entry.mint, rec);
+  addLog(`👁️ OBS RECHAZADA [${motivo}]: ${entry.symbol} — grabando ${REJ_REC_MS/60000}min sin operar`, "info");
+  rec.timer = setTimeout(() => rejFinish(entry.mint), REJ_REC_MS);
+  return true;   // true = NO desuscribir, la cámara necesita los ticks
+}
+function rejSample(mint, price) {
+  const rec = state.rejRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  const dt = Date.now() - rec.t0;
+  const interval = cadenciaMs(dt, rec.puntos.length);
+  if (Date.now() - rec.lastSample < interval) return;
+  rec.lastSample = Date.now();
+  rec.puntos.push({ t: Math.round(dt / 1000), p: +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2) });
+}
+function rejFinish(mint) {
+  const rec = state.rejRecordings.get(mint);
+  if (!rec || rec.finished) return;
+  rec.finished = true; clearTimeout(rec.timer);
+  const pts = rec.puntos, mx = Math.max(...pts.map(q => q.p)), mn = Math.min(...pts.map(q => q.p));
+  const mxT = (pts.find(q => q.p === mx) || {}).t;
+  addLog(`[REJREC] mint=${rec.mint} motivo=${rec.motivo} vel=${rec.vel}s MC=$${(rec.mc/1000).toFixed(1)}K vol=${rec.vol} `
+    + `sig=${rec.sig ?? "n/a"} tb=${rec.tb ?? "n/a"} tg=${rec.tg === null ? "n/a" : (rec.tg ? 1 : 0)} `
+    + `MAX=${mx.toFixed(1)}%@${mxT}s MIN=${mn.toFixed(1)}% dur_rec=${pts[pts.length-1].t}s `
+    + `pts=${pts.map(q => q.t + ":" + q.p).join(",")}`, "rec");
+  state.rejRecordings.delete(mint);
+  unsubscribeToken(mint);
 }
 
 function obsStartRecording(entry, entryPrice, velMs) {
