@@ -2784,6 +2784,7 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   // [5-ago] desglose para la tarjeta del panel: MC de entrada, pico y salida + neto en SOL
   trade.mcClose = trade.mcEntry ? trade.mcEntry * (1 + pnlPct / 100) : null;
   trade.mcMin = trade.mcEntry ? trade.mcEntry * (1 + trade.maxLossPct / 100) : null;
+  trade.mcMax = trade.mcEntry ? trade.mcEntry * (1 + trade.maxGainPct / 100) : trade.mcMax;   // [5-ago] refrescar al cerrar
   trade.brutoSol = pnlSolOp;                                  // ya calculado arriba con el lote real
   trade.netoSol = +(pnlSolOp - (trade.sizeSol ?? SOL_PER_TRADE_MIG) * 0.045).toFixed(4);   // fricción 4.5%
   trade.dejadoPts = +(trade.maxGainPct - pnlPct).toFixed(1);
