@@ -107,6 +107,7 @@ function StrategyBadge({ strategy }) {
 }
 
 function TradeCard({ trade, isReal }) {
+ const [abierto, setAbierto] = useState(false);   // [5-ago] desglose plegable
  const isOpen = trade.status === "OPEN";
  const sym = trade.symbol && trade.symbol !== "???" ? trade.symbol : `${(trade.mint||"").slice(0,6)}…`;
  const slPct = trade.slPct ?? (trade.sl && trade.entryPrice ? ((trade.sl / trade.entryPrice) - 1) * 100 : null);
@@ -147,13 +148,63 @@ function TradeCard({ trade, isReal }) {
      {isReal && trade.buySignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 2 }}>Buy: <a href={`https://solscan.io/tx/${trade.buySignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.buySignature.slice(0,12)}…</a></div>}
      {isReal && trade.sellSignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 4 }}>Sell: <a href={`https://solscan.io/tx/${trade.sellSignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.sellSignature.slice(0,12)}…</a></div>}
      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-       <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
+       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+         <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
+         <button onClick={() => setAbierto(v => !v)} style={{ fontFamily: "monospace", fontSize: 9, color: "#94a3b8", background: "#131c2b", border: "1px solid #1e2d40", borderRadius: 6, padding: "2px 7px", cursor: "pointer" }}>
+           {abierto ? "▾ detalle" : "▸ detalle"}
+         </button>
+       </div>
        {isOpen && (
          <div style={{ display: "flex", gap: 10, fontFamily: "monospace", fontSize: 9 }}>
            {restante !== null && <span style={{ color: restanteMs < 300000 ? "#facc15" : "#475569" }}>⏳ {restante}</span>}
            <span style={{ color: beatFrio ? "#f97316" : "#475569" }}>📶 {beat === null ? "—" : `${beat}s`}{beatFrio ? " 🥶" : ""}</span>
          </div>
        )}
+     </div>
+     {abierto && <TradeDetalle trade={trade} isOpen={isOpen} />}
+   </div>
+ );
+}
+
+// [5-ago] desglose de la op: market caps, dinero y lo que dejó sobre la mesa
+function TradeDetalle({ trade, isOpen }) {
+ const mcE = trade.mcEntry ?? (trade.entryPrice ? trade.entryPrice * 1e9 : null);
+ const f = v => 1 + (v || 0) / 100;
+ const mcAhora = mcE ? mcE * f(trade.currentPct) : null;
+ const mcMax = trade.mcMax ?? (mcE ? mcE * f(trade.maxGainPct) : null);
+ const mcMin = trade.mcMin ?? (mcE ? mcE * f(trade.maxLossPct) : null);
+ const mcFin = trade.mcClose ?? (!isOpen && mcE ? mcE * f(trade.pnlPct) : null);
+ const fmt = v => v == null ? "—" : v >= 1e6 ? `$${(v/1e6).toFixed(2)}M` : `$${(v/1000).toFixed(1)}K`;
+ const lote = trade.lote ?? trade.sizeSol ?? null;
+ const bruto = trade.brutoSol ?? (lote && trade.pnlPct != null ? lote * trade.pnlPct / 100 : null);
+ const neto = trade.netoSol ?? (lote && trade.pnlPct != null ? lote * (trade.pnlPct - 4.5) / 100 : null);
+ const dejado = trade.dejadoPts ?? (trade.pnlPct != null ? trade.maxGainPct - trade.pnlPct : null);
+ const sol = v => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(3)} SOL`;
+ const F = ({ k, v, c }) => (
+   <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
+     <span style={{ color: "#64748b" }}>{k}</span>
+     <span style={{ color: c || "#e2e8f0", fontWeight: 700 }}>{v}</span>
+   </div>
+ );
+ return (
+   <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1e2d40", fontFamily: "monospace", fontSize: 10 }}>
+     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 18px" }}>
+       <F k="MC entrada" v={fmt(mcE)} />
+       <F k="MC pico" v={fmt(mcMax)} c="#22c55e" />
+       <F k={isOpen ? "MC ahora" : "MC salida"} v={fmt(isOpen ? mcAhora : mcFin)} />
+       <F k="MC suelo" v={fmt(mcMin)} c="#ef4444" />
+       <F k="lote" v={lote != null ? `${lote} SOL` : "—"} />
+       <F k="dejó sin coger" v={dejado != null ? `${dejado.toFixed(0)} pts` : "—"} c="#facc15" />
+       {!isOpen && <F k="bruto" v={sol(bruto)} c={pctColor(trade.pnlPct || 0)} />}
+       {!isOpen && <F k="neto (fee 4.5%)" v={sol(neto)} c={neto >= 0 ? "#22c55e" : "#ef4444"} />}
+       {trade.velSeg != null && <F k="vel entrada" v={`${trade.velSeg}s`} />}
+       {trade.sigPct != null && <F k="señal" v={`+${trade.sigPct}%`} />}
+       {trade.mov2s != null && <F k="mov2s" v={`${trade.mov2s >= 0 ? "+" : ""}${trade.mov2s.toFixed(1)}%`} />}
+       {trade.cfg?.nom && <F k="config" v={trade.cfg.nom} />}
+     </div>
+     <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
+       <a href={`https://solscan.io/token/${trade.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 9, textDecoration: "none" }}>🔎 Solscan</a>
+       <span onClick={() => navigator.clipboard?.writeText(trade.mint)} style={{ color: "#64748b", fontSize: 9, cursor: "pointer" }}>📋 copiar mint</span>
      </div>
    </div>
  );
