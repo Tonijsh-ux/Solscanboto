@@ -170,10 +170,13 @@ function TradeCard({ trade, isReal }) {
 function TradeDetalle({ trade, isOpen }) {
  const mcE = trade.mcEntry ?? (trade.entryPrice ? trade.entryPrice * 1e9 : null);
  const f = v => 1 + (v || 0) / 100;
+ // [5-ago] los MC se DERIVAN siempre del MC de entrada y los porcentajes (que sí están al día).
+ // Antes se leía trade.mcMax/mcMin/mcClose, pero el server no los refresca al cerrar y llegaban
+ // con el valor inicial: el MC pico salía igual que el de entrada aunque la op hubiera hecho +126%.
  const mcAhora = mcE ? mcE * f(trade.currentPct) : null;
- const mcMax = trade.mcMax ?? (mcE ? mcE * f(trade.maxGainPct) : null);
- const mcMin = trade.mcMin ?? (mcE ? mcE * f(trade.maxLossPct) : null);
- const mcFin = trade.mcClose ?? (!isOpen && mcE ? mcE * f(trade.pnlPct) : null);
+ const mcMax = mcE ? mcE * f(trade.maxGainPct) : (trade.mcMax ?? null);
+ const mcMin = mcE ? mcE * f(trade.maxLossPct) : (trade.mcMin ?? null);
+ const mcFin = !isOpen && mcE ? mcE * f(trade.pnlPct) : (trade.mcClose ?? null);
  const fmt = v => v == null ? "—" : v >= 1e6 ? `$${(v/1e6).toFixed(2)}M` : `$${(v/1000).toFixed(1)}K`;
  const lote = trade.lote ?? trade.sizeSol ?? null;
  const bruto = trade.brutoSol ?? (lote && trade.pnlPct != null ? lote * trade.pnlPct / 100 : null);
