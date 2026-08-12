@@ -2529,6 +2529,7 @@ function updateRealTrades(mint, price, strategy) {
     trade.currentPct = +currentPct.toFixed(2);
     trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
     trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
+    if (trade.mcEntry) trade.mcMax = Math.max(trade.mcMax || 0, trade.mcEntry * (1 + trade.maxGainPct / 100));   // [5-ago]
 
     if (isMig(trade)) {
       const gainRatio = price / trade.entryPrice;
@@ -2603,6 +2604,11 @@ function openDemoTrade(signal) {
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: "INITIAL", status: "OPEN",
+    // [5-ago] datos para el desglose de la tarjeta del panel
+    mcEntry: signal.mcUsd ?? null,          // market cap al entrar
+    mcMax: signal.mcUsd ?? null,            // se irá actualizando con el máximo
+    velSeg: signal.vel ?? null, sigPct: signal.sigPct ?? null,
+    lote: null,                             // se rellena abajo con sizeSol
     expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS),
     mov1s: null, mov2s: null,
   };
@@ -2775,6 +2781,13 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   // [31-jul] MIGCLOSE de vuelta: linea parseable de cierre para cuadrar el lab con lo que hace el bot.
   // El MIGREC se emite al acabar la camara (60min), asi que su cierre_real puede ir en n/a; esta linea
   // permite cruzar por mint el resultado real de CADA cierre (migracion, re-caza y fuerza).
+  // [5-ago] desglose para la tarjeta del panel: MC de entrada, pico y salida + neto en SOL
+  trade.mcClose = trade.mcEntry ? trade.mcEntry * (1 + pnlPct / 100) : null;
+  trade.mcMin = trade.mcEntry ? trade.mcEntry * (1 + trade.maxLossPct / 100) : null;
+  trade.brutoSol = pnlSolOp;                                  // ya calculado arriba con el lote real
+  trade.netoSol = +(pnlSolOp - (trade.sizeSol ?? SOL_PER_TRADE_MIG) * 0.045).toFixed(4);   // fricción 4.5%
+  trade.dejadoPts = +(trade.maxGainPct - pnlPct).toFixed(1);
+  trade.lote = trade.sizeSol ?? SOL_PER_TRADE_MIG;
   addLog(`[MIGCLOSE] mint=${trade.mint} sym=${trade.symbol} strat=${trade.strategy} pnl=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% reason=${reason} dur=${Math.round((Date.now() - trade.openTime) / 1000)}s runner=${trade.runnerActive ? 1 : 0} cfg=${(trade.cfg || {}).nom || "-"} sig=${trade.sigPct != null ? trade.sigPct : "n/a"} vel=${trade.velSeg != null ? trade.velSeg : "n/a"} mov2s=${trade.mov2s != null ? trade.mov2s.toFixed(2) : "n/a"} lote=${trade.sizeSol != null ? trade.sizeSol : "n/a"}`, "rec");
   if (isMig(trade)) {
     liveRecFinish(trade.mint, trade.pnlPct);
