@@ -31,6 +31,7 @@ function useBackend() {
  const [movements, setMovements] = useState([]);
  const [log, setLog] = useState([]);
  const [stats, setStats] = useState({});
+ const [postCierre, setPostCierre] = useState({});   // [5-ago] qué hizo el token DESPUÉS de vender
  const [shadow, setShadow] = useState(null);
  const [fzJuicio, setFzJuicio] = useState(null);
  const [wsStatus, setWsStatus] = useState("connecting");
@@ -60,6 +61,7 @@ function useBackend() {
            return;
          }
          if (event === "stats") { setStats(data); return; }
+         if (event === "postCierre") { setPostCierre(p => ({ ...p, [data.mint]: data })); return; }   // [5-ago]
          if (event === "shadow") { setShadow(data); return; }
          if (event === "fzJuicio") { setFzJuicio(data); return; }
          if (event === "migWatchUpdate") { setMigWatching(p => p.map(w => w.mint === data.mint ? { ...w, ...data } : w)); return; }
@@ -106,7 +108,7 @@ function StrategyBadge({ strategy }) {
  );
 }
 
-function TradeCard({ trade, isReal }) {
+function TradeCard({ trade, isReal, post }) {
  const [abierto, setAbierto] = useState(false);   // [5-ago] desglose plegable
  const isOpen = trade.status === "OPEN";
  const sym = trade.symbol && trade.symbol !== "???" ? trade.symbol : `${(trade.mint||"").slice(0,6)}…`;
@@ -119,6 +121,10 @@ function TradeCard({ trade, isReal }) {
  const isLoss = trade.result === "LOSS";
  const color = isOpen ? (isReal ? "#f97316" : "#38bdf8") : isWin ? "#22c55e" : isLoss ? "#ef4444" : "#64748b";
  const statusLabel = isOpen ? (isReal ? "🔴 REAL" : "🔵 DEMO") : isWin ? "✅ WIN" : isLoss ? "❌ LOSS" : trade.result === "EXPIRED" ? "⏱️ EXP" : trade.result?.includes("WIN") ? "⏱️ +EXP" : "⏱️ -EXP";
+ // [5-ago] qué hizo el token DESPUÉS de que vendiéramos (la cámara sigue grabando 60 min)
+ const vered = post ? (post.veredicto || (post.max >= 50 ? "pronto" : post.max >= 15 ? "justo" : "bien")) : null;
+ const vCol = vered === "pronto" ? "#ef4444" : vered === "justo" ? "#facc15" : "#22c55e";
+ const vTxt = vered === "pronto" ? "vendiste pronto" : vered === "justo" ? "justo" : "buen cierre";
  return (
    <div style={{ background: "#0d1117", border: `1px solid ${color}${isOpen?"55":"33"}`, borderRadius: 10, padding: "10px 14px" }}>
      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
@@ -147,6 +153,16 @@ function TradeCard({ trade, isReal }) {
      {!isOpen && <div style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginBottom: 4 }}>P&L: <span style={{ color: pctColor(trade.pnlPct||0) }}>{(trade.pnlPct||0)>0?"+":""}{(trade.pnlPct||0).toFixed(2)}%</span>{isReal && trade.pnlSol !== null && <span style={{ color: pctColor(trade.pnlSol||0), marginLeft: 8 }}>{(trade.pnlSol||0)>0?"+":""}{(trade.pnlSol||0).toFixed(4)} SOL</span>}</div>}
      {isReal && trade.buySignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 2 }}>Buy: <a href={`https://solscan.io/tx/${trade.buySignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.buySignature.slice(0,12)}…</a></div>}
      {isReal && trade.sellSignature && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", marginBottom: 4 }}>Sell: <a href={`https://solscan.io/tx/${trade.sellSignature}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", textDecoration: "none" }}>{trade.sellSignature.slice(0,12)}…</a></div>}
+     {!isOpen && post && (
+       <div style={{ fontFamily: "monospace", fontSize: 10, marginBottom: 5, padding: "4px 7px", background: `${vCol}14`, border: `1px solid ${vCol}44`, borderRadius: 7, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+         <span style={{ color: "#94a3b8" }}>
+           🔭 tras vender: <b style={{ color: post.desde >= 0 ? "#22c55e" : "#ef4444" }}>{post.desde >= 0 ? "+" : ""}{post.desde}%</b>
+           {post.max > 0 && <span style={{ color: "#64748b" }}> · pico <b style={{ color: "#22c55e" }}>+{post.max}%</b></span>}
+           <span style={{ color: "#475569" }}> · {post.min}m</span>
+         </span>
+         <span style={{ color: vCol, fontWeight: 700 }}>{post.final ? (vered === "pronto" ? "❌ " : vered === "justo" ? "🟡 " : "✅ ") : "⏳ "}{vTxt}</span>
+       </div>
+     )}
      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
          <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
@@ -161,13 +177,13 @@ function TradeCard({ trade, isReal }) {
          </div>
        )}
      </div>
-     {abierto && <TradeDetalle trade={trade} isOpen={isOpen} />}
+     {abierto && <TradeDetalle trade={trade} isOpen={isOpen} post={post} />}
    </div>
  );
 }
 
 // [5-ago] desglose de la op: market caps, dinero y lo que dejó sobre la mesa
-function TradeDetalle({ trade, isOpen }) {
+function TradeDetalle({ trade, isOpen, post }) {
  const mcE = trade.mcEntry ?? (trade.entryPrice ? trade.entryPrice * 1e9 : null);
  const f = v => 1 + (v || 0) / 100;
  // [5-ago] los MC se DERIVAN siempre del MC de entrada y los porcentajes (que sí están al día).
@@ -204,6 +220,8 @@ function TradeDetalle({ trade, isOpen }) {
        {trade.sigPct != null && <F k="señal" v={`+${trade.sigPct}%`} />}
        {trade.mov2s != null && <F k="mov2s" v={`${trade.mov2s >= 0 ? "+" : ""}${trade.mov2s.toFixed(1)}%`} />}
        {trade.cfg?.nom && <F k="config" v={trade.cfg.nom} />}
+       {post && <F k="MC ahora" v={fmt(post.mcAhora)} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
+       {post && <F k="pico tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
      </div>
      <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
        <a href={`https://solscan.io/token/${trade.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 9, textDecoration: "none" }}>🔎 Solscan</a>
@@ -723,7 +741,7 @@ export default function App() {
              </div>
            </div>
            {reFzTrades.length === 0 && <EmptyState icon="🔄" text="Las re-entradas (cazadora de resurrecciones) y las fuerzas (persecución de breakouts) aparecerán aquí…" />}
-           {[...reFzTrades.filter(t => t.status === "OPEN"), ...reFzTrades.filter(t => t.status !== "OPEN")].slice(0, 60).map(t => <TradeCard key={t.id} trade={t} isReal={false} />)}
+           {[...reFzTrades.filter(t => t.status === "OPEN"), ...reFzTrades.filter(t => t.status !== "OPEN")].slice(0, 60).map(t => <TradeCard post={postCierre[t?.mint]} key={t.id} trade={t} isReal={false} />)}
          </>
        )}
 
@@ -768,7 +786,7 @@ export default function App() {
            </div>
            <FilterBar statusFilter={demoStatusFilter} setStatusFilter={setDemoStatusFilter} stratFilter={demoStratFilter} setStratFilter={setDemoStratFilter} accentColor="#38bdf8" />
            {filteredDemo.length === 0 && <EmptyState icon="💰" text="No hay operaciones con estos filtros." />}
-           {filteredDemo.map(t => <TradeCard key={t.id} trade={t} isReal={false} />)}
+           {filteredDemo.map(t => <TradeCard post={postCierre[t?.mint]} key={t.id} trade={t} isReal={false} />)}
          </>
        )}
 
@@ -792,7 +810,7 @@ export default function App() {
            </div>
            <FilterBar statusFilter={realStatusFilter} setStatusFilter={setRealStatusFilter} stratFilter={realStratFilter} setStratFilter={setRealStratFilter} accentColor="#f97316" />
            {filteredReal.length === 0 && <EmptyState icon="🔴" text="No hay operaciones con estos filtros." />}
-           {filteredReal.map(t => <TradeCard key={t.id} trade={t} isReal={true} />)}
+           {filteredReal.map(t => <TradeCard post={postCierre[t?.mint]} key={t.id} trade={t} isReal={true} />)}
          </>
        )}
 
