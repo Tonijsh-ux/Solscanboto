@@ -1598,6 +1598,18 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
+  // [5-ago] seguimiento post-cierre: cuánto se movió el token DESDE que vendimos
+  if (rec.post && rec.post.salida > 0) {
+    const p = rec.post, desde = (price / p.salida - 1) * 100;
+    p.ultimo = +desde.toFixed(1);
+    if (desde > p.maxDespues) p.maxDespues = +desde.toFixed(1);
+    if (Date.now() - p.lastEmit > 15_000) {
+      p.lastEmit = Date.now();
+      broadcast({ event: "postCierre", data: { mint, tradeId: p.tradeId, symbol: p.symbol,
+        desde: p.ultimo, max: p.maxDespues, mcAhora: price * 1_000_000_000,
+        min: Math.round((Date.now() - p.t0) / 60000) } });
+    }
+  }
   rec.volPost = (rec.volPost || 0) + volUSD;  // LAB: volumen negociado DESPUÉS de migrar
   // [v10] volumen acumulado por segundo (0-60s) para la hipótesis del pump orquestado
   const segNow = Math.floor((Date.now() - rec.t0) / 1000);
@@ -2009,8 +2021,21 @@ function shadowProcesa(rec){
   }
 }
 
+// [5-ago] veredicto: ¿fue buen momento de vender? Se emite al apagarse la cámara.
+function emitirVeredicto(mint, rec) {
+  if (!rec || !rec.post || !rec.post.salida) return;
+  const p = rec.post;
+  const veredicto = p.maxDespues >= 50 ? "pronto" : p.maxDespues >= 15 ? "justo" : "bien";
+  broadcast({ event: "postCierre", data: { mint, tradeId: p.tradeId, symbol: p.symbol,
+    desde: p.ultimo, max: p.maxDespues, min: Math.round((Date.now() - p.t0) / 60000),
+    final: true, veredicto } });
+  addLog(`🔭 POST-CIERRE ${rec.symbol}: tras vender el token hizo ${p.maxDespues >= 0 ? "+" : ""}${p.maxDespues}% como máximo `
+    + `(ahora ${p.ultimo >= 0 ? "+" : ""}${p.ultimo}%) → ${veredicto === "pronto" ? "❌ vendimos PRONTO" : veredicto === "justo" ? "🟡 justo" : "✅ buen cierre"}`, "rec");
+}
+
 function liveRecEmit(mint) {
   const rec = state.liveRecordings.get(mint);
+  if (rec && rec.post) emitirVeredicto(mint, rec);   // [5-ago]
   if (!rec || rec.finished) return;
   rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
   const pts = rec.puntos;
@@ -2785,6 +2810,14 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   trade.mcClose = trade.mcEntry ? trade.mcEntry * (1 + pnlPct / 100) : null;
   trade.mcMin = trade.mcEntry ? trade.mcEntry * (1 + trade.maxLossPct / 100) : null;
   trade.mcMax = trade.mcEntry ? trade.mcEntry * (1 + trade.maxGainPct / 100) : trade.mcMax;   // [5-ago] refrescar al cerrar
+  // [5-ago] SEGUIMIENTO POST-CIERRE: la cámara sigue grabando, así que marcamos el punto de salida
+  // para poder decir después si vender fue acierto o precipitación.
+  const recPost = state.liveRecordings.get(trade.mint);
+  if (recPost && !recPost.finished) {
+    recPost.post = { salida: trade.closePrice || null, pnlPct,
+      mcSalida: trade.mcClose, t0: Date.now(), maxDespues: 0, ultimo: 0,
+      tradeId: trade.id, symbol: trade.symbol, lastEmit: 0 };
+  }
   trade.brutoSol = pnlSolOp;                                  // ya calculado arriba con el lote real
   trade.netoSol = +(pnlSolOp - (trade.sizeSol ?? SOL_PER_TRADE_MIG) * 0.045).toFixed(4);   // fricción 4.5%
   trade.dejadoPts = +(trade.maxGainPct - pnlPct).toFixed(1);
