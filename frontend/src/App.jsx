@@ -89,7 +89,7 @@ function useBackend() {
    return () => { ws?.close(); clearTimeout(t); };
  }, []);
 
- return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus };
+ return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus, postCierre };
 }
 
 // ── COMPONENTES ────────────────────────────────────────────────
@@ -582,7 +582,7 @@ function Calendar({ realTrades, movements, setMovements }) {
 
 // ── APP PRINCIPAL ──────────────────────────────────────────────
 export default function App() {
- const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus } = useBackend();
+ const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
  const [demoStratFilter, setDemoStratFilter] = useState("all");
