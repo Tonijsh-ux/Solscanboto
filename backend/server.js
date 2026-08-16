@@ -23,10 +23,10 @@ const DEMO_ONLY = true;
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
 // real. NO es para ganar dinero todavía. Requiere: keys ROTADAS + wallet dedicada.
-const SOL_PER_TRADE_REAL = +(process.env.SOL_PER_TRADE_REAL || 0.25); // [v11.9] fase de medición
+const SOL_PER_TRADE_REAL = +(process.env.SOL_PER_TRADE_REAL || 0.3); // [v11.9] fase de medición
 const MIG_MAX_MC_REAL = 1_000_000; // [v11.9] IDÉNTICO al demo (antes 200K: divergencia eliminada)
 const SOL_PER_TRADE_MIG = 0.5;
-const MAX_REAL_TRADES = 10;
+const MAX_REAL_TRADES = +(process.env.MAX_REAL_TRADES || 2);   // [16-ago] prueba: 2 x 0.3 = 0.6 SOL, deja margen de gas sobre el balance de ~0.75 (era 10)
 const MAX_MIG_REAL = 10;
 const REAL_STRATEGIES = ["migration", "reentry", "fuerza"]; // [v11.9] real = demo
 
@@ -481,10 +481,13 @@ const MIG_TOP_FLOOR = 0.65;
 
 // ── KILL-SWITCH DE PORTAFOLIO ──
 const RISK = {
-  maxDailyLossSol: +(process.env.RISK_MAX_DAILY_LOSS || 3),   // [v11.9] escalado al lote 0.25
-  maxConsecutiveLosses: 12,
-  maxWindowLossSol: 0.8,        // tope por VENTANA MÓVIL (independiente de medianoche UTC)
-  windowHours: 6,              // ventana de las últimas 6 horas
+  // [16-ago] PRUEBA EN REAL con lote 0.3 — límites deliberadamente estrechos.
+  // Con esta estrategia (sin TP ni expiración) una op puede quedarse abierta horas,
+  // así que el freno tiene que venir del portafolio, no del trade.
+  maxDailyLossSol: +(process.env.RISK_MAX_DAILY_LOSS || 0.45),  // 1.5 lotes: con balance ~0.75 el tope debe morder ANTES que el saldo
+  maxConsecutiveLosses: 5,
+  maxWindowLossSol: 0.3,        // 1 lote completo en 6h
+  windowHours: 6,
   cooldownAfterStreakMs: 60 * 60 * 1000,
 };
 
