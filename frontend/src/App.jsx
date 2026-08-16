@@ -158,7 +158,9 @@ function TradeCard({ trade, isReal, post }) {
          <span style={{ color: "#94a3b8" }}>
            🔭 tras vender: <b style={{ color: post.desde >= 0 ? "#22c55e" : "#ef4444" }}>{post.desde >= 0 ? "+" : ""}{post.desde}%</b>
            {post.max > 0 && <span style={{ color: "#64748b" }}> · pico <b style={{ color: "#22c55e" }}>+{post.max}%</b></span>}
-           <span style={{ color: "#475569" }}> · {post.min}m</span>
+           {post.mcAhora > 0 && <span style={{ color: "#64748b" }}> · {formatMC(post.mcAhora)}</span>}
+           <span style={{ color: "#475569" }}> · {post.min}m{post.final ? "" : "/120m"}</span>
+           {post.vivo === false && <span style={{ color: "#f59e0b" }}> 🔇</span>}
          </span>
          <span style={{ color: vCol, fontWeight: 700 }}>{post.final ? (vered === "pronto" ? "❌ " : vered === "justo" ? "🟡 " : "✅ ") : "⏳ "}{vTxt}</span>
        </div>
@@ -209,7 +211,7 @@ function TradeDetalle({ trade, isOpen, post }) {
    <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1e2d40", fontFamily: "monospace", fontSize: 10 }}>
      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 18px" }}>
        <F k="MC entrada" v={fmt(mcE)} />
-       <F k="MC pico" v={fmt(mcMax)} c="#22c55e" />
+       <F k="MC pico (en la op)" v={fmt(mcMax)} c="#22c55e" />
        <F k={isOpen ? "MC ahora" : "MC salida"} v={fmt(isOpen ? mcAhora : mcFin)} />
        <F k="MC suelo" v={fmt(mcMin)} c="#ef4444" />
        <F k="lote" v={lote != null ? `${lote} SOL` : "—"} />
@@ -221,7 +223,9 @@ function TradeDetalle({ trade, isOpen, post }) {
        {trade.mov2s != null && <F k="mov2s" v={`${trade.mov2s >= 0 ? "+" : ""}${trade.mov2s.toFixed(1)}%`} />}
        {trade.cfg?.nom && <F k="config" v={trade.cfg.nom} />}
        {post && <F k="MC ahora" v={fmt(post.mcAhora)} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
-       {post && <F k="pico tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
+       {post && <F k="MC pico REAL" v={fmt(mcFin != null && post.max != null ? mcFin * (1 + post.max / 100) : null)} c="#facc15" />}
+       {post && <F k="subió tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
+       {post && <F k="ahora vs salida" v={`${post.desde >= 0 ? "+" : ""}${post.desde}%`} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
      </div>
      <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
        <a href={`https://solscan.io/token/${trade.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 9, textDecoration: "none" }}>🔎 Solscan</a>
