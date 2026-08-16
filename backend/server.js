@@ -1598,6 +1598,7 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
+  rec.lastPrice = price; rec.lastTickAt = Date.now();   // [5-ago] último precio · [16-ago] y cuándo, para el vigilante
   // [5-ago] seguimiento post-cierre: cuánto se movió el token DESDE que vendimos
   if (rec.post && rec.post.salida > 0) {
     const p = rec.post, desde = (price / p.salida - 1) * 100;
@@ -1804,12 +1805,12 @@ function updateFuerzaTrades(mint, price) {
 // [CAMBIO 9-jul] Grabación extendida 10 → 30 MINUTOS: necesitamos curvas de la
 // región 10-30 min para backtestear el moon-bag y la ventana larga con datos
 // reales (los topes del Excel demostraron que ahí vive el recorrido grande).
-const LAB_EXTEND_MS = 60 * 60_000;   // [FIX 27-jul] 30→60 min: la cámara ahora cubre la vida completa de la op (MIG_DURATION=60min); un 19% de las ops seguían vivas al apagarse la grabación y su final quedaba fuera de plano para el lab y el torneo
+const LAB_EXTEND_MS = 120 * 60_000;   // [16-ago] 60→120min: sin expiración las ops duran más y los cohetes despegan tarde   // [FIX 27-jul] 30→60 min: la cámara ahora cubre la vida completa de la op (MIG_DURATION=60min); un 19% de las ops seguían vivas al apagarse la grabación y su final quedaba fuera de plano para el lab y el torneo
 // LAB: contadores de salud del experimento (volcados cada hora)
 const labStats = { premigOk: 0, premigErr: 0, migrecs: 0, inicio: Date.now() };
 setInterval(() => {
   const h = ((Date.now() - labStats.inicio) / 3600000).toFixed(1);
-  addLog(`[LAB-SALUD] ${h}h de lab | migraciones=${state.stats.mig_migrations} entradas=${state.stats.mig_entered} MIGRECs=${labStats.migrecs} PREMIG ok=${labStats.premigOk} err=${labStats.premigErr}${labStats.premigErr > labStats.premigOk ? " ⚠️ HELIUS FALLANDO" : ""} | feed: ${Math.round((Date.now()-feedLastMigAt)/60000)}min sin migracion, reconexiones=${feedReconexiones}`, "info");
+  addLog(`[LAB-SALUD] ${h}h de lab | migraciones=${state.stats.mig_migrations} entradas=${state.stats.mig_entered} MIGRECs=${labStats.migrecs} PREMIG ok=${labStats.premigOk} err=${labStats.premigErr}${labStats.premigErr > labStats.premigOk ? " ⚠️ HELIUS FALLANDO" : ""} | feed: ${Math.round((Date.now()-feedLastMigAt)/60000)}min sin migracion, reconexiones=${feedReconexiones} | subs=${state.liveRecordings.size + state.migWatching.size + state.migMonitored.size} camaras=${state.liveRecordings.size} mudas=${[...state.liveRecordings.values()].filter(r => !r.finished && Date.now() - (r.lastTickAt || r.t0) > 90000).length}`, "info");
 }, 3600_000);
 
 // ═══════════════ [v11.9] TORNEO DE SOMBRAS ═══════════════
@@ -2021,6 +2022,44 @@ function shadowProcesa(rec){
   }
 }
 
+// [16-ago] VIGILANTE DE SUSCRIPCIÓN POR TOKEN.
+// Caso real (5629xdj, 15-ago): la cámara corrió sus 60min pero los ticks se cortaron a los 215s
+// y justo después el token hizo +363% sin que lo viéramos. El socket global seguía vivo (llegaban
+// otras migraciones), así que el vigilante de feed no saltaba: era ESE mint el que dejó de emitir.
+// Cada minuto revisamos las grabaciones vivas y re-suscribimos las que llevan >90s mudas.
+setInterval(() => {
+  if (!LIVE_RECORD || pumpPortalWs?.readyState !== WebSocket.OPEN) return;
+  const mudos = [];
+  for (const [mint, rec] of state.liveRecordings) {
+    if (rec.finished) continue;
+    const ultimo = rec.lastTickAt || rec.t0;
+    if (Date.now() - ultimo > 90_000) { mudos.push(mint); rec.resubs = (rec.resubs || 0) + 1; rec.lastTickAt = Date.now(); }
+  }
+  if (mudos.length) {
+    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mudos }));
+    addLog(`🔌 RE-SUSCRIPCIÓN: ${mudos.length} token(s) llevaban 90s sin ticks con la cámara viva — reenviado subscribeTokenTrade`, "warn");
+  }
+}, 60_000);
+
+// [5-ago] LATIDO DEL SEGUIMIENTO: los tokens muertos (rug) dejan de emitir ticks, así que sin esto
+// su tarjeta nunca mostraría el post-cierre. Cada 15s emitimos el estado de todas las ops vigiladas
+// con el último precio conocido, así la franja aparece y se mantiene viva en las 60 ops de la hora.
+setInterval(() => {
+  if (!LIVE_RECORD) return;
+  for (const [mint, rec] of state.liveRecordings) {
+    const p = rec.post;
+    if (!p || !p.salida || rec.finished) continue;
+    // [16-ago] el seguimiento vive lo que viva la cámara (hasta 2h), no 60 min
+    const px = rec.lastPrice || p.salida;
+    const desde = +((px / p.salida - 1) * 100).toFixed(1);
+    p.ultimo = desde;
+    if (desde > p.maxDespues) p.maxDespues = desde;
+    broadcast({ event: "postCierre", data: { mint, tradeId: p.tradeId, symbol: p.symbol,
+      desde, max: p.maxDespues, mcAhora: px * 1_000_000_000,
+      min: Math.round((Date.now() - p.t0) / 60000), vivo: !!rec.lastPrice } });
+  }
+}, 15_000);
+
 // [5-ago] veredicto: ¿fue buen momento de vender? Se emite al apagarse la cámara.
 function emitirVeredicto(mint, rec) {
   if (!rec || !rec.post || !rec.post.salida) return;
@@ -2082,7 +2121,9 @@ function liveRecFinish(mint, cierreRealPct) {
   // [4-ago] sin expiración, la cámara acompaña a la op mientras siga abierta (si no, el lab quedaría ciego)
   const sigueAbierta = state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")
                     || state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"));
-  const ventana = sigueAbierta ? Math.min(MIG_HARD_MAX_MS, LAB_EXTEND_MS * 6) : LAB_EXTEND_MS;
+  // [16-ago] sin expiración, una op puede durar horas: la cámara la acompaña hasta el tope duro.
+  // Si ya cerró, seguimos grabando LAB_EXTEND (2h) para ver qué hizo el token después de vender.
+  const ventana = sigueAbierta ? MIG_HARD_MAX_MS : LAB_EXTEND_MS;
   const restante = (rec.t0 + ventana) - Date.now();
   if (restante <= 0) { liveRecEmit(mint); return; }
   if (!rec._emitTimer) rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
