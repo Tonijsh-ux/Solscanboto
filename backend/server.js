@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3001;
 // ── MODO DEMO ONLY ──
 // true = solo opera en DEMO (papel), NO toca la wallet real. Para probar
 // la nueva estrategia (filtro entrada + trailing +25%) sin arriesgar dinero.
-const DEMO_ONLY = false;
+const DEMO_ONLY = true;
 // ═══ EXPERIMENTO REAL (7-jul): lote micro 0.1 SOL × 2 días para MEDIR LA FRICCIÓN
 // (slippage+fees reales vs tick). El demo sigue corriendo en paralelo con 0.5 para
 // comparar op a op. Objetivo: saber si el edge (+2.8%/op en demo) sobrevive al peaje
@@ -1595,6 +1595,11 @@ function liveRecStart(entry, entryPrice) {
     volSeg: [], lastVolSec: -1, minP: 0, reentered: false,
     wallets: new Map() };  // [v10.1] wallet → {buyUsd, sellUsd, buys, sells} en 0-60s
   state.liveRecordings.set(entry.mint, rec);
+  // [16-ago] TOPE DESDE EL MINUTO CERO. Antes el temporizador solo nacía en liveRecFinish (al cerrar
+  // una op): si la op no cerraba nunca —y ya no hay expiración— la cámara grababa sin límite,
+  // acumulando puntos y suscripción para siempre. Al cerrar se reprograma con la ventana correcta.
+  rec._emitTimer = setTimeout(() => liveRecEmit(entry.mint), MIG_HARD_MAX_MS);
+  rec._ventanaMin = Math.round(MIG_HARD_MAX_MS / 60000);
 }
 
 function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
@@ -1820,7 +1825,12 @@ setInterval(() => {
 // Cada grabación terminada se re-juega contra K configs con el motor de replay (clavado a los
 // simuladores). Observador puro: no toca decisiones. Fuera-de-muestra de serie: cada config
 // solo se juzga sobre ops nacidas tras su alta.
-const SHADOW_ON = process.env.SHADOW_ON !== "false";
+// [16-ago] TORNEO DE SOMBRAS APAGADO por decisión propia.
+// Evaluaba ~25 configuraciones alternativas sobre cada grabación. Se apaga porque (a) competía
+// con el motor real usando el sofá viejo como patrón, así que su ranking ya no representaba lo
+// que corre, y (b) con dinero real conviene que el server haga una sola cosa y la haga bien.
+// El código se conserva intacto: poner SHADOW_ON=true en el entorno lo reactiva sin tocar nada.
+const SHADOW_ON = process.env.SHADOW_ON === "true";
 // [v11.9] alta del torneo anclada al ARRANQUE del proceso (no a la 1ª grabación, que llega ~50min
 // tarde). Reseteable con SHADOW_RESET=true si se quiere empezar el torneo de cero tras un cambio.
 const SHADOW_ALTA = Date.now() - 90*60*1000;   // margen: cuenta lo grabado en la última hora y media
@@ -2129,7 +2139,13 @@ function liveRecFinish(mint, cierreRealPct) {
   const ventana = sigueAbierta ? MIG_HARD_MAX_MS : LAB_EXTEND_MS;
   const restante = (rec.t0 + ventana) - Date.now();
   if (restante <= 0) { liveRecEmit(mint); return; }
-  if (!rec._emitTimer) rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
+  // [16-ago] REPROGRAMAR SIEMPRE. Antes se creaba el timer una sola vez (`if (!rec._emitTimer)`),
+  // así que si la op cerraba con la re-caza aún abierta se fijaba la ventana de 6h y ya no se
+  // recortaba al cerrar esta: la cámara seguía horas sobre un token muerto, gastando suscripción.
+  // Y al revés, si la ventana debía ampliarse (re-caza que entra después), tampoco se ampliaba.
+  if (rec._emitTimer) clearTimeout(rec._emitTimer);
+  rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
+  rec._ventanaMin = Math.round(ventana / 60000);
 }
 
 // Registra el PnL de una operación cerrada en el acumulador por hora.
@@ -2236,8 +2252,20 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
   if (!token) {
     const rec = state.liveRecordings.get(mint);
     if (rec && !rec.finished && price > 0) {
-      if (price < rec.entryPrice * 100 && price > rec.entryPrice / 100) {
+      // [16-ago] El guardarraíl ×100/÷100 protegía contra precios corruptos, pero descartaba
+      // el TICK ENTERO: con la cámara larga, todo lo que pasa tras cerrar la op entra por aquí,
+      // así que un solo precio fuera de banda dejaba de alimentar la curva Y de gestionar los
+      // trades vivos (sin actualizar máximo ni poder disparar el stop). Ahora el filtro solo
+      // decide si se GRABA la muestra; la gestión de trades se ejecuta siempre.
+      const cuerdo = price < rec.entryPrice * 100 && price > rec.entryPrice / 100;
+      if (cuerdo) {
         liveRecSample(mint, price, solAmount * solPriceUSD, trader, isBuy);
+      } else {
+        rec.lastTickAt = Date.now();   // hay vida: que el vigilante no lo dé por mudo
+        if (!rec._avisoBanda) { rec._avisoBanda = true;
+          addLog(`⚠️ precio fuera de banda en ${shortAddr(mint)}: ${price.toPrecision(4)} vs entrada ${rec.entryPrice.toPrecision(4)} — no se graba, pero la op se sigue gestionando`, "warn"); }
+      }
+      {
         // [v10] FIX ZOMBIE: si queda un demo OPEN de este mint (p.ej. el real cerró
         // antes y migCleanup borró el token del monitoreo), seguir gestionándolo.
         updateDemoTrades(mint, price, "migration");
@@ -2589,10 +2617,11 @@ function updateRealTrades(mint, price, strategy) {
   const nowR = Date.now();
   for (const trade of state.realTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
-    // [4-ago] idéntico al demo: solo se decide en los ticks grabados
+    // [16-ago] cadencia por tiempo, igual que el demo (ver nota arriba: no atarla a la cámara)
     if (MIG_DECIDE_ON && isMig(trade)) {
-      const rec = state.liveRecordings.get(trade.mint);
-      if (rec) { if (trade._lastEval === rec.sampleTick) continue; trade._lastEval = rec.sampleTick; }
+      const cad = cadenciaMs(nowR - trade.openTime, 0);
+      if (trade._lastEval && nowR - trade._lastEval < cad) continue;
+      trade._lastEval = nowR;
     }
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
@@ -2704,11 +2733,14 @@ function updateDemoTrades(mint, price, strategy) {
   const now = Date.now();
   for (const trade of state.demoTrades) {
     if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== strategy) continue;
-    // [4-ago] el motor decide EXACTAMENTE en los ticks que la cámara graba (mismo sello, mismo instante).
-    // Si no hay muestra en este tick, se descarta entero: ni mueve el máximo ni dispara el stop.
+    // [16-ago] CADENCIA POR TIEMPO, no atada al sello de la cámara.
+    // Antes se comparaba con rec.sampleTick: si la cámara terminaba (2h) o el tick llegaba por
+    // una ruta que no la alimenta, sampleTick se congelaba y el trade DEJABA DE EVALUARSE —
+    // con el stop loss sin poder dispararse. Inaceptable con dinero real.
     if (MIG_DECIDE_ON && isMig(trade)) {
-      const rec = state.liveRecordings.get(trade.mint);
-      if (rec) { if (trade._lastEval === rec.sampleTick) continue; trade._lastEval = rec.sampleTick; }
+      const cad = cadenciaMs(now - trade.openTime, 0);
+      if (trade._lastEval && now - trade._lastEval < cad) continue;
+      trade._lastEval = now;
     }
     const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
     trade.currentPct = +currentPct.toFixed(2);
