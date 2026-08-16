@@ -167,7 +167,7 @@ function TradeCard({ trade, isReal, post }) {
      )}
      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-         <a href={`https://dexscreener.com/solana/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener</a>
+         <a href={`https://pump.fun/coin/${trade.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 9, color: "#38bdf8", textDecoration: "none" }}>💊 pump.fun</a>
          <button onClick={() => setAbierto(v => !v)} style={{ fontFamily: "monospace", fontSize: 9, color: "#94a3b8", background: "#131c2b", border: "1px solid #1e2d40", borderRadius: 6, padding: "2px 7px", cursor: "pointer" }}>
            {abierto ? "▾ detalle" : "▸ detalle"}
          </button>
@@ -766,7 +766,7 @@ export default function App() {
                  <span style={{ color: "#22c55e" }}>TP {s.strategy === "migration" ? "+80%" : "+6%"}</span>
                  <span style={{ color: "#ef4444" }}>SL {s.strategy === "migration" ? "-18%" : "-3%"}</span>
                </div>
-               <a href={`https://dexscreener.com/solana/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>📊 DexScreener →</a>
+               <a href={`https://pump.fun/coin/${s.mint}`} target="_blank" rel="noreferrer" style={{ fontFamily: "monospace", fontSize: 10, color: "#38bdf8", textDecoration: "none" }}>💊 pump.fun</a>
              </div>
            ))}
          </>
