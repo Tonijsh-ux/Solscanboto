@@ -92,6 +92,7 @@ const MIG_SL = 0.61;   // [v11.9] -39% (la del sofá)
 const MIG_DURATION_MS = 0;   // [4-ago] 0 = SIN EXPIRACIÓN: la op vive hasta que el trailing la cierre.
                              // Antes 60min, pero cerraba cohetes vivos solo por el reloj.
 const MIG_HARD_MAX_MS = 6 * 60 * 60 * 1000;   // salvavidas: 6h de tope absoluto
+const MUERTO_PCT = 90;   // [16-ago] caída desde la entrada a partir de la cual damos el token por muerto
 const MIG_WINDOW_MS = 60_000;
 const MIG_MIN_VOL_FAST = 1_500;
 const MIG_MIN_VOL_SLOW = 2_000;
@@ -1607,6 +1608,14 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
   rec.lastPrice = price; rec.lastTickAt = Date.now();   // [5-ago] último precio · [16-ago] y cuándo, para el vigilante
+  // [16-ago] TOKEN MUERTO: por debajo de -90% desde la entrada ya no hay nada que observar.
+  // Cerramos la cámara, liberamos la suscripción y dejamos de re-suscribir un cadáver.
+  if (!rec.finished && rec.entryPrice > 0 && price <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
+    const caida = ((price / rec.entryPrice - 1) * 100).toFixed(1);
+    addLog(`⚰️ TOKEN MUERTO: ${rec.symbol} a ${caida}% de la entrada — cámara cerrada y suscripción liberada`, "info");
+    liveRecEmit(mint);
+    return;
+  }
   // [5-ago] seguimiento post-cierre: cuánto se movió el token DESDE que vendimos
   if (rec.post && rec.post.salida > 0) {
     const p = rec.post, desde = (price / p.salida - 1) * 100;
@@ -2045,8 +2054,20 @@ setInterval(() => {
   const mudos = [];
   for (const [mint, rec] of state.liveRecordings) {
     if (rec.finished) continue;
+    // [16-ago] no re-suscribir cadáveres: si el último precio visto ya está por debajo del
+    // umbral de muerte, o llevamos muchos reintentos sin éxito, se cierra la cámara.
+    if (rec.lastPrice && rec.entryPrice > 0 && rec.lastPrice <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
+      addLog(`⚰️ TOKEN MUERTO (mudo): ${rec.symbol} — cámara cerrada, no se re-suscribe`, "info");
+      liveRecEmit(mint); continue;
+    }
     const ultimo = rec.lastTickAt || rec.t0;
-    if (Date.now() - ultimo > 90_000) { mudos.push(mint); rec.resubs = (rec.resubs || 0) + 1; rec.lastTickAt = Date.now(); }
+    if (Date.now() - ultimo > 90_000) {
+      if ((rec.resubs || 0) >= 5) {   // 5 intentos sin recuperar ticks: darlo por perdido
+        addLog(`🔇 SIN TICKS: ${rec.symbol} tras ${rec.resubs} re-suscripciones — cámara cerrada`, "warn");
+        liveRecEmit(mint); continue;
+      }
+      mudos.push(mint); rec.resubs = (rec.resubs || 0) + 1; rec.lastTickAt = Date.now();
+    }
   }
   if (mudos.length) {
     pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mudos }));
@@ -2077,12 +2098,23 @@ setInterval(() => {
 function emitirVeredicto(mint, rec) {
   if (!rec || !rec.post || !rec.post.salida) return;
   const p = rec.post;
-  const veredicto = p.maxDespues >= 50 ? "pronto" : p.maxDespues >= 15 ? "justo" : "bien";
-  broadcast({ event: "postCierre", data: { mint, tradeId: p.tradeId, symbol: p.symbol,
-    desde: p.ultimo, max: p.maxDespues, min: Math.round((Date.now() - p.t0) / 60000),
-    final: true, veredicto } });
+  // [16-ago] VEREDICTO JUSTO. Antes solo miraba el pico: un token que repuntaba +75% y luego
+  // moría a -95% salía como "vendiste pronto", cuando vender fue justo lo correcto. Ahora el
+  // pico solo condena si el token TERMINA arriba; si repuntó y se hundió, el cierre fue bueno.
+  const subioMucho = p.maxDespues >= 50, sigueArriba = p.ultimo >= 15;
+  const veredicto = (subioMucho && sigueArriba) ? "pronto"
+    : (subioMucho && !sigueArriba) ? "repunte"
+    : p.maxDespues >= 15 && sigueArriba ? "justo" : "bien";
+  const datos = { mint, tradeId: p.tradeId, symbol: p.symbol, desde: p.ultimo, max: p.maxDespues,
+    mcAhora: (rec.lastPrice || p.salida) * 1_000_000_000,
+    min: Math.round((Date.now() - p.t0) / 60000), final: true, veredicto };
+  // [16-ago] lo guardamos EN EL TRADE: así sobrevive a recargas del panel y a reinicios del
+  // server (va en saveState), y viaja con la op a cualquier dispositivo.
+  const tr = state.demoTrades.find(t => t.id === p.tradeId) || state.realTrades.find(t => t.id === p.tradeId);
+  if (tr) { tr.post = datos; saveState(); }
+  broadcast({ event: "postCierre", data: datos });
   addLog(`🔭 POST-CIERRE ${rec.symbol}: tras vender el token hizo ${p.maxDespues >= 0 ? "+" : ""}${p.maxDespues}% como máximo `
-    + `(ahora ${p.ultimo >= 0 ? "+" : ""}${p.ultimo}%) → ${veredicto === "pronto" ? "❌ vendimos PRONTO" : veredicto === "justo" ? "🟡 justo" : "✅ buen cierre"}`, "rec");
+    + `(ahora ${p.ultimo >= 0 ? "+" : ""}${p.ultimo}%) → ${veredicto === "pronto" ? "❌ vendimos PRONTO" : veredicto === "repunte" ? "✅ buen cierre (repuntó y murió)" : veredicto === "justo" ? "🟡 justo" : "✅ buen cierre"}`, "rec");
 }
 
 function liveRecEmit(mint) {
