@@ -108,7 +108,7 @@ function StrategyBadge({ strategy }) {
  );
 }
 
-function TradeCard({ trade, isReal, post }) {
+function TradeCard({ trade, isReal, post: postLive }) {
  const [abierto, setAbierto] = useState(false);   // [5-ago] desglose plegable
  const isOpen = trade.status === "OPEN";
  const sym = trade.symbol && trade.symbol !== "???" ? trade.symbol : `${(trade.mint||"").slice(0,6)}…`;
@@ -122,9 +122,12 @@ function TradeCard({ trade, isReal, post }) {
  const color = isOpen ? (isReal ? "#f97316" : "#38bdf8") : isWin ? "#22c55e" : isLoss ? "#ef4444" : "#64748b";
  const statusLabel = isOpen ? (isReal ? "🔴 REAL" : "🔵 DEMO") : isWin ? "✅ WIN" : isLoss ? "❌ LOSS" : trade.result === "EXPIRED" ? "⏱️ EXP" : trade.result?.includes("WIN") ? "⏱️ +EXP" : "⏱️ -EXP";
  // [5-ago] qué hizo el token DESPUÉS de que vendiéramos (la cámara sigue grabando 60 min)
- const vered = post ? (post.veredicto || (post.max >= 50 ? "pronto" : post.max >= 15 ? "justo" : "bien")) : null;
+ // [16-ago] el evento en vivo manda; si no hay (p.ej. tras recargar), usamos el guardado en el trade
+ const post = postLive || trade.post || null;
+ const vered = post ? (post.veredicto || (post.max >= 50 && post.desde >= 15 ? "pronto" : post.max >= 50 ? "repunte" : post.max >= 15 ? "justo" : "bien")) : null;
  const vCol = vered === "pronto" ? "#ef4444" : vered === "justo" ? "#facc15" : "#22c55e";
- const vTxt = vered === "pronto" ? "vendiste pronto" : vered === "justo" ? "justo" : "buen cierre";
+ const vTxt = vered === "pronto" ? "vendiste pronto" : vered === "repunte" ? "buen cierre (repuntó y murió)"
+   : vered === "justo" ? "justo" : "buen cierre";
  return (
    <div style={{ background: "#0d1117", border: `1px solid ${color}${isOpen?"55":"33"}`, borderRadius: 10, padding: "10px 14px" }}>
      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
