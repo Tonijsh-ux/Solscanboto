@@ -255,6 +255,29 @@ const REENTRY_TRAIL = 0.80;   // [29-jul] tornillo del lab: anchura 80% (era 55)
 const REENTRY_MAX_OPEN = 10;
 const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
 
+// ── [23-ago] 🤝 UNIDA (demo puro): pierna bot paramétrica + relevo mixta tras SL ──
+// Motor clonado línea a línea de labSimUnida del analizador; decide en la MISMA cadencia en que
+// graba la cámara (uniSample se llama desde liveRecSample), igual que el lab. Validada en el
+// analizador 17-19 ago (111 ops): +25.9 SOL simple lote 0.5 (+72.1 compuesto banca 25/2%).
+// OJO honesto: histórico completo depurado ≈ -2.3 SOL → estrategia SOMBRA en demo hasta que
+// los días nuevos la confirmen. SIN espejo real a propósito.
+const UNI_ON = true;
+const UNI_SIZE = 0.5;              // lote demo por compra (pierna bot y cada relevo)
+const UNI_MAX_OPEN = 12;           // tope global de trades unida abiertos a la vez
+// pierna bot (tornillos del lab, captura 22-ago — INDEPENDIENTES de la Base de migración):
+const UNI_BOT = { sl: -15, mult: 3, arm: 60, p1: 40, p2: 77, ndT: 10, ndM: 28, relNL: false };
+// relevo mixta:
+const UNI_GIRO = 10;               // % de giro de los pivotes (detector de soportes)
+const UNI_TAU = 35;                // s de suavidad de la envolvente roja de máximos (venta)
+const UNI_MD = 5;                  // margen del soporte: compra al cruzar soporte -5%
+const UNI_MV = 20;                 // margen de la venta: vende al cruzar roja +20%
+const UNI_MAXLOT = 8;              // compras acumulables simultáneas por paquete
+const UNI_MAXVEND = 5;             // tope de lotes VENDIDOS por op (maxCiclos del lab)
+const UNI_RUG = 50;                // guardarraíl: no comprar por debajo de -50%
+const UNI_MUERTO_PCT = 60;         // [23-ago] token muerto: 60s seguidos por debajo de -60%
+const UNI_MUERTO_S = 60;           //   → liquida el paquete a mercado y deja de operar ese token
+                                   //   (validado: mejora 17-19 +35.5→+38.2 y el histórico -17.3→-13.9)
+
 // ── [v11.9] RE-ENTRADA POR FUERZA ("la del sofá") ──
 const FZ_ON = process.env.FZ_ON === "true";   // [v11.9] APAGADA por defecto (encender con FZ_ON=true)
 const FZ_MARGIN = 0.50;
@@ -1601,6 +1624,7 @@ function liveRecStart(entry, entryPrice) {
   // acumulando puntos y suscripción para siempre. Al cerrar se reprograma con la ventana correcta.
   rec._emitTimer = setTimeout(() => liveRecEmit(entry.mint), MIG_HARD_MAX_MS);
   rec._ventanaMin = Math.round(MIG_HARD_MAX_MS / 60000);
+  uniInit(rec, entryPrice);   // [23-ago] 🤝 UNIDA: pierna bot dentro desde la entrada
 }
 
 function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
@@ -1660,6 +1684,7 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
   if (pct < rec.minP) rec.minP = pct;
   maybeReentry(rec, price, pct, Math.round(dt/1000));  // [v10]
+  uniSample(rec, price, pct, Math.round(dt/1000));     // [23-ago] 🤝 UNIDA: decide en cadencia de muestra
 }
 
 // ── [v10] RE-ENTRADA EN RESUCITADOS (demo puro) ──
@@ -1745,6 +1770,174 @@ function updateReentryTrades(mint, price) {
       else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), trailingPhase: trade.trailingPhase } });
     }
   }
+}
+
+// ── [23-ago] 🤝 UNIDA: motor (réplica 1:1 de labSimUnida). Estado por grabación en rec.uni. ──
+// Las curvas del lab SON los puntos que muestrea liveRecSample, así que decidir aquí con los
+// mismos pct redondeados garantiza que server y analizador vean la misma película.
+const uniF = (v) => 1 + v / 100;   // % → ratio (el f() del lab)
+
+function uniAbiertas() {
+  return state.demoTrades.filter(t => t.strategy === "unida" && t.status === "OPEN").length;
+}
+
+function uniOpenTrade(rec, price, fase) {
+  const trade = {
+    id: `unida-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    strategy: "unida", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
+    entryPrice: price, tp: +(price * 1e9).toFixed(12),   // sin TP: cierra el motor
+    sl: 0,                                               // informativo: el stop vive en rec.uni
+    sizeSol: UNI_SIZE,
+    openTime: Date.now(), closeTime: null, closePrice: null,
+    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
+    trailingPhase: fase, status: "OPEN",
+    expiresAt: Date.now() + MIG_HARD_MAX_MS, mov1s: null, mov2s: rec.mov2s ?? null,
+    velSeg: rec.vel ?? null,
+    mcEntry: rec.mc && rec.entryPrice ? +(rec.mc * (price / rec.entryPrice)).toFixed(0) : null,   // [23-ago] MC real al precio de esta entrada
+  };
+  state.demoTrades.unshift(trade);
+  if (state.demoTrades.length > 500) state.demoTrades.pop();
+  state.stats.demoOpen++;
+  broadcast({ event: "newDemoTrade", data: trade });
+  broadcast({ event: "stats", data: state.stats });
+  return trade;
+}
+
+function uniCierra(rec, trade, price, reason) {
+  trade.mov2s = rec.mov2s ?? trade.mov2s;   // para la línea MIGCLOSE (strat=unida, parseable como las demás)
+  closeDemoTrade(trade, price, reason, 21);
+}
+
+function uniInit(rec, entryPrice) {
+  if (!UNI_ON || MC_OBSERVER || OBSERVER_MODE) return;
+  if (uniAbiertas() >= UNI_MAX_OPEN) { addLog(`🤝 UNIDA saltada (límite ${UNI_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
+  // estado = labSimUnida con el primer punto (t=0, p=0) ya consumido:
+  rec.uni = {
+    dir: 0, ref: { t: 0, p: 0 }, prev: 0, mins: [],   // pivotes causales (los máximos no se usan para comprar)
+    envLog: 0, envT: 0,                                // log-envolvente de máximos (labEnvUp): arranca en log(f(0))=0
+    bSl: uniF(UNI_BOT.sl), bFol: false, bMax: 0, bAbierta: true, mixOn: false,
+    lotes: [], sumInv: 0, tUlt: 0, vendidos: 0, muertoIni: null,
+    tradeBot: uniOpenTrade(rec, entryPrice, "UNI_BOT"),
+    tradePack: null,
+  };
+  addLog(`🤝 UNIDA [demo]: ${rec.symbol} | pierna bot dentro (stop ${UNI_BOT.sl}% · ×${UNI_BOT.mult} · arma +${UNI_BOT.arm} · pisos +${UNI_BOT.p1}/+${UNI_BOT.p2} · ND ${UNI_BOT.ndT}s/+${UNI_BOT.ndM}%)`, "accept");
+}
+
+function uniSample(rec, price, pct, tSec) {
+  const u = rec.uni;
+  if (!u) return;
+  const t = tSec, v = pct;
+  // 1) envolvente roja: el valor que DECIDE este tick es el PREVIO a integrar el punto
+  //    (labEnvUp asigna A[q]=exp(U) antes de actualizar U con el punto q)
+  const upRatio = Math.exp(u.envLog);
+  const dtE = Math.max(0.001, t - u.envT); u.envT = t;
+  const lp = Math.log(uniF(v));
+  if (lp > u.envLog) u.envLog = lp; else u.envLog += (1 - Math.exp(-dtE / UNI_TAU)) * (lp - u.envLog);
+  // 2) pivotes causales (siempre mirando, también con la pierna bot dentro — igual que el lab)
+  const cg = (uniF(v) / uniF(u.ref.p) - 1) * 100;
+  if (u.dir >= 0 && cg <= -UNI_GIRO) { u.dir = -1; u.ref = { t, p: v }; }
+  else if (u.dir <= 0 && cg >= UNI_GIRO) { u.mins.push({ ...u.ref }); u.dir = 1; u.ref = { t, p: v }; }
+  else if ((u.dir >= 0 && v > u.ref.p) || (u.dir < 0 && v < u.ref.p)) u.ref = { t, p: v };
+  // [23-ago] cronómetro del token muerto: cuenta desde CUALQUIER tick bajo el umbral
+  if (v <= -UNI_MUERTO_PCT) { if (u.muertoIni == null) u.muertoIni = t; } else u.muertoIni = null;
+  // 3) pierna del bot (tornillos UNI_BOT, independientes de la migración Base)
+  if (u.bAbierta) {
+    const tb = u.tradeBot;
+    tb.currentPct = +v.toFixed(2);
+    if (v > tb.maxGainPct) tb.maxGainPct = v;
+    if (v < tb.maxLossPct) tb.maxLossPct = v;
+    const ra = uniF(v);
+    if (v > u.bMax) u.bMax = v;
+    if (!u.bFol && ra >= 1 + UNI_BOT.arm / 100) u.bFol = true;
+    if (u.bFol) {
+      const b2 = u.bMax >= 100 ? 0.08 : u.bMax >= 60 ? 0.12 : u.bMax >= 40 ? 0.15 : 0.20;
+      const anch = Math.min(0.90, b2 * UNI_BOT.mult);
+      const cand = ra * (1 - anch); if (cand > u.bSl) u.bSl = cand;
+      if (u.bMax >= UNI_BOT.arm && 1 + UNI_BOT.p1 / 100 > u.bSl) u.bSl = 1 + UNI_BOT.p1 / 100;
+      if (u.bMax >= 100 && 1 + UNI_BOT.p2 / 100 > u.bSl) u.bSl = 1 + UNI_BOT.p2 / 100;
+    }
+    if (UNI_BOT.ndT && t >= UNI_BOT.ndT && u.bMax < UNI_BOT.ndM) {
+      u.bAbierta = false;
+      uniCierra(rec, tb, price, "NO_LAUNCH");
+      if (UNI_BOT.relNL) u.mixOn = true;   // apagado en la config decidida: tras NO_LAUNCH no hay relevo
+    } else if (ra <= u.bSl) {
+      u.bAbierta = false; u.mixOn = true;
+      uniCierra(rec, tb, price, "SL");
+      addLog(`🤝 UNIDA: ${rec.symbol} pierna bot fuera por SL a ${v.toFixed(0)}% → relevo armado (soporte giro ${UNI_GIRO}% -${UNI_MD}% · roja ${UNI_TAU}s +${UNI_MV}%)`, "info");
+    } else {
+      broadcast({ event: "demoTradeUpdate", data: { id: tb.id, currentPct: tb.currentPct, maxGainPct: tb.maxGainPct, sl: 0, slPct: +((u.bSl - 1) * 100).toFixed(1), trailingPhase: tb.trailingPhase } });
+    }
+    u.prev = v; return;   // un solo turno: mientras el bot está dentro, el relevo no compra (igual que el lab)
+  }
+  // 4) [23-ago] token muerto confirmado: M segundos seguidos bajo el umbral → liquidar y abandonar
+  if (u.muertoIni != null && t - u.muertoIni >= UNI_MUERTO_S) {
+    if (u.tradePack && u.tradePack.status === "OPEN") {
+      addLog(`🤝 UNIDA abandona token muerto: ${rec.symbol} lleva ${t - u.muertoIni}s bajo -${UNI_MUERTO_PCT}% → liquida paquete a ${v.toFixed(0)}%`, "info");
+      uniCierra(rec, u.tradePack, price, "MUERTO");
+    }
+    rec.uni = null;   // deja de vigilar este token
+    return;
+  }
+  // 5) relevo mixta (solo si mixOn: la pierna bot salió por SL)
+  if (u.mixOn) {
+    let hecho = false;
+    if (u.lotes.length < UNI_MAXLOT && u.vendidos < UNI_MAXVEND && u.mins.length >= 2) {
+      const A = u.mins[u.mins.length - 2], B = u.mins[u.mins.length - 1];
+      const dtN = B.t - A.t;
+      const soporte = dtN ? A.p + (B.p - A.p) * (t - A.t) / dtN : B.p;   // niv() del lab
+      const nn = (uniF(soporte) * uniF(-UNI_MD) - 1) * 100;              // aj() del lab
+      if (u.prev > nn && v <= nn && v > -UNI_RUG) {
+        u.lotes.push(v); u.sumInv += 1 / price; u.tUlt = t; hecho = true;
+        if (!u.tradePack) {
+          u.tradePack = uniOpenTrade(rec, price, "UNI_RELEVO");
+          u.tradePack.compras = [{ t, p: +v.toFixed(1) }];   // [23-ago] desglose para el detalle del panel
+          addLog(`🤝 UNIDA compra 1/${UNI_MAXLOT}: ${rec.symbol} a ${v.toFixed(0)}% (soporte ${nn.toFixed(0)}%)`, "accept");
+        } else {
+          const pk = u.tradePack;
+          const oldE = pk.entryPrice;
+          pk.entryPrice = u.lotes.length / u.sumInv;   // media ARMÓNICA: lotes de SOL iguales → mismo total que el lab
+          pk.sizeSol = +(UNI_SIZE * u.lotes.length).toFixed(2);
+          pk.trailingPhase = `UNI_RELEVO×${u.lotes.length}`;
+          pk.compras.push({ t, p: +v.toFixed(1) });   // [23-ago] desglose para el detalle del panel
+          // [23-ago] la media cambió → re-basar TODO sobre la nueva media (mismos precios, otra referencia):
+          const reb = oldE / pk.entryPrice;
+          pk.maxGainPct = +(((1 + pk.maxGainPct / 100) * reb - 1) * 100).toFixed(2);
+          pk.maxLossPct = +(((1 + pk.maxLossPct / 100) * reb - 1) * 100).toFixed(2);
+          pk.currentPct = +((price - pk.entryPrice) / pk.entryPrice * 100).toFixed(2);
+          if (pk.currentPct < pk.maxLossPct) pk.maxLossPct = pk.currentPct;
+          pk.mcEntry = rec.mc && rec.entryPrice ? +(rec.mc * (pk.entryPrice / rec.entryPrice)).toFixed(0) : pk.mcEntry;
+          broadcast({ event: "demoTradeUpdate", data: { id: pk.id, currentPct: pk.currentPct, maxGainPct: pk.maxGainPct, maxLossPct: pk.maxLossPct, sl: 0, slPct: 0, trailingPhase: pk.trailingPhase, sizeSol: pk.sizeSol, entryPrice: pk.entryPrice, mcEntry: pk.mcEntry, compras: pk.compras } });
+          addLog(`🤝 UNIDA compra ${u.lotes.length}/${UNI_MAXLOT}: ${rec.symbol} a ${v.toFixed(0)}% (paquete promediado)`, "accept");
+        }
+      }
+    }
+    if (!hecho && u.lotes.length && t > u.tUlt) {
+      const up = (upRatio * uniF(UNI_MV) - 1) * 100;
+      if (u.prev < up && v >= up) {
+        u.vendidos += u.lotes.length;
+        addLog(`🤝 UNIDA vende paquete ×${u.lotes.length}: ${rec.symbol} a ${v.toFixed(0)}% (roja ${up.toFixed(0)}%) | vendidos ${u.vendidos}/${UNI_MAXVEND}`, "info");
+        uniCierra(rec, u.tradePack, price, "ROJA");
+        u.tradePack = null; u.lotes = []; u.sumInv = 0;
+      }
+    }
+    if (u.tradePack) {
+      const pk = u.tradePack;
+      pk.currentPct = +((price - pk.entryPrice) / pk.entryPrice * 100).toFixed(2);
+      if (pk.currentPct > pk.maxGainPct) pk.maxGainPct = pk.currentPct;
+      if (pk.currentPct < pk.maxLossPct) pk.maxLossPct = pk.currentPct;
+    }
+  }
+  u.prev = v;
+}
+
+function uniFinish(rec) {
+  const u = rec.uni;
+  if (!u) return;
+  const last = rec.puntos.length ? rec.puntos[rec.puntos.length - 1].p : 0;
+  const price = rec.entryPrice * uniF(last);
+  if (u.bAbierta && u.tradeBot && u.tradeBot.status === "OPEN") { u.bAbierta = false; uniCierra(rec, u.tradeBot, price, "EXPIRED"); }
+  if (u.tradePack && u.tradePack.status === "OPEN") uniCierra(rec, u.tradePack, price, "EXPIRED");
+  rec.uni = null;
 }
 
 // ── [v11.9] FUERZA: apertura (demo + real) y gestión de salidas ──
@@ -2121,6 +2314,7 @@ function liveRecEmit(mint) {
   const rec = state.liveRecordings.get(mint);
   if (rec && rec.post) emitirVeredicto(mint, rec);   // [5-ago]
   if (!rec || rec.finished) return;
+  uniFinish(rec);   // [23-ago] 🤝 UNIDA: cerrar posiciones vivas antes de apagar la cámara
   rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
   const pts = rec.puntos;
   if (pts.length < 2) return;
