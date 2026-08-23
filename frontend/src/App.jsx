@@ -230,6 +230,17 @@ function TradeDetalle({ trade, isOpen, post }) {
        {post && <F k="subió tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
        {post && <F k="ahora vs salida" v={`${post.desde >= 0 ? "+" : ""}${post.desde}%`} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
      </div>
+     {trade.compras?.length > 0 && (
+       <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed #1e2d40" }}>
+         <div style={{ color: "#64748b", marginBottom: 2 }}>🛒 compras del relevo · {trade.compras.length} lote{trade.compras.length > 1 ? "s" : ""} de 0.5 <span style={{ color: "#475569" }}>(% vs la entrada de la op)</span></div>
+         {trade.compras.map((c2, i) => (
+           <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0" }}>
+             <span style={{ color: "#94a3b8" }}>C{i + 1} · t+{c2.t}s</span>
+             <span style={{ color: c2.p >= 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>{c2.p >= 0 ? "+" : ""}{c2.p}%</span>
+           </div>
+         ))}
+       </div>
+     )}
      <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
        <a href={`https://solscan.io/token/${trade.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 9, textDecoration: "none" }}>🔎 Solscan</a>
        <span onClick={() => navigator.clipboard?.writeText(trade.mint)} style={{ color: "#64748b", fontSize: 9, cursor: "pointer" }}>📋 copiar mint</span>
