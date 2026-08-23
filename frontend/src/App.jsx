@@ -189,6 +189,7 @@ function TradeCard({ trade, isReal, post: postLive }) {
 
 // [5-ago] desglose de la op: market caps, dinero y lo que dejó sobre la mesa
 function TradeDetalle({ trade, isOpen, post }) {
+ const esUni = trade.strategy === "unida";   // [23-ago] detalle limpio para la unida
  const mcE = trade.mcEntry ?? (trade.entryPrice ? trade.entryPrice * 1e9 : null);
  const f = v => 1 + (v || 0) / 100;
  // [5-ago] los MC se DERIVAN siempre del MC de entrada y los porcentajes (que sí están al día).
@@ -218,27 +219,46 @@ function TradeDetalle({ trade, isOpen, post }) {
        <F k={isOpen ? "MC ahora" : "MC salida"} v={fmt(isOpen ? mcAhora : mcFin)} />
        <F k="MC suelo" v={fmt(mcMin)} c="#ef4444" />
        <F k="lote" v={lote != null ? `${lote} SOL` : "—"} />
-       <F k="dejó sin coger" v={dejado != null ? `${dejado.toFixed(0)} pts` : "—"} c="#facc15" />
+       {!esUni && <F k="dejó sin coger" v={dejado != null ? `${dejado.toFixed(0)} pts` : "—"} c="#facc15" />}
        {!isOpen && <F k="bruto" v={sol(bruto)} c={pctColor(trade.pnlPct || 0)} />}
        {!isOpen && <F k="neto (fee 4.5%)" v={sol(neto)} c={neto >= 0 ? "#22c55e" : "#ef4444"} />}
        {trade.velSeg != null && <F k="vel entrada" v={`${trade.velSeg}s`} />}
        {trade.sigPct != null && <F k="señal" v={`+${trade.sigPct}%`} />}
        {trade.mov2s != null && <F k="mov2s" v={`${trade.mov2s >= 0 ? "+" : ""}${trade.mov2s.toFixed(1)}%`} />}
        {trade.cfg?.nom && <F k="config" v={trade.cfg.nom} />}
-       {post && <F k="MC ahora" v={fmt(post.mcAhora)} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
-       {post && <F k="MC pico REAL" v={fmt(mcFin != null && post.max != null ? mcFin * (1 + post.max / 100) : null)} c="#facc15" />}
-       {post && <F k="subió tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
-       {post && <F k="ahora vs salida" v={`${post.desde >= 0 ? "+" : ""}${post.desde}%`} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
+       {!esUni && post && <F k="MC ahora" v={fmt(post.mcAhora)} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
+       {!esUni && post && <F k="MC pico REAL" v={fmt(mcFin != null && post.max != null ? mcFin * (1 + post.max / 100) : null)} c="#facc15" />}
+       {!esUni && post && <F k="subió tras vender" v={`${post.max >= 0 ? "+" : ""}${post.max}%`} c="#facc15" />}
+       {!esUni && post && <F k="ahora vs salida" v={`${post.desde >= 0 ? "+" : ""}${post.desde}%`} c={post.desde >= 0 ? "#22c55e" : "#ef4444"} />}
      </div>
+     {esUni && !trade.compras?.length && (
+       <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed #1e2d40" }}>
+         <div style={{ display: "flex", justifyContent: "space-between", padding: "1px 0" }}>
+           <span style={{ color: "#94a3b8" }}>t+0s · COMPRA (pierna bot)</span><span style={{ color: "#e2e8f0" }}>+1</span>
+         </div>
+         {!isOpen && (
+           <div style={{ display: "flex", justifyContent: "space-between", padding: "1px 0" }}>
+             <span style={{ color: "#fb923c" }}>t+{Math.round(((trade.closeTime || Date.now()) - trade.openTime) / 1000)}s · 🤖 sale el BOT{trade.closeReason ? ` (${trade.closeReason})` : ""}</span>
+             <span style={{ color: (trade.pnlPct || 0) >= 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>{(trade.pnlPct || 0) >= 0 ? "+" : ""}{(trade.pnlPct || 0).toFixed(1)}%</span>
+           </div>
+         )}
+       </div>
+     )}
      {trade.compras?.length > 0 && (
        <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed #1e2d40" }}>
-         <div style={{ color: "#64748b", marginBottom: 2 }}>🛒 compras del relevo · {trade.compras.length} lote{trade.compras.length > 1 ? "s" : ""} de 0.5 <span style={{ color: "#475569" }}>(% vs la entrada de la op)</span></div>
+         <div style={{ color: "#64748b", marginBottom: 2 }}>🛒 paquete del relevo · {trade.compras.length} lote{trade.compras.length > 1 ? "s" : ""} de 0.5 <span style={{ color: "#475569" }}>(% vs la entrada de la op)</span></div>
          {trade.compras.map((c2, i) => (
            <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0" }}>
-             <span style={{ color: "#94a3b8" }}>C{i + 1} · t+{c2.t}s</span>
+             <span style={{ color: "#94a3b8" }}>C{i + 1} · t+{c2.t}s · COMPRA</span>
              <span style={{ color: c2.p >= 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>{c2.p >= 0 ? "+" : ""}{c2.p}%</span>
            </div>
          ))}
+         {!isOpen && (
+           <div style={{ display: "flex", justifyContent: "space-between", padding: "1px 0", borderTop: "1px dotted #1e2d40", marginTop: 2 }}>
+             <span style={{ color: "#fb923c", fontWeight: 700 }}>t+{trade.compras[0].t + Math.round(((trade.closeTime || Date.now()) - trade.openTime) / 1000)}s · VENDE el paquete{trade.closeReason ? ` (${trade.closeReason})` : ""} ×{trade.compras.length}</span>
+             <span style={{ color: (trade.pnlPct || 0) >= 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>{(trade.pnlPct || 0) >= 0 ? "+" : ""}{(trade.pnlPct || 0).toFixed(1)}% <span style={{ color: "#64748b", fontWeight: 400 }}>de la media</span></span>
+           </div>
+         )}
        </div>
      )}
      <div style={{ marginTop: 6, display: "flex", gap: 10 }}>
@@ -272,7 +292,7 @@ function FilterBar({ statusFilter, setStatusFilter, stratFilter, setStratFilter,
        ))}
      </div>
      <div style={{ display: "flex", gap: 6 }}>
-       {[{ id: "all", label: "Todas" }, { id: "migration", label: "🌉" }, { id: "reentry", label: "🔄" }, { id: "fuerza", label: "⚡" }].map(f => (
+       {[{ id: "all", label: "Todas" }, { id: "unida", label: "🤝" }, { id: "migration", label: "🌉" }, { id: "reentry", label: "🔄" }, { id: "fuerza", label: "⚡" }].map(f => (
          <button key={f.id} onClick={() => setStratFilter(f.id)} style={{ flex: 1, padding: "5px", border: `1px solid ${stratFilter === f.id ? "#94a3b8" : "#1e2d40"}`, borderRadius: 8, background: stratFilter === f.id ? "#1e2d4055" : "none", color: stratFilter === f.id ? "#f1f5f9" : "#64748b", fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>
            {f.label}
          </button>
@@ -603,7 +623,7 @@ export default function App() {
  const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
- const [demoStratFilter, setDemoStratFilter] = useState("all");
+ const [demoStratFilter, setDemoStratFilter] = useState("unida");   // [23-ago] demo arranca enseñando solo la unida
  const [realStatusFilter, setRealStatusFilter] = useState("all");
  const [realStratFilter, setRealStratFilter] = useState("all");
  const [chartPeriod, setChartPeriod] = useState("daily");
