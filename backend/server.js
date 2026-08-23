@@ -1805,6 +1805,7 @@ function uniOpenTrade(rec, price, fase) {
 
 function uniCierra(rec, trade, price, reason) {
   trade.mov2s = rec.mov2s ?? trade.mov2s;   // para la línea MIGCLOSE (strat=unida, parseable como las demás)
+  trade.closeReason = reason;               // [23-ago] el panel muestra el motivo en la línea de tiempo
   closeDemoTrade(trade, price, reason, 21);
 }
 
