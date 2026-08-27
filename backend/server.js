@@ -433,9 +433,6 @@ const MIG_STEP_FLOOR = 0.13;
 // el trailing fino devolvía las corredoras (Excel: topes reales +682% cerrados a +10).
 const MIG_FOLLOW_PCT_STEP = 0.90;   // [v11.9] x6.3 (cap 90%)
 const MIG_HARD_CAP_LOSS = -20;
-  [123, 10],
-  [200, 50],
-];
 const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.90;    // [FIX 27-jul] el ×6.3 de la v11.9 se aplicó a P2/P3/P4 pero NO a P1: quedaba un acantilado absurdo (máx 39→trailing 15%, máx 41→90%) que estranguló 232 de 236 ops de esa banda. Réplica sobre 1.227 ops: +1.9 SOL
 const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.90;    // [v11.9] x6.3 (cap)  // [v11] era 0.15
 const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.756;   // [v11.9] 0.12×6.3
@@ -1002,10 +999,6 @@ function migStartWatching(coin) {
   state.stats.mig_migrations++;
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
   registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
-    const mcMigUsd = (coin.marketCapSol || 0) * solPriceUSD;
-    broadcast({ event: "stats", data: state.stats });
-    return;
-  }
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
   const mcMin = OBSERVER_MODE ? OBS_MIN_MC : MIG_MIN_MC;
   const mcMax = OBSERVER_MODE ? Infinity : MIG_MAX_MC;
@@ -1147,11 +1140,6 @@ function migQualTick(entry, price) {
       }
       if (mcEntryUsd > MIG_MAX_MC_ENTRY) {
         addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-      // [v10] FRENO DE RÉGIMEN: en pausa no se entra (la grabación sigue aparte)
-        addLog(`🧊 MIG FRENO: ${entry.symbol} descartada | régimen hostil (pausa ${Math.ceil((brakePausedUntil-Date.now())/60000)}min restantes)`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
@@ -2026,7 +2014,6 @@ function liveRecFinish(mint, cierreRealPct) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished) return;
   if (rec.cierreDemo == null) rec.cierreDemo = cierreRealPct;
-  }
   // [4-ago] sin expiración, la cámara acompaña a la op mientras siga abierta (si no, el lab quedaría ciego)
   const sigueAbierta = state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")
                     || state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"));
