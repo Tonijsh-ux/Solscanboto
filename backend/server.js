@@ -28,7 +28,7 @@ const MIG_MAX_MC_REAL = 1_000_000; // [v11.9] IDÉNTICO al demo (antes 200K: div
 const SOL_PER_TRADE_MIG = 0.5;
 const MAX_REAL_TRADES = +(process.env.MAX_REAL_TRADES || 2);   // [16-ago] prueba: 2 x 0.3 = 0.6 SOL, deja margen de gas sobre el balance de ~0.75 (era 10)
 const MAX_MIG_REAL = 10;
-const REAL_STRATEGIES = ["migration", "reentry", "fuerza"]; // [v11.9] real = demo
+const REAL_STRATEGIES = ["migration"];   // [27-ago] solo migración (reentry y fuerza eliminadas)
 
 // ── [v11.9] EJECUCIÓN REAL — obra de fricción ──────────────────────────────
 // EXEC_MODE: "pp" = PumpPortal trade-local (actual, 0.5%/lado)
@@ -94,23 +94,13 @@ const MIG_DURATION_MS = 0;   // [4-ago] 0 = SIN EXPIRACIÓN: la op vive hasta qu
 const MIG_HARD_MAX_MS = 6 * 60 * 60 * 1000;   // salvavidas: 6h de tope absoluto
 const MUERTO_PCT = 90;   // [16-ago] caída desde la entrada a partir de la cual damos el token por muerto
 const MIG_WINDOW_MS = 60_000;
-const MIG_MIN_VOL_FAST = 1_500;
-const MIG_MIN_VOL_SLOW = 2_000;
 const MIG_FAST_WINDOW_MS = 20_000;
-// ── FILTRO DE VOLUMEN ──
-// false = SIN filtro de volumen (entra en cuanto hay señal de precio, sin esperar $).
-// PRUEBA en demo: ver qué hace sin volumen. AVISO: sin volumen entra en muchos
-// tokens fantasma (suben por 1 compra mínima y se desploman). Alta basura.
-const MIG_VOL_FILTER_ON = false;
-const MIG_VOL_FAST_EFF = MIG_VOL_FILTER_ON ? MIG_MIN_VOL_FAST : 1;   // 1 dólar = prácticamente sin filtro
-const MIG_VOL_SLOW_EFF = MIG_VOL_FILTER_ON ? MIG_MIN_VOL_SLOW : 1;
+const MIG_VOL_FAST_EFF = 1;   // [27-ago] sin filtro de volumen (bandera eliminada)
+const MIG_VOL_SLOW_EFF = 1;
 const MIG_MIN_MC = 0;
 const MIG_MAX_MC = 2_000_000;
 const MIG_MAX_MC_ENTRY = 1_000_000;
 const MIG_MIN_MC_ENTRY = 2_500; // LAB: bajado de 5000 para ver todo el espectro
-const MIG_EXCLUDE_BAND_ON = false; // LAB: off para grupo control
-const MIG_EXCLUDE_BAND_LO = 30_000;
-const MIG_EXCLUDE_BAND_HI = 40_000;
 
 // ── [CAMBIO 9-jul] CORTE POR NO-DESPEGUE — REACTIVADO y por MÁXIMO ──
 // Validado en backtest sobre 206 ops (8-9 jul, train/test cronológico): a los 30s,
@@ -120,8 +110,6 @@ const MIG_EXCLUDE_BAND_HI = 40_000;
 const MIG_LAUNCH_CHECK = false;  // [v11] OFF — validado: los 'cuchillazo y vuelo' se quedan dentro y el trailing ancho los cabalga (test +4.48 vs +0.21 con corte suave)
 const MIG_LAUNCH_CHECK_MS = 30_000;  // a los 30 segundos de abrir
 const MIG_LAUNCH_MIN_PCT = 10;       // exige que el MÁXIMO haya tocado +10%
-const MIG_R30_ON = false;            // legacy, sustituida por el chequeo de máximo
-const MIG_R30_THRESHOLD = 0;
 
 // ── [CAMBIO 9-jul] FILTRO DE ENTRADA POR HOLDERS ──
 // Validado (train +35.5 / test +20.3 mSOL/op): holders<20 en el PREMIG = veneno
@@ -206,54 +194,16 @@ function seedCreators() {
   addLog(`🏭 Semilla de creadores cargada: ${CREATOR_SEED.length} fábricas fichadas (veto a ${MIG_CREATOR_VETO_MALAS}+ malas: ${MIG_CREATOR_VETO ? "ON" : "off"})`, "info");
 }
 
-// ── [v10] FRENO DE RÉGIMEN (validado walk-forward 11 días: recupera 0.5-1.3 SOL
-// en noches hostiles; 18/20 configs top de train también mejoran en test) ──
-const MIG_BRAKE_ON = false; // [v11] OFF — calibrado para la distribución de cierres de la v9, a la v11 le cuesta -10 SOL (bloquea los cuchillazos-que-vuelan y mata las reentries); recalibraciones = agujas no fiables. El kill-switch real (riskState) sigue activo.
-const MIG_BRAKE_N = 20;              // últimos 20 cierres demo de migración
-const MIG_BRAKE_SUM = -150;          // si suman menos de -150% en total...
-const MIG_BRAKE_PAUSE_MS = 30 * 60_000; // ...pausa de entradas 30 min (el LAB sigue grabando)
-let brakeCloses = [];
-let brakePausedUntil = 0;
-function regimenPausado() { return MIG_BRAKE_ON && Date.now() < brakePausedUntil; }
-function brakeRecordClose(pnlPct) {
-  if (!MIG_BRAKE_ON) return;
-  brakeCloses.push(pnlPct);
-  if (brakeCloses.length > MIG_BRAKE_N) brakeCloses.shift();
-  const suma = brakeCloses.reduce((a, b) => a + b, 0);
-  if (brakeCloses.length === MIG_BRAKE_N && suma < MIG_BRAKE_SUM && Date.now() >= brakePausedUntil) {
-    brakePausedUntil = Date.now() + MIG_BRAKE_PAUSE_MS;
-    addLog(`🧊 MIG FRENO DE RÉGIMEN: últimos ${MIG_BRAKE_N} cierres suman ${suma.toFixed(0)}% — pausa de entradas ${MIG_BRAKE_PAUSE_MS/60000}min (mercado en modo rug; la grabación sigue)`, "warn");
-  }
-}
-
-// ── [v10] TAMAÑO POR CALOR DEL MERCADO (validado: +2.5 SOL en 11 días a igual
-// capital medio; señal monótona consistente train/test) ──
-const MIG_HEAT_ON = false;  // [v11] OFF — 3/3 días invertido en la era v10.1 (lote 0.7 → media -3.3%); vuelve el lote fijo 0.5
 const migFlowTimes = [];             // timestamps de migraciones detectadas
 function calorMercado() {            // migraciones en los últimos 15 min
   const cutoff = Date.now() - 15 * 60_000;
   while (migFlowTimes.length && migFlowTimes[0] < cutoff) migFlowTimes.shift();
   return migFlowTimes.length;
 }
-function factorCalor() {
-  if (!MIG_HEAT_ON) return 1.0;
-  const c = calorMercado();
-  return c <= 1 ? 0.6 : c <= 3 ? 1.0 : 1.4;   // frío 0.3 / normal 0.5 / caliente 0.7 SOL con lote base 0.5
-}
 
 // ── [v10] RE-ENTRADA EN RESUCITADOS (estrategia demo separada; validada
 // walk-forward: +7.3 SOL aditivos en 11 días — negocio de cola: 1.4% de premios
 // pagan los billetes; fricción real ~4.5% ya considerada en la validación) ──
-const REENTRY_ON = true;
-const REENTRY_MIN_T = 45;            // no antes del segundo 45 de la grabación
-const REENTRY_DIP = -51;   // [29-jul] tornillo del lab (era -60)
-const REENTRY_JUMP = 40;   // [4-ago] tornillo del lab
-const REENTRY_ZONE = -45;            // [4-ago] tornillo del lab: entra desde -45%
-const REENTRY_SL = -31;              // [4-ago] tornillo del lab
-const REENTRY_ARM = 150;  // [29-jul] tornillo del lab: arma el trailing a +150 (era 50)
-const REENTRY_TRAIL = 0.80;   // [29-jul] tornillo del lab: anchura 80% (era 55)
-const REENTRY_MAX_OPEN = 10;
-const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
 
 // ── [23-ago] 🤝 UNIDA (demo puro): pierna bot paramétrica + relevo mixta tras SL ──
 // Motor clonado línea a línea de labSimUnida del analizador; decide en la MISMA cadencia en que
@@ -263,7 +213,9 @@ const REENTRY_SIZE = 0.5;            // lote fijo (validado así)
 // los días nuevos la confirmen. SIN espejo real a propósito.
 const UNI_ON = true;
 const UNI_SIZE = 0.5;              // lote demo por compra (pierna bot y cada relevo)
-const UNI_MAX_OPEN = 12;           // tope global de trades unida abiertos a la vez
+const UNI_MAX_OPEN = 12;           // tope global de TOKENS con unida abierta a la vez
+const UNI_MAX_SOL = 25;            // [27-ago] tope de capital desplegado: no abre compras nuevas
+                                   // por encima de esto (el pico real medido fue 17 SOL)
 // pierna bot (tornillos del lab, captura 22-ago — INDEPENDIENTES de la Base de migración):
 const UNI_BOT = { sl: -15, mult: 3, arm: 60, p1: 40, p2: 77, ndT: 10, ndM: 28, relNL: false };
 // relevo mixta:
@@ -278,13 +230,30 @@ const UNI_MUERTO_PCT = 60;         // [23-ago] token muerto: 60s seguidos por de
 const UNI_MUERTO_S = 60;           //   → liquida el paquete a mercado y deja de operar ese token
                                    //   (validado: mejora 17-19 +35.5→+38.2 y el histórico -17.3→-13.9)
 
+// ── [27-ago] DOS VARIANTES EN PARALELO ──────────────────────────────────────────
+// A) "unida"  = la de siempre, la que lleva días midiéndose.
+// B) "unida2" = la que salió de trastear el laboratorio: sin corte de no-despegue,
+//    trailing más estrecho, soporte pegado y solo en tokens con poco wash.
+//    AVISO honesto: en la ventana 18-19 esta variante perdió (-7.9 SOL) donde la A
+//    ganaba (+10.4). Va en demo justamente para resolver eso con días nuevos.
+const UNI2_ON = true;
+const UNI2 = {
+  id: "unida2",
+  bot: { sl: -15, mult: 2, arm: 30, p1: 36, p2: 17, ndT: 0, ndM: 12, relNL: false },
+  giro: 10, tau: 20, md: 0, mv: 20,
+  maxlot: 8, maxvend: 5, rug: 50,
+  muertoPct: 0, muertoS: 60,      // 0 = sin regla del muerto
+  washMax: 20,                     // solo entra el relevo si el wash del primer minuto ≤ 20
+};
+const UNI1 = {
+  id: "unida",
+  bot: UNI_BOT, giro: UNI_GIRO, tau: UNI_TAU, md: UNI_MD, mv: UNI_MV,
+  maxlot: UNI_MAXLOT, maxvend: UNI_MAXVEND, rug: UNI_RUG,
+  muertoPct: UNI_MUERTO_PCT, muertoS: UNI_MUERTO_S, washMax: 0,
+};
+const UNI_VARIANTES = () => UNI2_ON ? [UNI1, UNI2] : [UNI1];
+
 // ── [v11.9] RE-ENTRADA POR FUERZA ("la del sofá") ──
-const FZ_ON = process.env.FZ_ON === "true";   // [v11.9] APAGADA por defecto (encender con FZ_ON=true)
-const FZ_MARGIN = 0.50;
-const FZ_SL = -15;
-const FZ_ARM = 40;
-const FZ_TRAIL = 0.50;
-const FZ_MAX_OPEN = 10;
 
 // ── [v11.9] RESCATE DE FEED: PumpPortal a veces calla en origen (5ª fuente: el volumen
 // se muda de pool, o la suscripción cae en silencio). Si un mint con trades ABIERTOS lleva
@@ -356,17 +325,9 @@ const OBS_T2_MS = 300_000;
 const OBS_T2_INTERVAL = 3_000;
 const OBS_T3_INTERVAL = 5_000;
 
-const MC_OBSERVER = false;  // OBSERVADOR OFF: el bot OPERA en demo. Ponlo en true para volver a grabar MCREC.
-const MCO_RECORD_MS = 1_200_000;      // 20 min de grabación
 const MCO_T1_MS = 60_000;             // primer MINUTO completo = alta resolución
 const MCO_T1_INTERVAL = 1_000;        // muestreo cada 1s durante el primer minuto
 const MCO_T2_INTERVAL = 5_000;        // después del minuto, cada 5s
-const MCO_STRONG_REBOUND = 40;
-const MCO_BIRTH_CANDLES = 12;         // grabar el % de las primeras 12 velas de 1s
-const MCO_BIRTH_WINDOW_MS = 1_000;    // cada "vela" = 1 segundo
-const MCO_VOL_SECONDS = 60;
-const MCO_PUMP_CANDLE_PCT = 50;       // vela "vertical" si sube >+50% en 1s
-const MCO_HEALTHY_CORRECTION = -3;    // corrección "sana" si una vela baja < -3%
 
 const MIG_BREAKEVEN_AT = 0.20;        // breakeven al +20%: protege el suelo antes
 const MIG_BREAKEVEN_MARGIN = 0.03;
@@ -434,8 +395,7 @@ const MIG_CFG_BASE = { nom:"base", sl:-40, mult:7.0, arm:30, piso1:0, piso2:60, 
 // enrutaba a 4 clases cuyas ventanas de vel (<3.8, <5.4) ya no encajan con la población actual
 // (mediana 5.8s), así que apenas se activaban y, cuando lo hacían, ejecutaban otra estrategia
 // distinta de la validada. Para que bot y lab hagan lo mismo, todo va a la Base.
-// Para reactivarlas: MIG_CLASES_ON = true y recalibrar sus condiciones en el lab primero.
-const MIG_CLASES_ON = false;
+// [27-ago] clases eliminadas: todo corre con la config Base.
 const MIG_CFGS = [
   { cond:d=> d.t10!=null&&d.t10>87 && d.mov!=null&&d.mov>1.12 && d.t5!=null&&d.t5>75,
     C:{ nom:"godzilla", arm:25, sl:-29, mult:6.0, piso1:24, piso2:80, pisoOn:false, runTrig:49, runTr:33, ndT:41, ndMin:58, tp:1e9 } },
@@ -451,7 +411,7 @@ function migCfgTrailPct(maxGainPct, mult) {   // mismos tiers del lab: b(máx) �
   return Math.min(0.90, b * mult);
 }
 function migRouteCfg(trade) {
-  if (!MIG_CLASES_ON) { trade.cfg = MIG_CFG_BASE; return; }   // [4-ago] todo con la Base, como el lab
+  trade.cfg = MIG_CFG_BASE; return;   // [27-ago] siempre la Base (clases eliminadas)
   const pre = premigData.get(trade.mint) || {};
   const d = { t10: pre.top10Pct ?? null, t5: pre.top5Pct ?? null, tx: pre.total ?? null, ed: pre.ageMin ?? null,
               vel: trade.velSeg ?? null, mc: trade.mcOpenUsd ?? null, mov: trade.mov2s ?? null };
@@ -464,7 +424,6 @@ function migRouteCfg(trade) {
   addLog(`🎛️ MOTOR ${C.nom.toUpperCase()}: ${trade.symbol} | mov2s ${trade.mov2s != null ? (trade.mov2s >= 0 ? "+" : "") + trade.mov2s.toFixed(1) + "%" : "n/a"} → SL ${C.sl}% · anchura x${C.mult} · pisos ${C.pisoOn ? "+" + C.piso1 + "/+" + C.piso2 : "off"} · moon +${C.runTrig}%/${C.runTr}% · ND ${C.ndT}s/+${C.ndMin}% · TP ${C.tp >= 1e8 ? "sin" : "+" + C.tp + "%"}`, "demo");
 } // [FIX 29-jul] VETO DE LENTOS, mando del lab: vel = segundos migración→entrada (señal+confirmación+examen incluidos, la misma vel que graba el MIGREC). Si tarda más de 11s en entrar, fuera.
 const MIG_QUAL_MAX_WAIT_MS = 600_000;  // qual_gate CONTINUO: vigila hasta 10 min esperando la señal
-const MIG_QUAL_PEND15_ON = false;
 const MIG_QUAL_WINDOW_MS = 15_000;
 const MIG_QUAL_DECIDE_MS = 2_500;
 const MIG_MAX_CAIDA_DELAY = 0.10;      // [FIX 26-jul] aborta si cae más de -10% en la confirmación (antes 0.35: toleraba un -34% tras la señal y entraba en pleno cuchillo)
@@ -474,28 +433,9 @@ const MIG_STEP_FLOOR = 0.13;
 // el trailing fino devolvía las corredoras (Excel: topes reales +682% cerrados a +10).
 const MIG_FOLLOW_PCT_STEP = 0.90;   // [v11.9] x6.3 (cap 90%)
 const MIG_HARD_CAP_LOSS = -20;
-const MIG_CAP_LOSS_ON = false;
-// ── TRAILING POR ESTRUCTURA ──
-const MIG_STRUCT_ON = false;
-const MIG_STRUCT_ARM_PCT = 50;
-const MIG_STRUCT_RETROCESO = 20;
-// ── TRAILING POR TENDENCIA ──
-// NOTA (auditoría 9-jul): aplicarEstructuraYEscalones NO se llama desde ningún sitio
-// (código muerto). Se dejan los flags en false para que el banner no anuncie una
-// estrategia que no corre. Si algún día se quiere activar, hay que invocarla desde
-// updateDemoTrades/updateRealTrades.
-const MIG_TREND_ON = false;           // [CAMBIO 9-jul] era true pero era código muerto
-const MIG_TREND_ARM_PCT = 50;
-const MIG_TREND_RETROCESO = 25;
-// ── ESCALONES DE SL POR NIVEL ──
-const MIG_ESCALONES_ON = false;       // [CAMBIO 9-jul] era true pero era código muerto
-const MIG_ESCALONES = [
   [123, 10],
   [200, 50],
 ];
-const MIG_VELO_DROP = 0.10;
-const MIG_VELO_ON = false;
-const MIG_VELO_MS = 2_000;
 const MIG_TRAIL_T1 = 40;  const MIG_TRAIL_P1 = 0.90;    // [FIX 27-jul] el ×6.3 de la v11.9 se aplicó a P2/P3/P4 pero NO a P1: quedaba un acantilado absurdo (máx 39→trailing 15%, máx 41→90%) que estranguló 232 de 236 ops de esa banda. Réplica sobre 1.227 ops: +1.9 SOL
 const MIG_TRAIL_T2 = 60;  const MIG_TRAIL_P2 = 0.90;    // [v11.9] x6.3 (cap)  // [v11] era 0.15
 const MIG_TRAIL_T3 = 100; const MIG_TRAIL_P3 = 0.756;   // [v11.9] 0.12×6.3
@@ -591,21 +531,11 @@ function riskRolloverDay() {
 }
 
 // FILTRO HORARIO (7-jul, validado sobre julio): evitar franjas malas consistentes.
-const MIG_TIME_FILTER_ON = false; // LAB: off, se simulará después
 const MIG_TZ_OFFSET = 2; // España respecto a UTC (verano). Ajustar a 1 en invierno.
 function horaEspana() {
   const utcH = new Date().getUTCHours();
   const utcM = new Date().getUTCMinutes();
   return ((utcH + MIG_TZ_OFFSET + 24) % 24) + utcM / 60;
-}
-function franjaHorariaEvitada() {
-  if (!MIG_TIME_FILTER_ON) return null;
-  const h = horaEspana();
-  // Madrugada 1:00 - 8:30
-  if (h >= 1 && h < 8.5) return "madrugada (1:00-8:30 ES)";
-  // Hora 20:00 - 21:00
-  if (h >= 20 && h < 21) return "hora 20h ES";
-  return null;
 }
 
 function tradingHalted() {
@@ -678,7 +608,6 @@ const state = {
   migMonitored: new Map(),
   obsRecordings: new Map(),
   rejRecordings: new Map(),   // [5-ago] cámaras de tokens rechazados (no operados)
-  mcoRecordings: new Map(),
   liveRecordings: new Map(),
   signals: [],
   // ── REGISTRO DE PnL POR HORA ──
@@ -725,7 +654,6 @@ function saveState() {
       movements: state.movements,
       stats: state.stats,
       shadow: state.shadow,
-      fzJuicio: state.fzJuicio,
       creatorHist: [...creatorHist.entries()],
       abyssCreators: [...abyssCreators],
       riskState: {
@@ -759,7 +687,6 @@ function loadState() {
       // [v11.9] blindaje: nunca heredar un alta posterior al arranque (bug de redeploys encadenados)
       if (!state.shadow.alta || state.shadow.alta > Date.now()) state.shadow.alta = SHADOW_ALTA;
     }
-    if (saved.fzJuicio) state.fzJuicio = saved.fzJuicio;
     if (saved.creatorHist) for (const [k, v] of saved.creatorHist) creatorHist.set(k, v);
     if (saved.abyssCreators) { for (const w of saved.abyssCreators) abyssCreators.add(w);
       if (abyssCreators.size) addLog(`☠️ Lista negra de por vida: ${abyssCreators.size} creador(es) (${ABYSS_SEED.length} de semilla + ${abyssCreators.size - ABYSS_SEED.length} cazados)`, "info"); }
@@ -889,9 +816,8 @@ function unsubscribeToken(mint) {
   if (state.migWatching.has(mint)) return;
   if (state.liveRecordings.has(mint)) return;   // LAB: grabación extendida activa
   if (state.obsRecordings?.has?.(mint)) return;
-  if (state.mcoRecordings?.has?.(mint)) return;   // [v11.9]
   if (state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"))) return;
-  if (state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")) return;   // [v11.9] fuerza/reentry demo vivos
+  if (state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")) return;   // [v11.9] demo vivos del mismo mint
   if (pumpPortalWs?.readyState === WebSocket.OPEN) {
     pumpPortalWs.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [mint] }));
   }
@@ -939,138 +865,9 @@ setInterval(async () => {
   if (wallet) { state.stats.walletBalance = await getWalletBalance(); broadcast({ event: "stats", data: state.stats }); }
 }, 30_000);
 
-// ════════════════════════════════════════════════════════════════
-// MODO MC_OBSERVER (grabación del recorrido del MC desde la migración)
-// ════════════════════════════════════════════════════════════════
 
-function mcoStart(mint, symbol, mcMigUsd) {
-  if (!MC_OBSERVER) return;
-  if (state.mcoRecordings.has(mint)) return;
-  if (pumpPortalWs?.readyState === WebSocket.OPEN) {
-    pumpPortalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
-  }
-  const rec = {
-    mint, symbol,
-    mcMig: mcMigUsd > 0 ? mcMigUsd : null,
-    mcMigSource: mcMigUsd > 0 ? "evento" : "1er-tick",
-    t0: Date.now(),
-    puntos: [],
-    lastSample: 0,
-    minP: 0, minT: 0,
-    maxP: 0, maxT: 0,
-    finished: false,
-    birthCandles: [],        // [{idx, pctAcum, pctVela}] una por segundo
-    lastCandleMc: null,      // MC al cierre de la última vela (para calcular % de la vela)
-    lastCandleT: 0,          // timestamp de la última vela cerrada
-    mcNacimiento: null,      // MC del primerísimo tick (el "nacimiento")
-    volPorSeg: [],           // [volAcumUSD] índice = segundo (0..VOL_SECONDS)
-    volAcum: 0,              // volumen acumulado total (USD)
-    lastVolSec: -1,          // último segundo registrado
-  };
-  if (rec.mcMig != null) rec.puntos.push({ t: 0, p: 0 });
-  state.mcoRecordings.set(mint, rec);
-  addLog(`🔬 MCREC GRABANDO: ${symbol} | MC mig ${rec.mcMig != null ? formatMC(rec.mcMig) : "(esperando 1er tick)"} — ${MCO_RECORD_MS/60000}min`, "accept");
-  rec.timer = setTimeout(() => mcoFinish(mint), MCO_RECORD_MS);
-}
 
-function mcoSample(mint, price, volUSD = 0) {
-  const rec = state.mcoRecordings.get(mint);
-  if (!rec || rec.finished || price <= 0) return;
-  const mcNow = price * 1_000_000_000;
-  rec.volAcum = (rec.volAcum || 0) + volUSD;
-  if (rec.t0) {
-    const segNow = Math.floor((Date.now() - rec.t0) / 1000);
-    if (segNow >= 0 && segNow <= MCO_VOL_SECONDS && segNow > rec.lastVolSec) {
-      for (let s = rec.lastVolSec + 1; s <= segNow; s++) rec.volPorSeg[s] = +rec.volAcum.toFixed(0);
-      rec.lastVolSec = segNow;
-    }
-  }
-  if (rec.mcMig == null) {
-    rec.mcMig = mcNow;
-    rec.mcNacimiento = mcNow;
-    rec.lastCandleMc = mcNow;
-    rec.lastCandleT = Date.now();
-    rec.t0 = Date.now();
-    rec.lastSample = 0;
-    rec.puntos.push({ t: 0, p: 0 });
-    addLog(`🔬 MCREC ref fijada (1er tick): ${rec.symbol} | MC nacimiento ${formatMC(rec.mcMig)}`, "accept");
-    return;
-  }
-  if (rec.mcMig <= 0) return;
 
-  if (rec.birthCandles.length < MCO_BIRTH_CANDLES) {
-    const dtCandle = Date.now() - rec.lastCandleT;
-    if (dtCandle >= MCO_BIRTH_WINDOW_MS) {
-      const pctVela = rec.lastCandleMc > 0 ? +((mcNow - rec.lastCandleMc) / rec.lastCandleMc * 100).toFixed(2) : 0;
-      const pctAcum = +((mcNow - rec.mcNacimiento) / rec.mcNacimiento * 100).toFixed(2);
-      rec.birthCandles.push({ idx: rec.birthCandles.length + 1, pctVela, pctAcum });
-      rec.lastCandleMc = mcNow;
-      rec.lastCandleT = Date.now();
-    }
-  }
-
-  const dt = Date.now() - rec.t0;
-  const interval = dt <= MCO_T1_MS ? MCO_T1_INTERVAL : MCO_T2_INTERVAL;
-  if (rec.lastSample && Date.now() - rec.lastSample < interval) return;
-  rec.lastSample = Date.now();
-  const pct = +((mcNow - rec.mcMig) / rec.mcMig * 100).toFixed(2);
-  const tSec = Math.round(dt / 1000);
-  rec.puntos.push({ t: tSec, p: pct });
-  if (pct < rec.minP) { rec.minP = pct; rec.minT = tSec; }
-  if (pct > rec.maxP) { rec.maxP = pct; rec.maxT = tSec; }
-}
-
-function mcoFinish(mint) {
-  const rec = state.mcoRecordings.get(mint);
-  if (!rec || rec.finished) return;
-  rec.finished = true;
-  state.mcoRecordings.delete(mint);
-  unsubscribeToken(mint);
-
-  const pts = rec.puntos;
-  if (rec.mcMig == null || pts.length < 2) {
-    addLog(`[MCREC] sym=${rec.symbol} SIN DATOS (${pts.length} pts, MC ref ${rec.mcMig == null ? "nunca llegó" : formatMC(rec.mcMig)}) — token sin actividad tras migrar`, "rec");
-    return;
-  }
-
-  const lastP = pts.length ? pts[pts.length - 1].p : 0;
-
-  let maxAfterMin = rec.minP;
-  let maxAfterMinT = rec.minT;
-  for (const pt of pts) {
-    if (pt.t > rec.minT && pt.p > maxAfterMin) { maxAfterMin = pt.p; maxAfterMinT = pt.t; }
-  }
-  const reboteDesdeSuelo = +(maxAfterMin - rec.minP).toFixed(2);
-  const tiroFuerte = reboteDesdeSuelo >= MCO_STRONG_REBOUND ? "SI" : "no";
-
-  const bc = rec.birthCandles;
-  const idxCohete = bc.findIndex(c => c.pctVela >= MCO_PUMP_CANDLE_PCT);
-  const huboCohete = idxCohete >= 0;
-  let firma = "normal";
-  if (huboCohete) {
-    const despues = bc.slice(idxCohete + 1);
-    const corrige = despues.some(c => c.pctVela <= MCO_HEALTHY_CORRECTION);
-    const sigueInflando = despues.length > 0 && despues.every(c => c.pctVela > MCO_HEALTHY_CORRECTION) &&
-                          despues.some(c => c.pctVela >= 30);
-    if (corrige) firma = "COHETE+corrige(sano?)";
-    else if (sigueInflando) firma = "COHETE+sigue-inflando(RUG?)";
-    else firma = "COHETE+plano";
-  }
-  const nacBajo = rec.mcNacimiento != null && rec.mcNacimiento < 5000 ? "BAJO" : "normal";
-  const murio = lastP < -50 || (rec.maxP > 20 && lastP < rec.maxP - 70) ? "MURIO" : "vivo";
-
-  const velasStr = bc.map(c => `v${c.idx}:${c.pctVela>=0?"+":""}${c.pctVela}%`).join(" ");
-  const ptsRaw = pts.map(p => `${p.t}:${p.p}`).join(",");
-  const volRaw = (rec.volPorSeg || []).map((v, s) => v != null ? `${s}:${v}` : null).filter(Boolean).join(",");
-  addLog(
-    `[MCREC] sym=${rec.symbol} nac=${rec.mcNacimiento != null ? formatMC(rec.mcNacimiento) : "?"}(${nacBajo}) ` +
-    `velas[${velasStr}] firma=${firma} fin=${murio} ` +
-    `suelo=${rec.minP}%@${rec.minT}s techo=${rec.maxP}%@${rec.maxT}s ` +
-    `rebote_desde_suelo=${reboteDesdeSuelo}pts@${maxAfterMinT}s tiro_fuerte=${tiroFuerte} ` +
-    `cierre=${lastP}% vol=${volRaw} pts=${ptsRaw}`,
-    "rec"
-  );
-}
 
 // ════════════════════════════════════════════════════════════════
 // ESTRATEGIA: SNIPER DE MIGRACIÓN
@@ -1205,10 +1002,8 @@ function migStartWatching(coin) {
   state.stats.mig_migrations++;
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
   registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
-  if (MC_OBSERVER) {
     const mcMigUsd = (coin.marketCapSol || 0) * solPriceUSD;
     broadcast({ event: "stats", data: state.stats });
-    mcoStart(coin.mint, coin.symbol || "???", mcMigUsd);
     return;
   }
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
@@ -1355,13 +1150,7 @@ function migQualTick(entry, price) {
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
-      if (MIG_EXCLUDE_BAND_ON && mcEntryUsd >= MIG_EXCLUDE_BAND_LO && mcEntryUsd < MIG_EXCLUDE_BAND_HI) {
-        addLog(`🚫 MIG BANDA EXCLUIDA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} en zona $30-40K (valle: WR 35%, -10.5 SOL histórico)`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
       // [v10] FRENO DE RÉGIMEN: en pausa no se entra (la grabación sigue aparte)
-      if (regimenPausado()) {
         addLog(`🧊 MIG FRENO: ${entry.symbol} descartada | régimen hostil (pausa ${Math.ceil((brakePausedUntil-Date.now())/60000)}min restantes)`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
@@ -1676,115 +1465,28 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   rec.sampleTick = rec.lastSample;   // [4-ago] sello: en ESTE tick sí hay muestra → el motor decide aquí
   const pct = +((price - rec.entryPrice) / rec.entryPrice * 100).toFixed(2);
   rec.puntos.push({ t: Math.round(dt/1000), p: pct });
-  // [v11.9] FUERZA: el precio supera el máximo previo en el margen -> perseguir
-  if (FZ_ON && rec.fzArmed && !rec.fzFired && pct >= rec.fzTrigPct) {
-    rec.fzFired = true;
-    fzOpenTrades(rec, price);
-  }
   if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
   if (pct < rec.minP) rec.minP = pct;
-  maybeReentry(rec, price, pct, Math.round(dt/1000));  // [v10]
   uniSample(rec, price, pct, Math.round(dt/1000));     // [23-ago] 🤝 UNIDA: decide en cadencia de muestra
 }
 
-// ── [v10] RE-ENTRADA EN RESUCITADOS (demo puro) ──
-function maybeReentry(rec, price, pct, tSec) {
-  if (!REENTRY_ON || rec.reentered || MC_OBSERVER || OBSERVER_MODE) return;
-  if (tSec < REENTRY_MIN_T) return;
-  if (!(rec.minP <= REENTRY_DIP && pct >= rec.minP + REENTRY_JUMP && pct >= REENTRY_ZONE)) { rec.reArmed = false; return; }
-  // [29-jul H78WEN] CONFIRMACIÓN ANTI-GLITCH: el rebote debe aguantar DOS ticks seguidos.
-  // Un print de lavado de 1 tick (−53% → −10% → −45%) disparaba la entrada y moría en 0s.
-  if (!rec.reArmed) { rec.reArmed = true; return; }   // primer tick que cumple: armar y esperar al siguiente
-  rec.reArmed = false;
-  rec.reentered = true;  // una sola re-entrada por token
-  const abiertos = state.demoTrades.filter(t => t.strategy === "reentry" && t.status === "OPEN").length;
-  if (abiertos >= REENTRY_MAX_OPEN) { addLog(`🔄 REENTRY saltada (límite ${REENTRY_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
-  const trade = {
-    id: `reentry-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
-    strategy: "reentry", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
-    entryPrice: price, tp: +(price * 21).toFixed(12),
-    sl: +(price * (1 + REENTRY_SL/100)).toFixed(12),
-    sizeSol: REENTRY_SIZE,
-    openTime: Date.now(), closeTime: null, closePrice: null,
-    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
-    trailingPhase: "REENTRY", status: "OPEN",
-    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS), mov1s: null, mov2s: null,
-  };
-  state.demoTrades.unshift(trade);
-  if (state.demoTrades.length > 500) state.demoTrades.pop();
-  state.stats.demoOpen++;
-  broadcast({ event: "newDemoTrade", data: trade });
-  broadcast({ event: "stats", data: state.stats });
-  addLog(`🔄 REENTRY [demo]: ${rec.symbol} | resucitado (mín ${rec.minP.toFixed(0)}% → ahora ${pct.toFixed(0)}%) | SL ${REENTRY_SL}% trail ${REENTRY_TRAIL*100}% desde pico`, "accept");
-  // [v11.9] real = demo: la reentry también se opera en real (mismo disparo, mismo token)
-  openRealTrade({ strategy: "reentry", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
-    price, tp: +(price * 21).toFixed(12), sl: +(price * (1 + REENTRY_SL/100)).toFixed(12) });
-}
 
-function updateReentryTrades(mint, price) {
-  if (!REENTRY_ON) return;
-  const now = Date.now();
-  for (const trade of state.demoTrades) {
-    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "reentry") continue;
-    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
-    trade.currentPct = +currentPct.toFixed(2);
-    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
-    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    if (trade.maxGainPct >= REENTRY_ARM) {
-      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
-      const cand = peakPrice * (1 - REENTRY_TRAIL);
-      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
-    }
-    if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
-    else if (price <= trade.sl) {
-      // [v10.1] confirmación de 2 ticks: el backtest se validó con muestras de 2-5s,
-      // así que las mechas de un solo tick no deben ejecutar (igual que el SL de migración)
-      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeDemoTrade(trade, price, "SL", 21); }
-    }
-    else {
-      trade._slBelowCount = 0;
-      if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
-      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), trailingPhase: trade.trailingPhase } });
-    }
-  }
-  // [v11.9] mismas reglas para las reentries REALES
-  for (const trade of state.realTrades) {
-    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "reentry") continue;
-    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
-    trade.currentPct = +currentPct.toFixed(2);
-    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
-    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    if (trade.maxGainPct >= REENTRY_ARM) {
-      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
-      const cand = peakPrice * (1 - REENTRY_TRAIL);
-      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
-    }
-    if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
-    else if (price <= trade.sl) {
-      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeRealTrade(trade, price, "SL"); }
-    } else {
-      trade._slBelowCount = 0;
-      if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
-      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), trailingPhase: trade.trailingPhase } });
-    }
-  }
-}
 
 // ── [23-ago] 🤝 UNIDA: motor (réplica 1:1 de labSimUnida). Estado por grabación en rec.uni. ──
 // Las curvas del lab SON los puntos que muestrea liveRecSample, así que decidir aquí con los
 // mismos pct redondeados garantiza que server y analizador vean la misma película.
 const uniF = (v) => 1 + v / 100;   // % → ratio (el f() del lab)
 
-function uniAbiertas() {
-  return state.demoTrades.filter(t => t.strategy === "unida" && t.status === "OPEN").length;
+function uniAbiertas(id) {   // [27-ago] cuenta TOKENS distintos, no trades (cada op abre hasta 2)
+  const mints = new Set();
+  for (const t of state.demoTrades) if (t.strategy === id && t.status === "OPEN") mints.add(t.mint);
+  return mints.size;
 }
 
-function uniOpenTrade(rec, price, fase) {
+function uniOpenTrade(rec, price, fase, id) {
   const trade = {
-    id: `unida-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    strategy: "unida", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
+    id: `${id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    strategy: id, mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
     entryPrice: price, tp: +(price * 1e9).toFixed(12),   // sin TP: cierra el motor
     sl: 0,                                               // informativo: el stop vive en rec.uni
     sizeSol: UNI_SIZE,
@@ -1805,42 +1507,56 @@ function uniOpenTrade(rec, price, fase) {
 
 function uniCierra(rec, trade, price, reason) {
   trade.mov2s = rec.mov2s ?? trade.mov2s;   // para la línea MIGCLOSE (strat=unida, parseable como las demás)
-  trade.closeReason = reason;               // [23-ago] el panel muestra el motivo en la línea de tiempo
+  trade.closeReason = reason;
+  trade.spark = curvaMini(rec.mint);        // [27-ago] curva para el minigráfico de la tarjeta
+  trade.calidad = calidadEntrada(rec.mint); // wash / compradores / concentración               // [23-ago] el panel muestra el motivo en la línea de tiempo
   closeDemoTrade(trade, price, reason, 21);
 }
 
 function uniInit(rec, entryPrice) {
-  if (!UNI_ON || MC_OBSERVER || OBSERVER_MODE) return;
-  if (uniAbiertas() >= UNI_MAX_OPEN) { addLog(`🤝 UNIDA saltada (límite ${UNI_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
-  // estado = labSimUnida con el primer punto (t=0, p=0) ya consumido:
-  rec.uni = {
-    dir: 0, ref: { t: 0, p: 0 }, prev: 0, mins: [],   // pivotes causales (los máximos no se usan para comprar)
-    envLog: 0, envT: 0,                                // log-envolvente de máximos (labEnvUp): arranca en log(f(0))=0
-    bSl: uniF(UNI_BOT.sl), bFol: false, bMax: 0, bAbierta: true, mixOn: false,
-    lotes: [], sumInv: 0, tUlt: 0, vendidos: 0, muertoIni: null,
-    tradeBot: uniOpenTrade(rec, entryPrice, "UNI_BOT"),
-    tradePack: null,
-  };
-  addLog(`🤝 UNIDA [demo]: ${rec.symbol} | pierna bot dentro (stop ${UNI_BOT.sl}% · ×${UNI_BOT.mult} · arma +${UNI_BOT.arm} · pisos +${UNI_BOT.p1}/+${UNI_BOT.p2} · ND ${UNI_BOT.ndT}s/+${UNI_BOT.ndM}%)`, "accept");
+  if (!UNI_ON || OBSERVER_MODE) return;
+  rec.uni = [];
+  for (const cfg of UNI_VARIANTES()) {
+    if (uniAbiertas(cfg.id) >= UNI_MAX_OPEN) { addLog(`🤝 ${cfg.id} saltada (límite ${UNI_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); continue; }
+    // estado = labSimUnida con el primer punto (t=0, p=0) ya consumido:
+    rec.uni.push({
+      cfg,
+      dir: 0, ref: { t: 0, p: 0 }, prev: 0, mins: [],   // pivotes causales (los máximos no se usan para comprar)
+      envLog: 0, envT: 0,                                // log-envolvente de máximos (labEnvUp): arranca en log(f(0))=0
+      bSl: uniF(cfg.bot.sl), bFol: false, bMax: 0, bAbierta: true, mixOn: false,
+      lotes: [], sumInv: 0, tUlt: 0, vendidos: 0, muertoIni: null, vetado: false,
+      tradeBot: uniOpenTrade(rec, entryPrice, "UNI_BOT", cfg.id),
+      tradePack: null,
+    });
+  }
+  if (!rec.uni.length) { rec.uni = null; return; }
+  const b = UNI1.bot;
+  addLog(`🤝 UNIDA [demo]: ${rec.symbol} | ${rec.uni.length} variante(s) · pierna bot dentro (stop ${b.sl}% · ×${b.mult} · arma +${b.arm} · ND ${b.ndT ? b.ndT + "s/+" + b.ndM + "%" : "off"})`, "accept");
 }
 
 function uniSample(rec, price, pct, tSec) {
-  const u = rec.uni;
-  if (!u) return;
+  if (!rec.uni || !rec.uni.length) return;
+  for (const u of rec.uni) uniSampleUno(rec, u, price, pct, tSec);
+  if (!rec.uni.some(u => u)) rec.uni = null;
+}
+
+function uniSampleUno(rec, u, price, pct, tSec) {
+  if (!u || u.muerto) return;
+  const C = u.cfg;
   const t = tSec, v = pct;
   // 1) envolvente roja: el valor que DECIDE este tick es el PREVIO a integrar el punto
   //    (labEnvUp asigna A[q]=exp(U) antes de actualizar U con el punto q)
   const upRatio = Math.exp(u.envLog);
   const dtE = Math.max(0.001, t - u.envT); u.envT = t;
   const lp = Math.log(uniF(v));
-  if (lp > u.envLog) u.envLog = lp; else u.envLog += (1 - Math.exp(-dtE / UNI_TAU)) * (lp - u.envLog);
+  if (lp > u.envLog) u.envLog = lp; else u.envLog += (1 - Math.exp(-dtE / C.tau)) * (lp - u.envLog);
   // 2) pivotes causales (siempre mirando, también con la pierna bot dentro — igual que el lab)
   const cg = (uniF(v) / uniF(u.ref.p) - 1) * 100;
-  if (u.dir >= 0 && cg <= -UNI_GIRO) { u.dir = -1; u.ref = { t, p: v }; }
-  else if (u.dir <= 0 && cg >= UNI_GIRO) { u.mins.push({ ...u.ref }); u.dir = 1; u.ref = { t, p: v }; }
+  if (u.dir >= 0 && cg <= -C.giro) { u.dir = -1; u.ref = { t, p: v }; }
+  else if (u.dir <= 0 && cg >= C.giro) { u.mins.push({ ...u.ref }); u.dir = 1; u.ref = { t, p: v }; }
   else if ((u.dir >= 0 && v > u.ref.p) || (u.dir < 0 && v < u.ref.p)) u.ref = { t, p: v };
   // [23-ago] cronómetro del token muerto: cuenta desde CUALQUIER tick bajo el umbral
-  if (v <= -UNI_MUERTO_PCT) { if (u.muertoIni == null) u.muertoIni = t; } else u.muertoIni = null;
+  if (C.muertoPct > 0) { if (v <= -C.muertoPct) { if (u.muertoIni == null) u.muertoIni = t; } else u.muertoIni = null; }
   // 3) pierna del bot (tornillos UNI_BOT, independientes de la migración Base)
   if (u.bAbierta) {
     const tb = u.tradeBot;
@@ -1849,50 +1565,61 @@ function uniSample(rec, price, pct, tSec) {
     if (v < tb.maxLossPct) tb.maxLossPct = v;
     const ra = uniF(v);
     if (v > u.bMax) u.bMax = v;
-    if (!u.bFol && ra >= 1 + UNI_BOT.arm / 100) u.bFol = true;
+    if (!u.bFol && ra >= 1 + C.bot.arm / 100) u.bFol = true;
     if (u.bFol) {
       const b2 = u.bMax >= 100 ? 0.08 : u.bMax >= 60 ? 0.12 : u.bMax >= 40 ? 0.15 : 0.20;
-      const anch = Math.min(0.90, b2 * UNI_BOT.mult);
+      const anch = Math.min(0.90, b2 * C.bot.mult);
       const cand = ra * (1 - anch); if (cand > u.bSl) u.bSl = cand;
-      if (u.bMax >= UNI_BOT.arm && 1 + UNI_BOT.p1 / 100 > u.bSl) u.bSl = 1 + UNI_BOT.p1 / 100;
-      if (u.bMax >= 100 && 1 + UNI_BOT.p2 / 100 > u.bSl) u.bSl = 1 + UNI_BOT.p2 / 100;
+      if (u.bMax >= C.bot.arm && 1 + C.bot.p1 / 100 > u.bSl) u.bSl = 1 + C.bot.p1 / 100;
+      if (u.bMax >= 100 && 1 + C.bot.p2 / 100 > u.bSl) u.bSl = 1 + C.bot.p2 / 100;
     }
-    if (UNI_BOT.ndT && t >= UNI_BOT.ndT && u.bMax < UNI_BOT.ndM) {
+    if (C.bot.ndT && t >= C.bot.ndT && u.bMax < C.bot.ndM) {
       u.bAbierta = false;
       uniCierra(rec, tb, price, "NO_LAUNCH");
-      if (UNI_BOT.relNL) u.mixOn = true;   // apagado en la config decidida: tras NO_LAUNCH no hay relevo
+      if (C.bot.relNL) u.mixOn = true;   // apagado en la config decidida: tras NO_LAUNCH no hay relevo
     } else if (ra <= u.bSl) {
       u.bAbierta = false; u.mixOn = true;
       uniCierra(rec, tb, price, "SL");
-      addLog(`🤝 UNIDA: ${rec.symbol} pierna bot fuera por SL a ${v.toFixed(0)}% → relevo armado (soporte giro ${UNI_GIRO}% -${UNI_MD}% · roja ${UNI_TAU}s +${UNI_MV}%)`, "info");
+      addLog(`🤝 UNIDA: ${rec.symbol} pierna bot fuera por SL a ${v.toFixed(0)}% → relevo armado (soporte giro ${C.giro}% -${C.md}% · roja ${C.tau}s +${C.mv}%)`, "info");
     } else {
       broadcast({ event: "demoTradeUpdate", data: { id: tb.id, currentPct: tb.currentPct, maxGainPct: tb.maxGainPct, sl: 0, slPct: +((u.bSl - 1) * 100).toFixed(1), trailingPhase: tb.trailingPhase } });
     }
     u.prev = v; return;   // un solo turno: mientras el bot está dentro, el relevo no compra (igual que el lab)
   }
   // 4) [23-ago] token muerto confirmado: M segundos seguidos bajo el umbral → liquidar y abandonar
-  if (u.muertoIni != null && t - u.muertoIni >= UNI_MUERTO_S) {
+  if (C.muertoPct > 0 && u.muertoIni != null && t - u.muertoIni >= C.muertoS) {
     if (u.tradePack && u.tradePack.status === "OPEN") {
-      addLog(`🤝 UNIDA abandona token muerto: ${rec.symbol} lleva ${t - u.muertoIni}s bajo -${UNI_MUERTO_PCT}% → liquida paquete a ${v.toFixed(0)}%`, "info");
+      addLog(`🤝 UNIDA abandona token muerto: ${rec.symbol} lleva ${t - u.muertoIni}s bajo -${C.muertoPct}% → liquida paquete a ${v.toFixed(0)}%`, "info");
       uniCierra(rec, u.tradePack, price, "MUERTO");
     }
-    rec.uni = null;   // deja de vigilar este token
+    u.muerto = true;   // esta variante abandona el token (la otra sigue)
     return;
   }
   // 5) relevo mixta (solo si mixOn: la pierna bot salió por SL)
   if (u.mixOn) {
     let hecho = false;
-    if (u.lotes.length < UNI_MAXLOT && u.vendidos < UNI_MAXVEND && u.mins.length >= 2) {
+    const solEnJuego = state.demoTrades.reduce((s, t) => s + (t.strategy === "unida" && t.status === "OPEN" ? (t.sizeSol || 0) : 0), 0);
+    if (u.lotes.length < C.maxlot && u.vendidos < C.maxvend && u.mins.length >= 2 && solEnJuego + UNI_SIZE <= UNI_MAX_SOL) {
       const A = u.mins[u.mins.length - 2], B = u.mins[u.mins.length - 1];
       const dtN = B.t - A.t;
       const soporte = dtN ? A.p + (B.p - A.p) * (t - A.t) / dtN : B.p;   // niv() del lab
-      const nn = (uniF(soporte) * uniF(-UNI_MD) - 1) * 100;              // aj() del lab
-      if (u.prev > nn && v <= nn && v > -UNI_RUG) {
+      const nn = (uniF(soporte) * uniF(-C.md) - 1) * 100;              // aj() del lab
+      if (u.prev > nn && v <= nn && v > -C.rug) {
         u.lotes.push(v); u.sumInv += 1 / price; u.tUlt = t; hecho = true;
+        if (!u.tradePack && C.washMax > 0) {
+          // [27-ago] la variante con filtro solo despliega el relevo en tokens con poco
+          // wash del primer minuto (si aún no ha pasado 1 min, se usa lo acumulado).
+          const q = calidadEntrada(rec.mint);
+          if (q && q.wash > C.washMax) {
+            u.vetado = true; u.mixOn = false;
+            addLog(`🧼 ${C.id}: ${rec.symbol} descartada por wash ${q.wash} > ${C.washMax}`, "filter");
+            u.prev = v; return;
+          }
+        }
         if (!u.tradePack) {
-          u.tradePack = uniOpenTrade(rec, price, "UNI_RELEVO");
+          u.tradePack = uniOpenTrade(rec, price, "UNI_RELEVO", C.id);
           u.tradePack.compras = [{ t, p: +v.toFixed(1) }];   // [23-ago] desglose para el detalle del panel
-          addLog(`🤝 UNIDA compra 1/${UNI_MAXLOT}: ${rec.symbol} a ${v.toFixed(0)}% (soporte ${nn.toFixed(0)}%)`, "accept");
+          addLog(`🤝 UNIDA compra 1/${C.maxlot}: ${rec.symbol} a ${v.toFixed(0)}% (soporte ${nn.toFixed(0)}%)`, "accept");
         } else {
           const pk = u.tradePack;
           const oldE = pk.entryPrice;
@@ -1907,16 +1634,16 @@ function uniSample(rec, price, pct, tSec) {
           pk.currentPct = +((price - pk.entryPrice) / pk.entryPrice * 100).toFixed(2);
           if (pk.currentPct < pk.maxLossPct) pk.maxLossPct = pk.currentPct;
           pk.mcEntry = rec.mc && rec.entryPrice ? +(rec.mc * (pk.entryPrice / rec.entryPrice)).toFixed(0) : pk.mcEntry;
-          broadcast({ event: "demoTradeUpdate", data: { id: pk.id, currentPct: pk.currentPct, maxGainPct: pk.maxGainPct, maxLossPct: pk.maxLossPct, sl: 0, slPct: 0, trailingPhase: pk.trailingPhase, sizeSol: pk.sizeSol, entryPrice: pk.entryPrice, mcEntry: pk.mcEntry, compras: pk.compras } });
-          addLog(`🤝 UNIDA compra ${u.lotes.length}/${UNI_MAXLOT}: ${rec.symbol} a ${v.toFixed(0)}% (paquete promediado)`, "accept");
+          broadcast({ event: "demoTradeUpdate", data: { id: pk.id, currentPct: pk.currentPct, maxGainPct: pk.maxGainPct, maxLossPct: pk.maxLossPct, sl: 0, slPct: 0, trailingPhase: pk.trailingPhase, sizeSol: pk.sizeSol, entryPrice: pk.entryPrice, mcEntry: pk.mcEntry, compras: pk.compras, spark: curvaMini(rec.mint) } });
+          addLog(`🤝 UNIDA compra ${u.lotes.length}/${C.maxlot}: ${rec.symbol} a ${v.toFixed(0)}% (paquete promediado)`, "accept");
         }
       }
     }
     if (!hecho && u.lotes.length && t > u.tUlt) {
-      const up = (upRatio * uniF(UNI_MV) - 1) * 100;
+      const up = (upRatio * uniF(C.mv) - 1) * 100;
       if (u.prev < up && v >= up) {
         u.vendidos += u.lotes.length;
-        addLog(`🤝 UNIDA vende paquete ×${u.lotes.length}: ${rec.symbol} a ${v.toFixed(0)}% (roja ${up.toFixed(0)}%) | vendidos ${u.vendidos}/${UNI_MAXVEND}`, "info");
+        addLog(`🤝 UNIDA vende paquete ×${u.lotes.length}: ${rec.symbol} a ${v.toFixed(0)}% (roja ${up.toFixed(0)}%) | vendidos ${u.vendidos}/${C.maxvend}`, "info");
         uniCierra(rec, u.tradePack, price, "ROJA");
         u.tradePack = null; u.lotes = []; u.sumInv = 0;
       }
@@ -1932,86 +1659,20 @@ function uniSample(rec, price, pct, tSec) {
 }
 
 function uniFinish(rec) {
-  const u = rec.uni;
+  if (!rec.uni || !rec.uni.length) return;
+  for (const u of rec.uni) uniFinishUno(rec, u);
+  rec.uni = null;
+}
+
+function uniFinishUno(rec, u) {
   if (!u) return;
   const last = rec.puntos.length ? rec.puntos[rec.puntos.length - 1].p : 0;
   const price = rec.entryPrice * uniF(last);
   if (u.bAbierta && u.tradeBot && u.tradeBot.status === "OPEN") { u.bAbierta = false; uniCierra(rec, u.tradeBot, price, "EXPIRED"); }
   if (u.tradePack && u.tradePack.status === "OPEN") uniCierra(rec, u.tradePack, price, "EXPIRED");
-  rec.uni = null;
 }
 
-// ── [v11.9] FUERZA: apertura (demo + real) y gestión de salidas ──
-function fzOpenTrades(rec, price) {
-  const abiertos = state.demoTrades.filter(t => t.strategy === "fuerza" && t.status === "OPEN").length;
-  if (abiertos >= FZ_MAX_OPEN) { addLog(`⚡ FUERZA saltada (límite ${FZ_MAX_OPEN} abiertas): ${rec.symbol}`, "filter"); return; }
-  const trade = {
-    id: `fuerza-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
-    strategy: "fuerza", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
-    entryPrice: price, tp: +(price * 21).toFixed(12),
-    sl: +(price * (1 + FZ_SL/100)).toFixed(12),
-    sizeSol: REENTRY_SIZE,
-    openTime: Date.now(), closeTime: null, closePrice: null,
-    result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
-    trailingPhase: "FUERZA", status: "OPEN",
-    expiresAt: Date.now() + (MIG_DURATION_MS || MIG_HARD_MAX_MS), mov1s: null, mov2s: null,
-  };
-  state.demoTrades.unshift(trade);
-  if (state.demoTrades.length > 500) state.demoTrades.pop();
-  state.stats.demoOpen++;                                    // [FIX 26-jul] faltaba: el cierre lo decrementa y el contador de abiertas se descuadraba con cada FUERZA
-  broadcast({ event: "newDemoTrade", data: trade });         // [FIX 26-jul] mismo evento que reentry/migración (antes "demoTradeOpened", que el panel no escucha)
-  broadcast({ event: "stats", data: state.stats });          // [FIX 26-jul]
-  addLog(`⚡ FUERZA [demo]: ${rec.symbol} | rompió su máximo previo (disparo a +${rec.fzTrigPct}%) | SL ${FZ_SL}% trail ${FZ_TRAIL*100}%@+${FZ_ARM}`, "accept");
-  openRealTrade({ strategy: "fuerza", mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
-    price, tp: +(price * 21).toFixed(12), sl: +(price * (1 + FZ_SL/100)).toFixed(12) });
-}
 
-function updateFuerzaTrades(mint, price) {
-  if (!FZ_ON) return;
-  const now = Date.now();
-  for (const trade of state.demoTrades) {
-    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "fuerza") continue;
-    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
-    trade.currentPct = +currentPct.toFixed(2);
-    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
-    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    if (trade.maxGainPct >= FZ_ARM) {
-      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
-      const cand = peakPrice * (1 - FZ_TRAIL);
-      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
-    }
-    if (price >= trade.tp) { closeDemoTrade(trade, price, "TP", 21); }
-    else if (price <= trade.sl) {
-      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeDemoTrade(trade, price, "SL", 21); }
-    } else {
-      trade._slBelowCount = 0;
-      if (now >= trade.expiresAt) { closeDemoTrade(trade, price, "EXPIRED", 21); }
-      else broadcast({ event: "demoTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), trailingPhase: trade.trailingPhase } });
-    }
-  }
-  for (const trade of state.realTrades) {
-    if (trade.mint !== mint || trade.status !== "OPEN" || trade.strategy !== "fuerza") continue;
-    const currentPct = (price - trade.entryPrice) / trade.entryPrice * 100;
-    trade.currentPct = +currentPct.toFixed(2);
-    trade.maxGainPct = Math.max(trade.maxGainPct, currentPct);
-    trade.maxLossPct = Math.min(trade.maxLossPct, currentPct);
-    if (trade.maxGainPct >= FZ_ARM) {
-      const peakPrice = trade.entryPrice * (1 + trade.maxGainPct/100);
-      const cand = peakPrice * (1 - FZ_TRAIL);
-      if (cand > trade.sl) setSL(trade, +cand.toFixed(12), "trail-arm");
-    }
-    if (price >= trade.tp) { closeRealTrade(trade, price, "TP"); }
-    else if (price <= trade.sl) {
-      trade._slBelowCount = (trade._slBelowCount || 0) + 1;
-      if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || (esPanico(trade, price) && !tickFantasma(trade, price))) { closeRealTrade(trade, price, "SL"); }
-    } else {
-      trade._slBelowCount = 0;
-      if (now >= trade.expiresAt) { closeRealTrade(trade, price, "EXPIRED"); }
-      else broadcast({ event: "realTradeUpdate", data: { id: trade.id, currentPct: trade.currentPct, maxGainPct: trade.maxGainPct, sl: trade.sl, slPct: +(((trade.sl - trade.entryPrice) / trade.entryPrice) * 100).toFixed(1), trailingPhase: trade.trailingPhase } });
-    }
-  }
-}
 
 // [CAMBIO 9-jul] Grabación extendida 10 → 30 MINUTOS: necesitamos curvas de la
 // región 10-30 min para backtestear el moon-bag y la ventana larga con datos
@@ -2342,21 +2003,29 @@ function liveRecEmit(mint) {
   labStats.migrecs++;
 }
 
+// [27-ago] firma de actores del primer minuto, consultable en cualquier momento.
+// Sirve para etiquetar cada cierre con su wash/compradores y poder evaluar
+// la "estrategia con filtro de wash" sin duplicar el motor: son las MISMAS
+// decisiones sobre un subconjunto de ops, así que basta con saber a cuál pertenece.
+function calidadEntrada(mint) {
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || !rec.wallets || !rec.wallets.size) return null;
+  const ws = [...rec.wallets.values()];
+  const buyers = ws.filter(w => w.buys > 0);
+  const totalBuy = buyers.reduce((s, w) => s + w.buyUsd, 0);
+  const topBuy = buyers.length ? Math.max(...buyers.map(w => w.buyUsd)) : 0;
+  return {
+    buyers: buyers.length,
+    top: totalBuy > 0 ? Math.round(100 * topBuy / totalBuy) : 0,
+    wash: ws.filter(w => w.buys > 0 && w.sells > 0).length,
+  };
+}
+
 function liveRecFinish(mint, cierreRealPct) {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished) return;
   if (rec.cierreDemo == null) rec.cierreDemo = cierreRealPct;
-  // [FIX 27-jul] 🐛 ARMAR LA FUERZA: fzArmed/fzTrigPct se leían en liveRecSample pero nadie
-  // los escribía — la estrategia era una pistola sin percutor (jamás podía disparar, ni con
-  // FZ_ON=true). Se arma aquí, al cerrar la pata de migración: disparo si el precio supera
-  // el máximo visto hasta ahora en un +FZ_MARGIN (mismo criterio que el shFz del torneo).
-  if (!rec.fzArmed) {
-    let maxP = -1e9;
-    for (const q of rec.puntos) if (q.p > maxP) maxP = q.p;
-    rec.fzTrigPct = +(((1 + maxP / 100) * (1 + FZ_MARGIN) - 1) * 100).toFixed(1);
-    rec.fzArmed = true;
-    if (FZ_ON) addLog(`⚡ FUERZA armada: ${rec.symbol} — disparo si supera +${rec.fzTrigPct}% (máx visto ${maxP.toFixed(0)}% × margen ${FZ_MARGIN*100}%)`, "info");
   }
   // [4-ago] sin expiración, la cámara acompaña a la op mientras siga abierta (si no, el lab quedaría ciego)
   const sigueAbierta = state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")
@@ -2408,12 +2077,6 @@ function migOpenTrades(entry) {
   const price = entry.firstPrice;
   if (!price || price <= 0) return;
   const mcOpen = price * 1_000_000_000;
-  if (MIG_EXCLUDE_BAND_ON && mcOpen >= MIG_EXCLUDE_BAND_LO && mcOpen < MIG_EXCLUDE_BAND_HI) {
-    addLog(`🚫 MIG BANDA EXCLUIDA (cinturón apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} en zona $30-40K`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-    broadcast({ event: "stats", data: state.stats });
-    return;
-  }
   if (mcOpen > MIG_MAX_MC_ENTRY || mcOpen < MIG_MIN_MC_ENTRY) {
     addLog(`🛑 MIG MC FUERA DE RANGO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} (rango válido ${formatMC(MIG_MIN_MC_ENTRY)}–${formatMC(MIG_MAX_MC_ENTRY)})`, "filter");
     state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
@@ -2497,20 +2160,16 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
         // antes y migCleanup borró el token del monitoreo), seguir gestionándolo.
         updateDemoTrades(mint, price, "migration");
         updateRealTrades(mint, price, "migration");   // [v11.9] el real también respira aquí
-        updateReentryTrades(mint, price);
-        updateFuerzaTrades(mint, price);
       }
     } else if (price > 0) {
       // [v11.9] POST-GRABACIÓN: la grabación terminó (o nunca existió) pero quedan
-      // trades vivos de este mint (fuerza/reentry/migración larga). Sin esta rama,
+      // trades vivos de este mint (migración larga o unida). Sin esta rama,
       // los ticks llegaban y se tiraban -> congelación aunque la suscripción viva.
       const abierto = state.demoTrades.find(t => t.mint === mint && t.status === "OPEN")
                    || state.realTrades.find(t => t.mint === mint && t.status === "OPEN");
       if (abierto && price < abierto.entryPrice * 1000 && price > abierto.entryPrice / 1000) {
         updateDemoTrades(mint, price, "migration");
         updateRealTrades(mint, price, "migration");
-        updateReentryTrades(mint, price);
-        updateFuerzaTrades(mint, price);
       }
     }
     return;
@@ -2524,8 +2183,6 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
     if (ab && price < ab.entryPrice * 1000 && price > ab.entryPrice / 1000) {
       updateDemoTrades(mint, price, "migration");
       updateRealTrades(mint, price, "migration");
-      updateReentryTrades(mint, price);
-      updateFuerzaTrades(mint, price);
     }
     return;
   }
@@ -2537,8 +2194,6 @@ function migUpdatePrice(mint, price, solAmount, trader = null, isBuy = false) {
   liveRecSample(mint, price, solAmount * solPriceUSD, trader, isBuy);
   updateDemoTrades(mint, price, "migration");
   updateRealTrades(mint, price, "migration");
-  updateReentryTrades(mint, price);  // [v10]
-  updateFuerzaTrades(mint, price);  // [v11.9]
   broadcast({ event: "migTokenUpdate", data: token });
 }
 
@@ -2666,7 +2321,7 @@ async function sellToken(mint, fraction = 1, urgency = "calm") {
 
 async function openRealTrade(signal) {
   if (DEMO_ONLY) return;
-  if (OBSERVER_MODE || MC_OBSERVER) return;
+  if (OBSERVER_MODE) return;
   if (!wallet || !connection) return;
   if (!REAL_STRATEGIES.includes(signal.strategy)) return;
   if (tradingHalted()) { addLog(`🛑 REAL bloqueado por kill-switch: ${signal.symbol}`, "warn"); return; }
@@ -2828,17 +2483,6 @@ function migTrailingPct(maxGainPct) {
 
 const isMig = (t) => t.strategy === "migration";
 
-function veloDropTriggered(trade, price) {
-  if (!MIG_VELO_ON || !isMig(trade)) return false;
-  const now = Date.now();
-  if (!trade._veloRef || now - trade._veloRefTime > MIG_VELO_MS) {
-    trade._veloRef = price; trade._veloRefTime = now; return false;
-  }
-  const drop = (trade._veloRef - price) / trade._veloRef;
-  if (drop >= MIG_VELO_DROP) return true;
-  if (price > trade._veloRef) { trade._veloRef = price; trade._veloRefTime = now; }
-  return false;
-}
 
 function updateRealTrades(mint, price, strategy) {
   const nowR = Date.now();
@@ -2917,10 +2561,10 @@ setInterval(() => {
 }, 30_000);
 
 function openDemoTrade(signal) {
-  if (OBSERVER_MODE || MC_OBSERVER) return;
+  if (OBSERVER_MODE) return;
   const openCount = state.demoTrades.filter(t => t.status === "OPEN").length;
   if (openCount >= 50) return;
-  const sizeSol = +(SOL_PER_TRADE_MIG * factorCalor()).toFixed(2);   // [v10] tamaño por calor
+  const sizeSol = +(SOL_PER_TRADE_MIG ).toFixed(2);   // [v10] tamaño por calor
   const trade = {
     id: `demo-${signal.strategy}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, strategy: signal.strategy,   // [FIX 27-jul] sufijo aleatorio: dos aperturas en el mismo ms compartían id y el panel mezclaba sus tarjetas
     mint: signal.mint, symbol: signal.symbol, name: signal.name,
@@ -2952,7 +2596,7 @@ function openDemoTrade(signal) {
   state.stats.demoOpen++;
   broadcast({ event: "newDemoTrade", data: trade });
   broadcast({ event: "stats", data: state.stats });
-  addLog(`🧪 DEMO [${signal.strategy}]: ${signal.symbol} (${sizeSol} SOL${MIG_HEAT_ON ? `, calor ${calorMercado()}` : ""})`, "demo");
+  addLog(`🧪 DEMO [${signal.strategy}]: ${signal.symbol} (${sizeSol} SOL${""})`, "demo");
   if (signal.strategy === "migration" && MIG_LAUNCH_CHECK) scheduleLaunchCheck(trade, "demo");
 }
 
@@ -3065,7 +2709,7 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   const sizeSol = trade.sizeSol ?? SOL_PER_TRADE_MIG;
   const pnlSolOp = +(sizeSol * pnlPct / 100).toFixed(4);
 
-  if (isMig(trade) || trade.strategy === "reentry" || trade.strategy === "fuerza") {
+  if (isMig(trade)) {
     if (trade.result === "WIN") state.stats.mig_demoWins++;
     else if (trade.result === "EXPIRED") state.stats.mig_demoExpired++;
     else state.stats.mig_demoLosses++;
@@ -3108,7 +2752,7 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   saveState();
   // [31-jul] MIGCLOSE de vuelta: linea parseable de cierre para cuadrar el lab con lo que hace el bot.
   // El MIGREC se emite al acabar la camara (60min), asi que su cierre_real puede ir en n/a; esta linea
-  // permite cruzar por mint el resultado real de CADA cierre (migracion, re-caza y fuerza).
+  // permite cruzar por mint el resultado real de CADA cierre (migracion y unida).
   // [5-ago] desglose para la tarjeta del panel: MC de entrada, pico y salida + neto en SOL
   trade.mcClose = trade.mcEntry ? trade.mcEntry * (1 + pnlPct / 100) : null;
   trade.mcMin = trade.mcEntry ? trade.mcEntry * (1 + trade.maxLossPct / 100) : null;
@@ -3125,7 +2769,7 @@ function closeDemoTrade(trade, price, reason, tpMult) {
   trade.netoSol = +(pnlSolOp - (trade.sizeSol ?? SOL_PER_TRADE_MIG) * 0.045).toFixed(4);   // fricción 4.5%
   trade.dejadoPts = +(trade.maxGainPct - pnlPct).toFixed(1);
   trade.lote = trade.sizeSol ?? SOL_PER_TRADE_MIG;
-  addLog(`[MIGCLOSE] mint=${trade.mint} sym=${trade.symbol} strat=${trade.strategy} pnl=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% reason=${reason} dur=${Math.round((Date.now() - trade.openTime) / 1000)}s runner=${trade.runnerActive ? 1 : 0} cfg=${(trade.cfg || {}).nom || "-"} sig=${trade.sigPct != null ? trade.sigPct : "n/a"} vel=${trade.velSeg != null ? trade.velSeg : "n/a"} mov2s=${trade.mov2s != null ? trade.mov2s.toFixed(2) : "n/a"} lote=${trade.sizeSol != null ? trade.sizeSol : "n/a"}`, "rec");
+  addLog(`[MIGCLOSE] mint=${trade.mint} sym=${trade.symbol} strat=${trade.strategy} pnl=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% reason=${reason} dur=${Math.round((Date.now() - trade.openTime) / 1000)}s runner=${trade.runnerActive ? 1 : 0} cfg=${(trade.cfg || {}).nom || "-"} sig=${trade.sigPct != null ? trade.sigPct : "n/a"} vel=${trade.velSeg != null ? trade.velSeg : "n/a"} mov2s=${trade.mov2s != null ? trade.mov2s.toFixed(2) : "n/a"} lote=${trade.sizeSol != null ? trade.sizeSol : "n/a"}${(q => q ? ` buyers=${q.buyers} topBuyer=${q.top}% wash=${q.wash}` : "")(calidadEntrada(trade.mint))}`, "rec");
   if (isMig(trade)) {
     liveRecFinish(trade.mint, trade.pnlPct);
     if (!state.realTrades.some(t => t.mint === trade.mint && (t.status === "OPEN" || t.status === "CLOSING"))
@@ -3171,9 +2815,10 @@ setInterval(async () => {
       const secs = Math.round((now - last) / 1000);
       addLog(`🚑 RESCATE FEED: ${shortAddr(mint)} sin ticks ${secs}s — precio DexScreener $${px.toPrecision(4)} alimenta la gestión`, "warn");
       updateDemoTrades(mint, px, "migration");
+      liveRecSample(mint, px);   // [27-ago] BUG ARREGLADO: sin esto, un paquete de la unida
+                                 // se congelaba mientras el token estuviera mudo (no vendía
+                                 // en la roja, no contaba el 💀 ni el reloj del muerto).
       updateRealTrades(mint, px, "migration");
-      updateReentryTrades(mint, px);
-      updateFuerzaTrades(mint, px);
     } catch {}
   }
 }, RESCUE_POLL_MS);
@@ -3246,7 +2891,6 @@ function connectPumpPortal() {
         const price = calcPrice(msg);
         if (price > 0) {
           lastTickAt.set(msg.mint, Date.now());   // [v11.9] pulso del feed para el rescatador
-          if (MC_OBSERVER) { mcoSample(msg.mint, price, (msg.solAmount || 0) * solPriceUSD); return; }
           if (OBSERVER_MODE && state.obsRecordings.has(msg.mint)) { obsSample(msg.mint, price); return; }
           migUpdatePrice(msg.mint, price, msg.solAmount || 0, msg.traderPublicKey || null, msg.txType === "buy");
         }
@@ -3270,7 +2914,6 @@ app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }
 
 app.get("/api/state", (req, res) => {
   res.json({
-    fzJuicio: state.fzJuicio || null,
     demoTrades: state.demoTrades.slice(0, 100),
     realTrades: state.realTrades.slice(0, 100),
     signals: state.signals.slice(0, 50),
@@ -3285,7 +2928,7 @@ app.get("/api/state", (req, res) => {
     horaActual: state.horaActual, horaPnlSol: state.horaPnlSol, horaOps: state.horaOps,
     diaPnlSol: state.diaPnlSol, diaOps: state.diaOps, diaInicio: state.diaInicio,
     demoOnly: DEMO_ONLY,
-    observerMode: OBSERVER_MODE || MC_OBSERVER,
+    observerMode: OBSERVER_MODE,
   });
 });
 
@@ -3359,7 +3002,6 @@ wss.on("connection", (ws) => {
   frontendClients.add(ws);
   ws.send(JSON.stringify({ event: "fullState", data: {   // [FIX 26-jul] el frontend escucha "fullState", no "init"
     wsStatus: "connected",
-    fzJuicio: state.fzJuicio || null,
     demoTrades: state.demoTrades.slice(0, 100),
     realTrades: state.realTrades.slice(0, 100),
     signals: state.signals.slice(0, 50),
@@ -3374,7 +3016,7 @@ wss.on("connection", (ws) => {
     horaActual: state.horaActual, horaPnlSol: state.horaPnlSol, horaOps: state.horaOps,
     diaPnlSol: state.diaPnlSol, diaOps: state.diaOps, diaInicio: state.diaInicio,
     demoOnly: DEMO_ONLY,
-    observerMode: OBSERVER_MODE || MC_OBSERVER,
+    observerMode: OBSERVER_MODE,
   }}));
   ws.on("close", () => frontendClients.delete(ws));
 });
@@ -3384,8 +3026,6 @@ server.listen(PORT, () => {
   addLog(`💾 Estado en ${STATE_FILE}${_stateInfo.persistent ? " (persistente)" : " ⚠️ NO persistente: se pierde en cada deploy — monta un Volume en /data"}`, _stateInfo.persistent ? "info" : "warn");
   addLog(`🔧 [FIX 26-jul] Cambios: (1) confirmación aborta a -10% · (2) FUERZA cuenta/emite bien · (3) RESUMEN en hora ES · (4) kill-switch ventana persiste · (5) MANDOS: topBal≥${MIG_MIN_TOPBAL} SOL + señal mov2s≥+${MIG_QUAL_MOV2S_MIN}%`, "info");
   if (DEMO_ONLY) addLog("🧪 MODO DEMO ONLY: la wallet real no se toca", "warn");
-  if (MC_OBSERVER) addLog("🔬 MC_OBSERVER: solo grabación MCREC", "warn");
-  if (FZ_ON) addLog(`⚡ FUERZA ON: margen +${FZ_MARGIN*100}% SL ${FZ_SL}% trail ${FZ_TRAIL*100}%@+${FZ_ARM}`, "info");
   if (SHADOW_ON) addLog(`👥 TORNEO DE SOMBRAS ON: ${SHADOW_GRID.length} configs compitiendo`, "info");
   if (MIG_EX2S_ON) addLog(`🎓 EXAMEN 2s ON: tras los filtros espera ${MIG_EX2S_MS/1000}s y solo entra si no cae más de ${MIG_EX2S_MIN}% (suspenso → vuelve al portero)`, "info");
   loadState();
