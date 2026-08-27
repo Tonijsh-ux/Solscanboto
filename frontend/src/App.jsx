@@ -97,8 +97,6 @@ function StrategyBadge({ strategy }) {
  const map = {
    migration:   { label: "🌉 MIG",   color: "#facc15", bg: "#3b2f00" },
    momentum:    { label: "⚡ MOM",   color: "#a78bfa", bg: "#2d1b69" },
-   reentry:     { label: "🔄 RE",    color: "#38bdf8", bg: "#082f3f" },
-   fuerza:      { label: "⚡ FZ",    color: "#f472b6", bg: "#3f0a24" },
  };
  const s = map[strategy] || { label: (strategy||"?").toUpperCase(), color: "#94a3b8", bg: "#1e2d40" };
  return (
@@ -188,6 +186,143 @@ function TradeCard({ trade, isReal, post: postLive }) {
 }
 
 // [5-ago] desglose de la op: market caps, dinero y lo que dejó sobre la mesa
+// ═══════════ [27-ago] VISTA NUEVA DEL DEMO ═══════════
+// 1 tarjeta por TOKEN (no por trade) · minigráfico · 3 cifras · color por resultado ·
+// agrupado por día con su resumen · insignias de las reglas de protección.
+
+const SOL_NETO = (t) => (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100);
+
+// minigráfico: la curva del token con los hitos marcados
+function Spark({ datos, compras, salida, alto = 42 }) {
+  if (!datos || datos.length < 3) return null;
+  const W = 150, H = alto, min = Math.min(...datos), max = Math.max(...datos);
+  const rango = Math.max(1, max - min);
+  const x = (i) => (i / (datos.length - 1)) * (W - 4) + 2;
+  const y = (v) => H - 3 - ((v - min) / rango) * (H - 8);
+  const d = datos.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const cero = min <= 0 && max >= 0 ? y(0) : null;
+  const fin = datos[datos.length - 1];
+  const col = fin >= 0 ? "#22c55e" : "#ef4444";
+  // los hitos se colocan por proporción de tiempo (la curva ya viene reducida)
+  const punto = (frac, color) => {
+    const i = Math.max(0, Math.min(datos.length - 1, Math.round(frac * (datos.length - 1))));
+    return <circle cx={x(i)} cy={y(datos[i])} r="2.4" fill={color} />;
+  };
+  return (
+    <svg width={W} height={H} style={{ display: "block" }}>
+      {cero != null && <line x1="0" y1={cero} x2={W} y2={cero} stroke="#1e2d40" strokeWidth="1" strokeDasharray="2 3" />}
+      <path d={d} fill="none" stroke={col} strokeWidth="1.6" strokeLinejoin="round" />
+      {(compras || []).map((f, k) => <g key={k}>{punto(f, "#22c55e")}</g>)}
+      {salida != null && punto(salida, "#fb923c")}
+    </svg>
+  );
+}
+
+// insignia del motivo de cierre
+function Insignia({ reason }) {
+  const M = { MUERTO: ["💀", "#ef4444", "liquidado por muerto"], ROJA: ["🔴", "#22c55e", "vendido en la envolvente"],
+    SL: ["🛑", "#f97316", "stop del bot"], NO_LAUNCH: ["✂️", "#64748b", "cortado a los 10s"],
+    EXPIRED: ["⏱️", "#94a3b8", "fin de cámara"], PSL: ["🩹", "#facc15", "stop del paquete"] };
+  const m = M[reason]; if (!m) return null;
+  return <span title={m[2]} style={{ fontSize: 11, color: m[1], background: m[1] + "18", border: "1px solid " + m[1] + "44",
+    borderRadius: 5, padding: "1px 5px", fontWeight: 700 }}>{m[0]} {reason}</span>;
+}
+
+// TARJETA POR TOKEN: junta la pierna del bot y sus paquetes
+function TokenCard({ mint, trades, post }) {
+  const [abierto, setAbierto] = useState(false);
+  const bot = trades.find(t => t.trailingPhase === "UNI_BOT") || trades.find(t => t.strategy !== "unida");
+  const packs = trades.filter(t => t !== bot);
+  const vivo = trades.some(t => t.status === "OPEN");
+  const sol = trades.filter(t => t.status !== "OPEN").reduce((s, t) => s + SOL_NETO(t), 0);
+  const ini = Math.min(...trades.map(t => t.openTime));
+  const fin = Math.max(...trades.map(t => t.closeTime || Date.now()));
+  const dur = Math.round((fin - ini) / 1000);
+  const sym = (trades[0].symbol && trades[0].symbol !== "???") ? trades[0].symbol : mint.slice(0, 6);
+  const conCurva = trades.find(t => t.spark && t.spark.length > 2);
+  const lotes = packs.reduce((s, p) => s + Math.round((p.sizeSol || 0.5) / 0.5), 0);
+  const col = vivo ? "#38bdf8" : sol >= 0 ? "#22c55e" : "#ef4444";
+  const esUni = trades[0].strategy === "unida";
+  const fracs = (conCurva && conCurva.compras && conCurva.spark)
+    ? conCurva.compras.map(x => Math.min(1, x.t / Math.max(1, dur))) : [];
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid " + col + "44", borderLeft: "3px solid " + (esUni ? "#22c55e" : "#facc15"),
+      borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+      <div onClick={() => setAbierto(!abierto)} style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#e2e8f0", fontSize: 14 }}>{sym}</span>
+            {vivo && <span style={{ fontSize: 10, color: "#38bdf8", border: "1px solid #38bdf844", borderRadius: 4, padding: "0 4px" }}>EN CURSO</span>}
+            {!vivo && trades.filter(t => t.closeReason).slice(-1).map((t, i) => <Insignia key={i} reason={t.closeReason} />)}
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+            <span style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 700, color: vivo ? "#94a3b8" : (sol >= 0 ? "#22c55e" : "#ef4444") }}>
+              {vivo ? "—" : (sol >= 0 ? "+" : "") + sol.toFixed(2)}
+            </span>
+            <span style={{ fontSize: 11, color: "#64748b" }}>SOL</span>
+            <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 4 }}>
+              {lotes > 0 ? `🛒 ×${lotes}` : "🤖 solo bot"} · {dur < 90 ? dur + "s" : Math.round(dur / 60) + "m"}
+            </span>
+          </div>
+        </div>
+        {conCurva && <Spark datos={conCurva.spark} compras={fracs} salida={bot && bot.closeTime ? (bot.closeTime - ini) / Math.max(1, fin - ini) : null} />}
+      </div>
+      {abierto && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #1e2d40", fontFamily: "monospace", fontSize: 12 }}>
+          {trades.map(t => (
+            <div key={t.id} style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", color: "#94a3b8" }}>
+                <span>{t.trailingPhase === "UNI_BOT" ? "🤖 pierna del bot" : `🛒 paquete ×${Math.round((t.sizeSol || 0.5) / 0.5)}`}
+                  {t.closeReason ? ` · ${t.closeReason}` : t.status === "OPEN" ? " · abierto" : ""}</span>
+                <span style={{ color: (t.pnlPct || 0) >= 0 ? "#22c55e" : "#ef4444", fontWeight: 700 }}>
+                  {(t.pnlPct || 0) >= 0 ? "+" : ""}{(t.pnlPct || 0).toFixed(1)}% · {t.status === "OPEN" ? "—" : (SOL_NETO(t) >= 0 ? "+" : "") + SOL_NETO(t).toFixed(2) + " SOL"}
+                </span>
+              </div>
+              {t.compras && t.compras.map((x, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", color: "#475569", paddingLeft: 12 }}>
+                  <span>C{i + 1} · t+{x.t}s</span><span style={{ color: x.p >= 0 ? "#16a34a" : "#dc2626" }}>{x.p >= 0 ? "+" : ""}{x.p}%</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          {trades[0].calidad && (
+            <div style={{ color: "#64748b", paddingTop: 4, borderTop: "1px dotted #1e2d40" }}>
+              🧼 wash {trades[0].calidad.wash} · 👥 {trades[0].calidad.buyers} compradores · 🐋 top {trades[0].calidad.top}%
+            </div>
+          )}
+          <a href={`https://solscan.io/token/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 11 }}>🔎 Solscan</a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// curva de banca del día
+function CurvaDia({ cierres }) {
+  if (!cierres.length) return null;
+  const orden = [...cierres].sort((a, b) => (a.closeTime || 0) - (b.closeTime || 0));
+  let acc = 0; const serie = orden.map(t => (acc += SOL_NETO(t)));
+  const W = 320, H = 54, min = Math.min(0, ...serie), max = Math.max(0, ...serie), r = Math.max(0.5, max - min);
+  const x = i => (i / Math.max(1, serie.length - 1)) * (W - 4) + 2;
+  const y = v => H - 4 - ((v - min) / r) * (H - 10);
+  const d = serie.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const fin = serie[serie.length - 1], col = fin >= 0 ? "#22c55e" : "#ef4444";
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontSize: 10, color: "#64748b", letterSpacing: .5 }}>HOY · {cierres.length} cierres</div>
+          <div style={{ fontFamily: "monospace", fontSize: 26, fontWeight: 700, color: col }}>{fin >= 0 ? "+" : ""}{fin.toFixed(2)} <span style={{ fontSize: 13, color: "#64748b" }}>SOL</span></div>
+        </div>
+        <svg width={W / 2} height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+          <line x1="0" y1={y(0)} x2={W} y2={y(0)} stroke="#1e2d40" strokeDasharray="2 3" />
+          <path d={d} fill="none" stroke={col} strokeWidth="2" />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 function TradeDetalle({ trade, isOpen, post }) {
  const esUni = trade.strategy === "unida";   // [23-ago] detalle limpio para la unida
  const mcE = trade.mcEntry ?? (trade.entryPrice ? trade.entryPrice * 1e9 : null);
@@ -292,7 +427,7 @@ function FilterBar({ statusFilter, setStatusFilter, stratFilter, setStratFilter,
        ))}
      </div>
      <div style={{ display: "flex", gap: 6 }}>
-       {[{ id: "all", label: "Todas" }, { id: "unida", label: "🤝" }, { id: "migration", label: "🌉" }, { id: "reentry", label: "🔄" }, { id: "fuerza", label: "⚡" }].map(f => (
+       {[{ id: "all", label: "Todas" }, { id: "unida", label: "🤝" }, { id: "migration", label: "🌉" }].map(f => (
          <button key={f.id} onClick={() => setStratFilter(f.id)} style={{ flex: 1, padding: "5px", border: `1px solid ${stratFilter === f.id ? "#94a3b8" : "#1e2d40"}`, borderRadius: 8, background: stratFilter === f.id ? "#1e2d4055" : "none", color: stratFilter === f.id ? "#f1f5f9" : "#64748b", fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>
            {f.label}
          </button>
@@ -651,8 +786,10 @@ export default function App() {
  });
 
  const migDemoOpen = demoTrades.filter(t => t.status === "OPEN" && t.strategy === "migration").length;
- const reFzOpen = demoTrades.filter(t => t.status === "OPEN" && (t.strategy === "reentry" || t.strategy === "fuerza")).length;
- const reFzTrades = demoTrades.filter(t => t.strategy === "reentry" || t.strategy === "fuerza");
+ // [27-ago] SOL netos por estrategia (lote real × pnl − fee), que es lo único que significa algo
+ const solNeto = (strat) => demoTrades
+   .filter(t => t.strategy === strat && t.status !== "OPEN")
+   .reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
  const hoyKey = toDateKey(Date.now());
  const cerradasHoy = demoTrades.filter(t => t.status !== "OPEN" && t.closeTime && toDateKey(t.closeTime) === hoyKey);
  const hoyNeto = cerradasHoy.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
@@ -683,7 +820,10 @@ export default function App() {
          {[
            { label: "🌉 MIG W%", val: `${migWR}%`, color: migWR >= 50 ? "#22c55e" : "#ef4444" },
            { label: `☀️ HOY (${cerradasHoy.length})`, val: `${hoyNeto >= 0 ? "+" : ""}${hoyNeto.toFixed(2)}`, color: pctColor(hoyNeto) },
-           { label: "💰 DEMO", val: `${((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0)) >= 0 ? "+" : ""}${Math.round((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0))}%`, color: ((stats.mig_demoPnL||0)+(stats.mom_demoPnL||0)) >= 0 ? "#22c55e" : "#ef4444" },
+           // [27-ago] antes sumaba PORCENTAJES de trades con lotes distintos (un -80% de 0.5 SOL
+           // pesaba igual que un +180% de 4 SOL): un número sin sentido. Ahora, SOL netos de verdad.
+           { label: "🤝 UNIDA", val: `${solNeto("unida") >= 0 ? "+" : ""}${solNeto("unida").toFixed(1)}`, color: solNeto("unida") >= 0 ? "#22c55e" : "#ef4444" },
+           { label: "🌉 MIG", val: `${solNeto("migration") >= 0 ? "+" : ""}${solNeto("migration").toFixed(1)}`, color: solNeto("migration") >= 0 ? "#22c55e" : "#ef4444" },
            { label: "🔴 REAL", val: `${totalPnlSol >= 0 ? "+" : ""}${totalPnlSol.toFixed(3)}`, color: pctColor(totalPnlSol) },
          ].map(s => (
            <div key={s.label} style={{ background: "#111827", borderRadius: 8, padding: "6px 4px", textAlign: "center" }}>
@@ -698,7 +838,6 @@ export default function App() {
      <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40", overflowX: "auto" }}>
        {[
          { id: "migration", label: "🌉 Mig", badge: migWatching.length + migMonitored.length, accent: "#facc15" },
-         { id: "momentum", label: "🔄⚡ Re/Fz", badge: reFzOpen, accent: "#a78bfa" },
          { id: "signals", label: "🎯", badge: signals.length, accent: "#38bdf8" },
          { id: "demo", label: "💰 Demo", badge: (stats.demoOpen||0) },
          { id: "real", label: "🔴 Real", badge: (stats.realOpen||0), accent: "#f97316" },
@@ -754,35 +893,6 @@ export default function App() {
          </>
        )}
 
-       {tab === "momentum" && (
-         <>
-           <div style={{ background: "#0d1117", border: "1px solid #a78bfa44", borderRadius: 10, padding: 12 }}>
-             <div style={{ fontFamily: "monospace", fontSize: 11, color: "#a78bfa", marginBottom: 8, fontWeight: 700 }}>🔄⚡ RE-ENTRADAS Y FUERZAS</div>
-             <div style={{ display: "flex", justifyContent: "space-around" }}>
-               {(() => {
-                 const cerradas = reFzTrades.filter(t => t.status !== "OPEN");
-                 const neto = cerradas.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
-                 const re = reFzTrades.filter(t => t.strategy === "reentry").length;
-                 const fz = reFzTrades.filter(t => t.strategy === "fuerza").length;
-                 return [
-                   { label: "Abiertas", val: reFzOpen, color: "#a78bfa" },
-                   { label: "🔄 RE", val: re, color: "#38bdf8" },
-                   { label: "⚡ FZ", val: fz, color: "#f472b6" },
-                   { label: "Neto SOL", val: `${neto >= 0 ? "+" : ""}${neto.toFixed(2)}`, color: pctColor(neto) },
-                 ].map(s => (
-                   <div key={s.label} style={{ textAlign: "center" }}>
-                     <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: s.color }}>{s.val}</div>
-                     <div style={{ fontSize: 9, color: "#64748b" }}>{s.label}</div>
-                   </div>
-                 ));
-               })()}
-             </div>
-           </div>
-           {reFzTrades.length === 0 && <EmptyState icon="🔄" text="Las re-entradas (cazadora de resurrecciones) y las fuerzas (persecución de breakouts) aparecerán aquí…" />}
-           {[...reFzTrades.filter(t => t.status === "OPEN"), ...reFzTrades.filter(t => t.status !== "OPEN")].slice(0, 60).map(t => <TradeCard post={postCierre[t?.mint]} key={t.id} trade={t} isReal={false} />)}
-         </>
-       )}
-
        {tab === "signals" && (
          <>
            {signals.length === 0 && <EmptyState icon="🎯" text="Las señales aparecerán aquí." />}
@@ -813,18 +923,47 @@ export default function App() {
                <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#facc15" }}>{migDemoOpen}</div>
                <div style={{ fontSize: 9, color: "#64748b" }}>🌉 Mig abiertas</div>
              </div>
-             <div style={{ flex: 1, background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
-               <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#a78bfa" }}>{reFzOpen}</div>
-               <div style={{ fontSize: 9, color: "#64748b" }}>🔄⚡ Re/Fz abiertas</div>
+             <div style={{ flex: 1, background: "#0d1117", border: "1px solid #22c55e33", borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
+               <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#22c55e" }}>{demoTrades.filter(t => t.status === "OPEN" && t.strategy === "unida").length}</div>
+               <div style={{ fontSize: 9, color: "#64748b" }}>🤝 Unida abiertas</div>
              </div>
+
              <div style={{ flex: 1, background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
                <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{demoTrades.filter(t => t.status !== "OPEN").length}</div>
                <div style={{ fontSize: 9, color: "#64748b" }}>Total cerradas</div>
              </div>
            </div>
            <FilterBar statusFilter={demoStatusFilter} setStatusFilter={setDemoStatusFilter} stratFilter={demoStratFilter} setStratFilter={setDemoStratFilter} accentColor="#38bdf8" />
+           <CurvaDia cierres={cerradasHoy} />
            {filteredDemo.length === 0 && <EmptyState icon="💰" text="No hay operaciones con estos filtros." />}
-           {filteredDemo.map(t => <TradeCard post={postCierre[t?.mint]} key={t.id} trade={t} isReal={false} />)}
+           {(() => {
+             // agrupar por día y, dentro, por token
+             const porDia = {};
+             for (const t of filteredDemo) {
+               const k = toDateKey(t.closeTime || t.openTime);
+               (porDia[k] = porDia[k] || []).push(t);
+             }
+             return Object.keys(porDia).sort().reverse().map(dia => {
+               const trades = porDia[dia];
+               const sol = trades.filter(t => t.status !== "OPEN").reduce((s, t) => s + SOL_NETO(t), 0);
+               const rojas = trades.filter(t => t.closeReason === "ROJA").length;
+               const tok = {};
+               for (const t of trades) (tok[t.mint] = tok[t.mint] || []).push(t);
+               const orden = Object.keys(tok).sort((a, b) => Math.max(...tok[b].map(t => t.openTime)) - Math.max(...tok[a].map(t => t.openTime)));
+               return (
+                 <div key={dia} style={{ marginBottom: 14 }}>
+                   <div style={{ display: "flex", alignItems: "baseline", gap: 8, padding: "6px 2px", position: "sticky", top: 0,
+                     background: "#010409", zIndex: 5, borderBottom: "1px solid #1e2d40", marginBottom: 8 }}>
+                     <span style={{ fontSize: 12, color: "#94a3b8", fontWeight: 700 }}>📅 {dia.slice(5)}</span>
+                     <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: sol >= 0 ? "#22c55e" : "#ef4444" }}>
+                       {sol >= 0 ? "+" : ""}{sol.toFixed(2)} SOL</span>
+                     <span style={{ fontSize: 11, color: "#475569" }}>{orden.length} tokens{rojas ? ` · ${rojas} 🔴 en la roja` : ""}</span>
+                   </div>
+                   {orden.map(m => <TokenCard key={m} mint={m} trades={tok[m]} post={postCierre[m]} />)}
+                 </div>
+               );
+             });
+           })()}
          </>
        )}
 
@@ -973,29 +1112,7 @@ export default function App() {
              <StatsRow label="Pérdida máx media" val={`-${(stats.mig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
            </div>
 
-           {(() => {
-             const calc = (strat) => {
-               const v = demoTrades.filter(t => t.strategy === strat && t.status !== "OPEN");
-               const w = v.filter(t => (t.pnlPct || 0) > 0).length;
-               const neto = v.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
-               const media = v.length ? v.reduce((s, t) => s + (t.pnlPct || 0), 0) / v.length : 0;
-               return { n: v.length, w, l: v.length - w, wr: v.length ? Math.round(w / v.length * 100) : 0, neto, media };
-             };
-             const re = calc("reentry"), fz = calc("fuerza");
-             return (
-               <div style={{ background: "#0d1117", border: "1px solid #a78bfa33", borderRadius: 10, padding: 14 }}>
-                 <div style={{ fontFamily: "monospace", fontSize: 12, color: "#a78bfa", marginBottom: 10, fontWeight: 700 }}>🔄⚡ RE-ENTRADA Y FUERZA (demo, en vivo)</div>
-                 <StatsRow label="🔄 RE cerradas" val={re.n} color="#38bdf8" />
-                 <StatsRow label="🔄 W / L" val={`${re.w} / ${re.l}`} color={re.wr >= 50 ? "#22c55e" : "#ef4444"} />
-                 <StatsRow label="🔄 Media bruta" val={`${re.media >= 0 ? "+" : ""}${re.media.toFixed(1)}%`} color={pctColor(re.media)} desc="La cazadora de resurrecciones: pocas balas, piezas grandes" />
-                 <StatsRow label="🔄 Neto" val={`${re.neto >= 0 ? "+" : ""}${re.neto.toFixed(2)} SOL`} color={pctColor(re.neto)} desc="Fricción 4.5% restada" />
-                 <StatsRow label="⚡ FZ cerradas" val={fz.n} color="#f472b6" />
-                 <StatsRow label="⚡ W / L" val={`${fz.w} / ${fz.l}`} color={fz.wr >= 50 ? "#22c55e" : "#ef4444"} />
-                 <StatsRow label="⚡ Media bruta" val={`${fz.media >= 0 ? "+" : ""}${fz.media.toFixed(1)}%`} color={pctColor(fz.media)} desc="Muchos peajes de -15 a cambio de premios raros enormes" />
-                 <StatsRow label="⚡ Neto" val={`${fz.neto >= 0 ? "+" : ""}${fz.neto.toFixed(2)} SOL`} color={pctColor(fz.neto)} desc="No juzgar antes de ~100 disparos con feed sano (v11.5e+)" />
-               </div>
-             );
-           })()}
+
 
            <div style={{ background: "#0d1117", border: "1px solid #f9741633", borderRadius: 10, padding: 14 }}>
              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#f97316", marginBottom: 10, fontWeight: 700 }}>🔴 REAL</div>
