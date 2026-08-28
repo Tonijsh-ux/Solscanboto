@@ -239,6 +239,12 @@ function TokenCard({ mint, trades, post }) {
   const conCurva = trades.find(t => t.spark && t.spark.length > 2);
   const lotes = packs.reduce((s, p) => s + Math.round((p.sizeSol || 0.5) / 0.5), 0);
   // recorrido de la op: lo mejor y lo peor que llegó a marcar cualquiera de sus piernas
+  // [28-ago] posición viva: % actual del paquete (ponderado por lotes) y SOL flotantes
+  const abiertos = trades.filter(t => t.status === "OPEN");
+  const solVivo = abiertos.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.currentPct || 0) - 4.5) / 100), 0)
+                + trades.filter(t => t.status !== "OPEN").reduce((s, t) => s + SOL_NETO(t), 0);
+  const pesoAb = abiertos.reduce((s, t) => s + (t.sizeSol || 0.5), 0) || 1;
+  const pctVivo = abiertos.reduce((s, t) => s + (t.currentPct || 0) * (t.sizeSol || 0.5), 0) / pesoAb;
   const maxOp = Math.max(0, ...trades.map(t => t.maxGainPct || 0));
   const minOp = Math.min(0, ...trades.map(t => t.maxLossPct || 0));
   const col = vivo ? "#38bdf8" : sol >= 0 ? "#22c55e" : "#ef4444";
@@ -259,10 +265,12 @@ function TokenCard({ mint, trades, post }) {
             {!vivo && trades.filter(t => t.closeReason).slice(-1).map((t, i) => <Insignia key={i} reason={t.closeReason} />)}
           </div>
           <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-            <span style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 700, color: vivo ? "#94a3b8" : (sol >= 0 ? "#22c55e" : "#ef4444") }}>
-              {vivo ? "—" : (sol >= 0 ? "+" : "") + sol.toFixed(2)}
+            <span style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 700, color: vivo ? (pctVivo >= 0 ? "#22c55e" : "#ef4444") : (sol >= 0 ? "#22c55e" : "#ef4444") }}>
+              {vivo ? (pctVivo >= 0 ? "+" : "") + pctVivo.toFixed(1) + "%" : (sol >= 0 ? "+" : "") + sol.toFixed(2)}
             </span>
-            <span style={{ fontSize: 11, color: "#64748b" }}>SOL</span>
+            <span style={{ fontSize: 11, color: "#64748b" }}>{vivo ? "ahora" : "SOL"}</span>
+            {vivo && <span style={{ fontFamily: "monospace", fontSize: 12, color: solVivo >= 0 ? "#22c55e" : "#ef4444" }}>
+              ({solVivo >= 0 ? "+" : ""}{solVivo.toFixed(2)} SOL)</span>}
             <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 4 }}>
               {lotes > 0 ? `🛒 ×${lotes}` : "🤖 solo bot"} · {dur < 90 ? dur + "s" : Math.round(dur / 60) + "m"}
             </span>
@@ -908,16 +916,25 @@ export default function App() {
            )}
            {migMonitored.length > 0 && (
              <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderRadius: 10, padding: 12 }}>
-               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#38bdf8", marginBottom: 8, fontWeight: 700 }}>📊 POST-MIGRACIÓN ({migMonitored.length})</div>
-               {migMonitored.map(t => (
-                 <div key={t.mint} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d4044" }}>
-                   <div>
-                     <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: "#f1f5f9" }}>{t.symbol}</span>
-                     <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginLeft: 8 }}>{formatMC(t.mc)}</span>
+               <div style={{ fontFamily: "monospace", fontSize: 11, color: "#38bdf8", marginBottom: 2, fontWeight: 700 }}>🔭 QUÉ PASÓ TRAS VENDER ({Object.keys(postCierre).length})</div>
+               <div style={{ fontSize: 10, color: "#64748b", marginBottom: 8 }}>Cuánto se movió cada token DESDE que el bot salió. Ordenado por lo que más subió después: si aquí hay mucho verde, estás vendiendo pronto.</div>
+               {Object.values(postCierre).sort((a, b) => (b.max || 0) - (a.max || 0)).map(p => (
+                 <div key={p.mint} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d4044" }}>
+                   <div style={{ minWidth: 0 }}>
+                     <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, color: "#f1f5f9" }}>{(p.symbol && p.symbol !== "???") ? p.symbol : p.mint.slice(0, 6)}</span>
+                     <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b", marginLeft: 8 }}>{formatMC(p.mcAhora)}</span>
+                     {!p.vivo && <span style={{ fontSize: 9, color: "#64748b", marginLeft: 6 }}>· sin ticks</span>}
                    </div>
-                   <div style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>{elapsed(t.detectedAt)}</div>
+                   <div style={{ display: "flex", alignItems: "center", gap: 10, fontFamily: "monospace", fontSize: 11 }}>
+                     <span title="pico desde que vendimos" style={{ color: (p.max || 0) >= 20 ? "#facc15" : "#64748b", fontWeight: (p.max || 0) >= 20 ? 700 : 400 }}>
+                       pico {(p.max || 0) >= 0 ? "+" : ""}{Math.round(p.max || 0)}%</span>
+                     <span title="ahora, respecto al precio de venta" style={{ color: (p.desde || 0) >= 0 ? "#22c55e" : "#ef4444", minWidth: 52, textAlign: "right" }}>
+                       {(p.desde || 0) >= 0 ? "+" : ""}{Math.round(p.desde || 0)}%</span>
+                     <span style={{ color: "#475569", minWidth: 34, textAlign: "right" }}>{p.min}m</span>
+                   </div>
                  </div>
                ))}
+               {Object.keys(postCierre).length === 0 && <div style={{ color: "#475569", fontSize: 11 }}>Aún no hay ventas que seguir.</div>}
              </div>
            )}
            {migWatching.length === 0 && migMonitored.length === 0 && <EmptyState icon="🌉" text="Esperando migraciones de pump.fun…" />}
