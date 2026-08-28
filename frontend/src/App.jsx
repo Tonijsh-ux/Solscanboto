@@ -33,7 +33,7 @@ function useBackend() {
  const [stats, setStats] = useState({});
  const [postCierre, setPostCierre] = useState({});   // [5-ago] qué hizo el token DESPUÉS de vender
  const [shadow, setShadow] = useState(null);
- const [fzJuicio, setFzJuicio] = useState(null);
+ const [setFzJuicio] = useState(null);
  const [wsStatus, setWsStatus] = useState("connecting");
 
  useEffect(() => {
@@ -56,20 +56,16 @@ function useBackend() {
            setLog(data.log || []);
            setStats(data.stats || {});
            setShadow(data.shadow || null);
-           setFzJuicio(data.fzJuicio || null);
            setWsStatus(data.wsStatus || "connected");
            return;
          }
          if (event === "stats") { setStats(data); return; }
          if (event === "postCierre") { setPostCierre(p => ({ ...p, [data.mint]: data })); return; }   // [5-ago]
          if (event === "shadow") { setShadow(data); return; }
-         if (event === "fzJuicio") { setFzJuicio(data); return; }
          if (event === "migWatchUpdate") { setMigWatching(p => p.map(w => w.mint === data.mint ? { ...w, ...data } : w)); return; }
          if (event === "newMigToken") { setMigMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
          if (event === "migTokenUpdate") { setMigMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
          if (event === "removeToken") { setMigMonitored(p => p.filter(t => t.mint !== data.mint)); setMomMonitored(p => p.filter(t => t.mint !== data.mint)); return; }
-         if (event === "newMomToken") { setMomMonitored(p => p.find(t => t.mint === data.mint) ? p : [data, ...p]); return; }
-         if (event === "momTokenUpdate") { setMomMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
          if (event === "newSignal") { setSignals(p => [data, ...p].slice(0, 100)); if (navigator.vibrate) navigator.vibrate([200,100,200]); return; }
          if (event === "newDemoTrade" || event === "demoTradeOpened") { const d = { ...data, _lastUp: Date.now() }; setDemoTrades(p => p.find(t => t.id === d.id) ? p : [d, ...p].slice(0, 500)); return; }
          if (event === "demoTradeUpdate") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...t, ...data, _lastUp: Date.now() } : t)); return; }
@@ -89,7 +85,7 @@ function useBackend() {
    return () => { ws?.close(); clearTimeout(t); };
  }, []);
 
- return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus, postCierre };
+ return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre };
 }
 
 // ── COMPONENTES ────────────────────────────────────────────────
@@ -242,6 +238,9 @@ function TokenCard({ mint, trades, post }) {
   const sym = (trades[0].symbol && trades[0].symbol !== "???") ? trades[0].symbol : mint.slice(0, 6);
   const conCurva = trades.find(t => t.spark && t.spark.length > 2);
   const lotes = packs.reduce((s, p) => s + Math.round((p.sizeSol || 0.5) / 0.5), 0);
+  // recorrido de la op: lo mejor y lo peor que llegó a marcar cualquiera de sus piernas
+  const maxOp = Math.max(0, ...trades.map(t => t.maxGainPct || 0));
+  const minOp = Math.min(0, ...trades.map(t => t.maxLossPct || 0));
   const col = vivo ? "#38bdf8" : sol >= 0 ? "#22c55e" : "#ef4444";
   const strat = trades[0].strategy;
   const esUni = strat === "unida" || strat === "unida2";
@@ -267,6 +266,11 @@ function TokenCard({ mint, trades, post }) {
             <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 4 }}>
               {lotes > 0 ? `🛒 ×${lotes}` : "🤖 solo bot"} · {dur < 90 ? dur + "s" : Math.round(dur / 60) + "m"}
             </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 2, fontSize: 11, fontFamily: "monospace" }}>
+            <span style={{ color: "#64748b" }}>🕐 {new Date(ini).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+            <span style={{ color: "#22c55e" }}>▲ +{maxOp.toFixed(0)}%</span>
+            <span style={{ color: "#ef4444" }}>▼ {minOp.toFixed(0)}%</span>
           </div>
         </div>
         {conCurva && <Spark datos={conCurva.spark} compras={fracs} salida={bot && bot.closeTime ? (bot.closeTime - ini) / Math.max(1, fin - ini) : null} />}
@@ -294,7 +298,11 @@ function TokenCard({ mint, trades, post }) {
               🧼 wash {trades[0].calidad.wash} · 👥 {trades[0].calidad.buyers} compradores · 🐋 top {trades[0].calidad.top}%
             </div>
           )}
-          <a href={`https://solscan.io/token/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 11 }}>🔎 Solscan</a>
+          <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+            <a href={`https://pump.fun/coin/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#4ade80", fontSize: 11 }}>💊 pump.fun</a>
+            <a href={`https://solscan.io/token/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 11 }}>🔎 Solscan</a>
+            <span onClick={(e) => { e.stopPropagation(); navigator.clipboard && navigator.clipboard.writeText(mint); }} style={{ color: "#94a3b8", fontSize: 11, cursor: "pointer" }}>📋 copiar mint</span>
+          </div>
         </div>
       )}
     </div>
@@ -759,7 +767,7 @@ function Calendar({ realTrades, movements, setMovements }) {
 
 // ── APP PRINCIPAL ──────────────────────────────────────────────
 export default function App() {
- const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, fzJuicio, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre
+ const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
  const [demoStratFilter, setDemoStratFilter] = useState("unida");   // [23-ago] demo arranca enseñando solo la unida
@@ -791,6 +799,24 @@ export default function App() {
 
  const migDemoOpen = demoTrades.filter(t => t.status === "OPEN" && t.strategy === "migration").length;
  // [27-ago] SOL netos por estrategia (lote real × pnl − fee), que es lo único que significa algo
+ // [28-ago] la tarjeta de MIGRACIÓN se calcula desde los trades (fuente de verdad),
+ // no desde contadores del server que pueden desincronizarse entre reinicios.
+ const migCard = (() => {
+   const T = demoTrades.filter(t => t.strategy === "migration");
+   const cerr = T.filter(t => t.status !== "OPEN");
+   const tokens = new Set(T.map(t => t.mint)).size;
+   const sol = cerr.reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
+   const pct = cerr.reduce((s, t) => s + (t.pnlPct || 0), 0);
+   const n = Math.max(1, cerr.length);
+   return {
+     tokens, abiertas: T.length - cerr.length,
+     wins: cerr.filter(t => (t.pnlPct || 0) > 0).length,
+     losses: cerr.filter(t => (t.pnlPct || 0) <= 0).length,
+     sol, pct,
+     avgMaxGain: cerr.reduce((s, t) => s + (t.maxGainPct || 0), 0) / n,
+     avgMaxLoss: cerr.reduce((s, t) => s + (t.maxLossPct || 0), 0) / n,
+   };
+ })();
  const solNeto = (strat) => demoTrades
    .filter(t => t.strategy === strat && t.status !== "OPEN")
    .reduce((s, t) => s + (t.sizeSol || 0.5) * (((t.pnlPct || 0) - 4.5) / 100), 0);
@@ -1026,18 +1052,6 @@ export default function App() {
                      <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 4 }}>Todas las puertas pasadas (n≥300 · ≥7 días · día a día · sin-top3). La promoción es decisión humana.</div>
                    </div>
                  )}
-                 {fzJuicio && (
-                   <div style={{ background: "#0d1117", border: "1px solid #f472b644", borderRadius: 10, padding: 12 }}>
-                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                       <span style={{ fontFamily: "monospace", fontSize: 11, color: "#f472b6", fontWeight: 700 }}>⚖️ JUICIO DE LA FUERZA {fzJuicio.dictado ? "— SENTENCIA" : ""}</span>
-                       <span style={{ fontFamily: "monospace", fontSize: 10, color: "#64748b" }}>{Math.min(fzJuicio.n, 100)}/100</span>
-                     </div>
-                     <div style={{ height: 6, background: "#1e2d40", borderRadius: 3, overflow: "hidden", marginBottom: 6 }}>
-                       <div style={{ height: "100%", width: `${Math.min(100, fzJuicio.n)}%`, background: fzJuicio.dictado ? (fzJuicio.neto > 0 ? "#22c55e" : "#ef4444") : "#f472b6", borderRadius: 3 }} />
-                     </div>
-                     <div style={{ fontFamily: "monospace", fontSize: 11, color: pctColor(fzJuicio.neto) }}>neto {fzJuicio.neto >= 0 ? "+" : ""}{fzJuicio.neto.toFixed(2)} SOL · WR {fzJuicio.n ? Math.round(100 * fzJuicio.w / fzJuicio.n) : 0}%{fzJuicio.dictado ? (fzJuicio.neto > 0 ? " → ABSUELTA ✅" : " → CULPABLE ⚖️ (FZ_ON=false)") : ""}</div>
-                   </div>
-                 )}
                  <div style={{ background: "#0d1117", border: "1px solid #facc1544", borderRadius: 10, padding: 12 }}>
                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                      <span style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", fontWeight: 700 }}>🏟️ CLASIFICACIÓN</span>
@@ -1116,14 +1130,14 @@ export default function App() {
            <div style={{ background: "#0d1117", border: "1px solid #facc1533", borderRadius: 10, padding: 14 }}>
              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#facc15", marginBottom: 10, fontWeight: 700 }}>🌉 MIGRACIÓN</div>
              <StatsRow label="Migraciones" val={stats.mig_migrations||0} />
-             <StatsRow label="Entradas" val={stats.mig_entered||0} color="#22c55e" />
+             <StatsRow label="Entradas" val={migCard.tokens} color="#22c55e" desc={stats.mig_entered && stats.mig_entered !== migCard.tokens ? `el contador del server dice ${stats.mig_entered}` : ""} />
              <StatsRow label="Rechazados" val={stats.mig_rejected||0} color="#ef4444" />
-             <StatsRow label="Demo Wins" val={stats.mig_demoWins||0} color="#22c55e" />
-             <StatsRow label="Demo Losses" val={stats.mig_demoLosses||0} color="#ef4444" />
+             <StatsRow label="Demo Wins" val={migCard.wins} color="#22c55e" />
+             <StatsRow label="Demo Losses" val={migCard.losses} color="#ef4444" />
              <StatsRow label="Win Rate" val={`${migWR}%`} color={migWR >= 50 ? "#22c55e" : "#ef4444"} />
-             <StatsRow label="P&L Demo" val={`${(stats.mig_demoPnL||0)>=0?"+":""}${Math.round(stats.mig_demoPnL||0)}%`} color={pctColor(stats.mig_demoPnL||0)} />
-             <StatsRow label="Ganancia máx media" val={`+${(stats.mig_avgMaxGain||0).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
-             <StatsRow label="Pérdida máx media" val={`-${(stats.mig_avgMaxLoss||0).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
+             <StatsRow label="P&L Demo" val={`${migCard.sol>=0?"+":""}${migCard.sol.toFixed(3)} SOL`} color={pctColor(migCard.sol)} desc={`suma de % (referencia): ${migCard.pct>=0?"+":""}${Math.round(migCard.pct)}%`} />
+             <StatsRow label="Ganancia máx media" val={`+${(migCard.avgMaxGain).toFixed(1)}%`} color="#22c55e" desc="Media del máximo que suben" />
+             <StatsRow label="Pérdida máx media" val={`${(migCard.avgMaxLoss).toFixed(1)}%`} color="#ef4444" desc="Media del máximo que bajan" />
            </div>
 
 
