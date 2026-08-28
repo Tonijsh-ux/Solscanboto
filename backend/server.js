@@ -1069,12 +1069,6 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     return;
   }
   if (!MIG_QUAL_GATE) {
-    const franjaEvit1 = franjaHorariaEvitada();
-    if (franjaEvit1) {
-      addLog(`🕐 MIG HORARIO: ${entry.symbol} descartada | franja evitada: ${franjaEvit1}`, "filter");
-      state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-      broadcast({ event: "stats", data: state.stats }); return;
-    }
     migExamThenOpen(entry, entryPriceB); return;   // [FIX 28-jul]
   }
   entry.qualStartPrice = (entry.priceHist && entry.priceHist.length) ? entry.priceHist[0][1] : entryPriceB;
@@ -1185,12 +1179,6 @@ function migQualTick(entry, price) {
         || (MIG_RED_MODO === "tg" ? preD.tg === true : (preD.tg === true || preD.tw === true));
       if (!redOK) {
         addLog(`✈️ MIG SIN REDES [${MIG_RED_MODO}]: ${entry.symbol} descartada | tg=${preD.tg?1:0} tw=${preD.tw?1:0}`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
-        broadcast({ event: "stats", data: state.stats }); return;
-      }
-      const franjaEvit2 = franjaHorariaEvitada();
-      if (franjaEvit2) {
-        addLog(`🕐 MIG HORARIO: ${entry.symbol} descartada | franja evitada: ${franjaEvit2}`, "filter");
         state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
@@ -1995,6 +1983,18 @@ function liveRecEmit(mint) {
 // Sirve para etiquetar cada cierre con su wash/compradores y poder evaluar
 // la "estrategia con filtro de wash" sin duplicar el motor: son las MISMAS
 // decisiones sobre un subconjunto de ops, así que basta con saber a cuál pertenece.
+// [27-ago] curva reducida (≤40 puntos) para el minigráfico del panel
+function curvaMini(mint, n = 40) {
+  const rec = state.liveRecordings.get(mint);
+  if (!rec || !rec.puntos || rec.puntos.length < 3) return null;
+  const P = rec.puntos, paso = Math.max(1, Math.floor(P.length / n));
+  const out = [];
+  for (let i = 0; i < P.length; i += paso) out.push(+P[i].p.toFixed(1));
+  const ult = +P[P.length - 1].p.toFixed(1);
+  if (out[out.length - 1] !== ult) out.push(ult);
+  return out;
+}
+
 function calidadEntrada(mint) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || !rec.wallets || !rec.wallets.size) return null;
@@ -2520,7 +2520,6 @@ function updateRealTrades(mint, price, strategy) {
       trade._slPanic = esPanico(trade, price) && !tickFantasma(trade, price);   // [FIX 27-jul · 31-jul anti-pinchazo]
       if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
     } else { trade._slBelowCount = 0; trade._slPanic = false; }
-    if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
     if (!reason && expired) {
       if (isMig(trade) && currentPct >= MIG_EXPIRED_WIN_PCT) reason = "TP_EXPIRED";
       else reason = "EXPIRED";
@@ -2653,7 +2652,6 @@ function updateDemoTrades(mint, price, strategy) {
       trade._slPanic = esPanico(trade, price) && !tickFantasma(trade, price);   // [FIX 27-jul · 31-jul anti-pinchazo]
       if (trade._slBelowCount >= MIG_SL_CONFIRM_TICKS || trade._slPanic) reason = "SL";
     } else { trade._slBelowCount = 0; trade._slPanic = false; }
-    if (!reason && veloDropTriggered(trade, price)) reason = "VELO";
     if (!reason && expired) {
       if (isMig(trade) && currentPct >= MIG_EXPIRED_WIN_PCT) reason = "TP_EXPIRED";
       else reason = "EXPIRED";
@@ -2713,7 +2711,6 @@ function closeDemoTrade(trade, price, reason, tpMult) {
       else if (mv >= -1) win ? state.stats.mig_mov_flat_win++ : state.stats.mig_mov_flat_loss++;
       else win ? state.stats.mig_mov_down_win++ : state.stats.mig_mov_down_loss++;
     }
-    if (isMig(trade)) brakeRecordClose(pnlPct);   // [v10] freno de régimen
     // [v10.1] historial del creador: cierre malo (<= -50%) = mala para su wallet
     // [v11.9] y si fue un pull de verdad (<= MIG_ABYSS_PNL), su creador entra en la lista negra DE POR VIDA
     const preC = premigData.get(trade.mint);
