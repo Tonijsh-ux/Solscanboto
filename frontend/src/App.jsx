@@ -96,7 +96,8 @@ function useBackend() {
 function StrategyBadge({ strategy }) {
  const map = {
    migration:   { label: "🌉 MIG",   color: "#facc15", bg: "#3b2f00" },
-   momentum:    { label: "⚡ MOM",   color: "#a78bfa", bg: "#2d1b69" },
+   unida:       { label: "🤝 UNI",   color: "#22c55e", bg: "#052e16" },
+   unida2:      { label: "🧼 UNI-W", color: "#0ea5e9", bg: "#082f49" },
  };
  const s = map[strategy] || { label: (strategy||"?").toUpperCase(), color: "#94a3b8", bg: "#1e2d40" };
  return (
@@ -242,16 +243,19 @@ function TokenCard({ mint, trades, post }) {
   const conCurva = trades.find(t => t.spark && t.spark.length > 2);
   const lotes = packs.reduce((s, p) => s + Math.round((p.sizeSol || 0.5) / 0.5), 0);
   const col = vivo ? "#38bdf8" : sol >= 0 ? "#22c55e" : "#ef4444";
-  const esUni = trades[0].strategy === "unida";
+  const strat = trades[0].strategy;
+  const esUni = strat === "unida" || strat === "unida2";
+  const colBarra = strat === "unida" ? "#22c55e" : strat === "unida2" ? "#0ea5e9" : "#facc15";
   const fracs = (conCurva && conCurva.compras && conCurva.spark)
     ? conCurva.compras.map(x => Math.min(1, x.t / Math.max(1, dur))) : [];
   return (
-    <div style={{ background: "#0d1117", border: "1px solid " + col + "44", borderLeft: "3px solid " + (esUni ? "#22c55e" : "#facc15"),
+    <div style={{ background: "#0d1117", border: "1px solid " + col + "44", borderLeft: "3px solid " + colBarra,
       borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
       <div onClick={() => setAbierto(!abierto)} style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
             <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#e2e8f0", fontSize: 14 }}>{sym}</span>
+            {strat === "unida2" && <span style={{ fontSize: 10, color: "#0ea5e9", border: "1px solid #0ea5e944", borderRadius: 4, padding: "0 4px" }}>🧼 W</span>}
             {vivo && <span style={{ fontSize: 10, color: "#38bdf8", border: "1px solid #38bdf844", borderRadius: 4, padding: "0 4px" }}>EN CURSO</span>}
             {!vivo && trades.filter(t => t.closeReason).slice(-1).map((t, i) => <Insignia key={i} reason={t.closeReason} />)}
           </div>
@@ -427,7 +431,7 @@ function FilterBar({ statusFilter, setStatusFilter, stratFilter, setStratFilter,
        ))}
      </div>
      <div style={{ display: "flex", gap: 6 }}>
-       {[{ id: "all", label: "Todas" }, { id: "unida", label: "🤝" }, { id: "migration", label: "🌉" }].map(f => (
+       {[{ id: "all", label: "Todas" }, { id: "unida", label: "🤝" }, { id: "unida2", label: "🧼" }, { id: "migration", label: "🌉" }].map(f => (
          <button key={f.id} onClick={() => setStratFilter(f.id)} style={{ flex: 1, padding: "5px", border: `1px solid ${stratFilter === f.id ? "#94a3b8" : "#1e2d40"}`, borderRadius: 8, background: stratFilter === f.id ? "#1e2d4055" : "none", color: stratFilter === f.id ? "#f1f5f9" : "#64748b", fontFamily: "monospace", fontSize: 10, cursor: "pointer" }}>
            {f.label}
          </button>
@@ -823,6 +827,7 @@ export default function App() {
            // [27-ago] antes sumaba PORCENTAJES de trades con lotes distintos (un -80% de 0.5 SOL
            // pesaba igual que un +180% de 4 SOL): un número sin sentido. Ahora, SOL netos de verdad.
            { label: "🤝 UNIDA", val: `${solNeto("unida") >= 0 ? "+" : ""}${solNeto("unida").toFixed(1)}`, color: solNeto("unida") >= 0 ? "#22c55e" : "#ef4444" },
+           { label: "🧼 UNI-W", val: `${solNeto("unida2") >= 0 ? "+" : ""}${solNeto("unida2").toFixed(1)}`, color: solNeto("unida2") >= 0 ? "#22c55e" : "#ef4444" },
            { label: "🌉 MIG", val: `${solNeto("migration") >= 0 ? "+" : ""}${solNeto("migration").toFixed(1)}`, color: solNeto("migration") >= 0 ? "#22c55e" : "#ef4444" },
            { label: "🔴 REAL", val: `${totalPnlSol >= 0 ? "+" : ""}${totalPnlSol.toFixed(3)}`, color: pctColor(totalPnlSol) },
          ].map(s => (
@@ -946,9 +951,14 @@ export default function App() {
              return Object.keys(porDia).sort().reverse().map(dia => {
                const trades = porDia[dia];
                const sol = trades.filter(t => t.status !== "OPEN").reduce((s, t) => s + SOL_NETO(t), 0);
+               const solA = trades.filter(t => t.status !== "OPEN" && t.strategy === "unida").reduce((s, t) => s + SOL_NETO(t), 0);
+               const solB = trades.filter(t => t.status !== "OPEN" && t.strategy === "unida2").reduce((s, t) => s + SOL_NETO(t), 0);
+               const hayB = trades.some(t => t.strategy === "unida2");
                const rojas = trades.filter(t => t.closeReason === "ROJA").length;
+               // [27-ago] agrupar por TOKEN + VARIANTE: si no, unida y unida2 se sumaban
+               // en la misma tarjeta y el resultado no era de ninguna de las dos.
                const tok = {};
-               for (const t of trades) (tok[t.mint] = tok[t.mint] || []).push(t);
+               for (const t of trades) { const k = t.mint + "|" + t.strategy; (tok[k] = tok[k] || []).push(t); }
                const orden = Object.keys(tok).sort((a, b) => Math.max(...tok[b].map(t => t.openTime)) - Math.max(...tok[a].map(t => t.openTime)));
                return (
                  <div key={dia} style={{ marginBottom: 14 }}>
@@ -957,9 +967,13 @@ export default function App() {
                      <span style={{ fontSize: 12, color: "#94a3b8", fontWeight: 700 }}>📅 {dia.slice(5)}</span>
                      <span style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: sol >= 0 ? "#22c55e" : "#ef4444" }}>
                        {sol >= 0 ? "+" : ""}{sol.toFixed(2)} SOL</span>
-                     <span style={{ fontSize: 11, color: "#475569" }}>{orden.length} tokens{rojas ? ` · ${rojas} 🔴 en la roja` : ""}</span>
+                     <span style={{ fontSize: 11, color: "#475569" }}>{orden.length} tarjetas{rojas ? ` · ${rojas} 🔴` : ""}</span>
+                     {hayB && <span style={{ fontSize: 11, marginLeft: "auto" }}>
+                       <b style={{ color: solA >= 0 ? "#22c55e" : "#ef4444" }}>🤝 {solA >= 0 ? "+" : ""}{solA.toFixed(1)}</b>
+                       <b style={{ color: solB >= 0 ? "#0ea5e9" : "#ef4444", marginLeft: 8 }}>🧼 {solB >= 0 ? "+" : ""}{solB.toFixed(1)}</b>
+                     </span>}
                    </div>
-                   {orden.map(m => <TokenCard key={m} mint={m} trades={tok[m]} post={postCierre[m]} />)}
+                   {orden.map(k => <TokenCard key={k} mint={k.split("|")[0]} trades={tok[k]} post={postCierre[k.split("|")[0]]} />)}
                  </div>
                );
              });
