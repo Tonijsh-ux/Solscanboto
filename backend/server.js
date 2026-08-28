@@ -209,6 +209,7 @@ const migFlowTimes = [];             // timestamps de migraciones detectadas
 const UNI_ON = true;
 const UNI_SIZE = 0.5;              // lote demo por compra (pierna bot y cada relevo)
 const UNI_MAX_OPEN = 12;           // tope global de TOKENS con unida abierta a la vez
+const UNI_LATIDO_MS = 6_000;       // [28-ago] cada cuánto refresca el panel una posición abierta
 const UNI_MAX_SOL = 25;            // [27-ago] tope de capital desplegado: no abre compras nuevas
                                    // por encima de esto (el pico real medido fue 17 SOL)
 // pierna bot (tornillos del lab, captura 22-ago — INDEPENDIENTES de la Base de migración):
@@ -1504,7 +1505,12 @@ function uniSampleUno(rec, u, price, pct, tSec) {
       uniCierra(rec, tb, price, "SL");
       addLog(`🤝 UNIDA: ${rec.symbol} pierna bot fuera por SL a ${v.toFixed(0)}% → relevo armado (soporte giro ${C.giro}% -${C.md}% · roja ${C.tau}s +${C.mv}%)`, "info");
     } else {
-      broadcast({ event: "demoTradeUpdate", data: { id: tb.id, currentPct: tb.currentPct, maxGainPct: tb.maxGainPct, sl: 0, slPct: +((u.bSl - 1) * 100).toFixed(1), trailingPhase: tb.trailingPhase } });
+      const ahoraB = Date.now();
+      const conCurva = !u.ultLatidoBot || ahoraB - u.ultLatidoBot >= UNI_LATIDO_MS;
+      if (conCurva) u.ultLatidoBot = ahoraB;
+      broadcast({ event: "demoTradeUpdate", data: { id: tb.id, currentPct: tb.currentPct, maxGainPct: tb.maxGainPct,
+        maxLossPct: tb.maxLossPct, sl: 0, slPct: +((u.bSl - 1) * 100).toFixed(1), trailingPhase: tb.trailingPhase,
+        ...(conCurva ? { spark: curvaMini(rec.mint) } : {}) } });
     }
     u.prev = v; return;   // un solo turno: mientras el bot está dentro, el relevo no compra (igual que el lab)
   }
@@ -1575,6 +1581,16 @@ function uniSampleUno(rec, u, price, pct, tSec) {
       pk.currentPct = +((price - pk.entryPrice) / pk.entryPrice * 100).toFixed(2);
       if (pk.currentPct > pk.maxGainPct) pk.maxGainPct = pk.currentPct;
       if (pk.currentPct < pk.maxLossPct) pk.maxLossPct = pk.currentPct;
+      // [28-ago] BUG: el paquete solo informaba al comprar, así que en el panel se quedaba
+      // congelado (curva parada y "+0.0%") mientras no hubiera lotes nuevos. Ahora late.
+      const ahora = Date.now();
+      if (!u.ultLatido || ahora - u.ultLatido >= UNI_LATIDO_MS) {
+        u.ultLatido = ahora;
+        broadcast({ event: "demoTradeUpdate", data: { id: pk.id, currentPct: pk.currentPct,
+          maxGainPct: pk.maxGainPct, maxLossPct: pk.maxLossPct, sl: 0, slPct: 0,
+          trailingPhase: pk.trailingPhase, sizeSol: pk.sizeSol, entryPrice: pk.entryPrice,
+          mcEntry: pk.mcEntry, compras: pk.compras, spark: curvaMini(rec.mint) } });
+      }
     }
   }
   u.prev = v;
