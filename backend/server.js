@@ -1016,22 +1016,6 @@ function migRechazada(entry, motivo) {
   } catch {}
 }
 
-// [31-ago] VEREDICTO MANUAL sobre una rechazada: el humano la mira en pump.fun y dice si el
-// filtro acertó ("bien") o se equivocó ("mal"), con el máximo que vio. Queda en el estado y en
-// el log ([REJ-VEREDICTO]) para poder medir la tasa de acierto de cada filtro.
-app.post("/api/rechazada/veredicto", (req, res) => {
-  const { id, veredicto, maxVisto } = req.body || {};
-  const r = (state.rechazadas || []).find(x => x.id === id);
-  if (!r) return res.status(404).json({ error: "rechazada no encontrada" });
-  if (!["bien", "mal", null].includes(veredicto)) return res.status(400).json({ error: "veredicto: bien | mal | null" });
-  r.veredicto = veredicto;
-  r.maxVisto = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
-  addLog(`[REJ-VEREDICTO] mint=${r.mint} sym=${r.symbol} motivo=${r.motivo} veredicto=${veredicto} maxVisto=${r.maxVisto ?? "n/a"} ultimo=${r.ultimo ?? "n/a"} dur=${r.dur}s mc=${r.mc ?? "n/a"}`, "info");
-  broadcast({ event: "migRechazadaVeredicto", data: { id, veredicto: r.veredicto, maxVisto: r.maxVisto } });
-  saveState();
-  res.json({ ok: true });
-});
-
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
   if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
@@ -3163,6 +3147,22 @@ app.post("/api/movement", (req, res) => {
   broadcast({ event: "newMovement", data: mov });
   saveState();
   res.json({ ok: true, movement: mov });
+});
+
+// [31-ago] VEREDICTO MANUAL sobre una rechazada: el humano la mira en pump.fun y dice si el
+// filtro acertó ("bien") o se equivocó ("mal"), con el máximo que vio. Queda en el estado y en
+// el log ([REJ-VEREDICTO]) para poder medir la tasa de acierto de cada filtro.
+app.post("/api/rechazada/veredicto", (req, res) => {
+  const { id, veredicto, maxVisto } = req.body || {};
+  const r = (state.rechazadas || []).find(x => x.id === id);
+  if (!r) return res.status(404).json({ error: "rechazada no encontrada" });
+  if (!["bien", "mal", null].includes(veredicto)) return res.status(400).json({ error: "veredicto: bien | mal | null" });
+  r.veredicto = veredicto;
+  r.maxVisto = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
+  addLog(`[REJ-VEREDICTO] mint=${r.mint} sym=${r.symbol} motivo=${r.motivo} veredicto=${veredicto} maxVisto=${r.maxVisto ?? "n/a"} ultimo=${r.ultimo ?? "n/a"} dur=${r.dur}s mc=${r.mc ?? "n/a"}`, "info");
+  broadcast({ event: "migRechazadaVeredicto", data: { id, veredicto: r.veredicto, maxVisto: r.maxVisto } });
+  saveState();
+  res.json({ ok: true });
 });
 
 app.delete("/api/movement/:id", (req, res) => {
