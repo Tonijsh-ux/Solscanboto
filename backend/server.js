@@ -3154,8 +3154,19 @@ app.post("/api/movement", (req, res) => {
 // el log ([REJ-VEREDICTO]) para poder medir la tasa de acierto de cada filtro.
 app.post("/api/rechazada/veredicto", (req, res) => {
   const { id, veredicto, maxVisto } = req.body || {};
-  const r = (state.rechazadas || []).find(x => x.id === id);
-  if (!r) return res.status(404).json({ error: "rechazada no encontrada" });
+  if (!state.rechazadas) state.rechazadas = [];
+  let r = state.rechazadas.find(x => x.id === id);
+  if (!r) {
+    // [31-ago] si el server se reinició, la tarjeta sigue en el panel pero no en memoria:
+    // en vez de fallar en silencio, la damos de alta con lo que manda el propio panel.
+    const t = req.body || {};
+    if (!id) return res.status(400).json({ error: "falta id" });
+    r = { id, mint: t.mint || "", symbol: t.symbol || "???", motivo: t.motivo || "?", ts: t.ts || Date.now(),
+          dur: t.dur ?? null, mc: t.mc ?? null, vol: t.vol ?? null, trades: t.trades ?? null,
+          sig: t.sig ?? null, mov2s: t.mov2s ?? null, ultimo: t.ultimo ?? null, serie: [], veredicto: null, maxVisto: null };
+    state.rechazadas.unshift(r);
+    if (state.rechazadas.length > 300) state.rechazadas.length = 300;
+  }
   if (!["bien", "mal", null].includes(veredicto)) return res.status(400).json({ error: "veredicto: bien | mal | null" });
   r.veredicto = veredicto;
   r.maxVisto = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
