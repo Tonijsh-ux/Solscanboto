@@ -353,19 +353,19 @@ function Rechazada({ r, onVeredicto }) {
         </div>
         {serie.length > 2 && <Spark datos={serie} compras={[]} salida={null} />}
       </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        <input value={maxTxt} onChange={e => setMaxTxt(e.target.value)} onClick={e => e.stopPropagation()} placeholder="máx % visto" inputMode="decimal"
+          style={{ width: 92, background: "#161b22", color: "#e6edf3", border: "1px solid #30363d", borderRadius: 8, padding: "8px 8px", fontSize: 13 }} />
+        <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "bien", maxTxt); }}
+          style={{ flex: 1, minHeight: 38, background: r.veredicto === "bien" ? "#22c55e33" : "#0d1117", border: `1px solid ${r.veredicto === "bien" ? "#22c55e" : "#30363d"}`, color: "#22c55e", borderRadius: 8, fontSize: 13, cursor: "pointer" }}>✅ bien</button>
+        <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "mal", maxTxt); }}
+          style={{ flex: 1, minHeight: 38, background: r.veredicto === "mal" ? "#ef444433" : "#0d1117", border: `1px solid ${r.veredicto === "mal" ? "#ef4444" : "#30363d"}`, color: "#ef4444", borderRadius: 8, fontSize: 13, cursor: "pointer" }}>❌ mal</button>
+        {r.veredicto && <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, null, ""); }}
+          style={{ minHeight: 38, background: "transparent", border: "1px solid #30363d", color: "#64748b", borderRadius: 8, padding: "0 10px", fontSize: 12, cursor: "pointer" }}>quitar</button>}
+      </div>
       {abierta && (
         <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #1e2d40", fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>
           <div>volumen ${r.vol} · {r.trades} trades{r.sig != null ? ` · señal ${r.sig >= 0 ? "+" : ""}${r.sig}%` : ""}{r.mov2s != null ? ` · mov2s ${r.mov2s >= 0 ? "+" : ""}${r.mov2s}%` : ""}</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-            <span style={{ color: "#64748b" }}>tu veredicto:</span>
-            <input value={maxTxt} onChange={e => setMaxTxt(e.target.value)} onClick={e => e.stopPropagation()} placeholder="máx % visto" inputMode="decimal"
-              style={{ width: 84, background: "#161b22", color: "#e6edf3", border: "1px solid #30363d", borderRadius: 6, padding: "4px 6px", fontSize: 11 }} />
-            <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "bien", maxTxt); }}
-              style={{ background: r.veredicto === "bien" ? "#22c55e22" : "#0d1117", border: `1px solid ${r.veredicto === "bien" ? "#22c55e" : "#30363d"}`, color: "#22c55e", borderRadius: 6, padding: "4px 8px", fontSize: 11 }}>✅ bien</button>
-            <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "mal", maxTxt); }}
-              style={{ background: r.veredicto === "mal" ? "#ef444422" : "#0d1117", border: `1px solid ${r.veredicto === "mal" ? "#ef4444" : "#30363d"}`, color: "#ef4444", borderRadius: 6, padding: "4px 8px", fontSize: 11 }}>❌ mal</button>
-            {r.veredicto && <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, null, ""); }} style={{ background: "transparent", border: "none", color: "#64748b", fontSize: 11 }}>quitar</button>}
-          </div>
           <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
             <a href={`https://pump.fun/coin/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>💊 pump.fun</a>
             <a href={`https://solscan.io/token/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8" }}>🔎 Solscan</a>
@@ -841,10 +841,19 @@ export default function App() {
  const [demoStratFilter, setDemoStratFilter] = useState("unida");
  const [rejFilter, setRejFilter] = useState("all");   // [31-ago] filtro por motivo de rechazo
  const mandarVeredicto = async (id, veredicto, maxVisto) => {
+   const mv = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
+   const antes = rechazadas;
+   setRechazadas(p => p.map(r => r.id === id ? { ...r, veredicto, maxVisto: mv } : r));   // se marca al instante
    try {
-     await fetch(`${BACKEND_HTTP}/api/rechazada/veredicto`, { method: "POST", headers: { "Content-Type": "application/json" },
-       body: JSON.stringify({ id, veredicto, maxVisto }) });
-   } catch (e) { console.error("veredicto", e); }
+     const r0 = antes.find(x => x.id === id) || {};
+     const res = await fetch(`${BACKEND_HTTP}/api/rechazada/veredicto`, { method: "POST", headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ id, veredicto, maxVisto: mv, mint: r0.mint, symbol: r0.symbol, motivo: r0.motivo,
+                              ts: r0.ts, dur: r0.dur, mc: r0.mc, vol: r0.vol, trades: r0.trades, sig: r0.sig, mov2s: r0.mov2s, ultimo: r0.ultimo }) });
+     if (!res.ok) throw new Error("HTTP " + res.status);
+   } catch (e) {
+     setRechazadas(antes);                                   // deshacer
+     alert("No se pudo guardar el veredicto: " + e.message);  // que se vea, en vez de fallar en silencio
+   }
  };   // [23-ago] demo arranca enseñando solo la unida
  const [realStatusFilter, setRealStatusFilter] = useState("all");
  const [realStratFilter, setRealStratFilter] = useState("all");
