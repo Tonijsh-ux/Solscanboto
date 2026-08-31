@@ -656,6 +656,7 @@ function saveState() {
       demoTrades: state.demoTrades,
       realTrades: state.realTrades,
       movements: state.movements,
+      rechazadas: (state.rechazadas || []).slice(0, 300),   // [31-ago] con los veredictos manuales
       stats: state.stats,
       shadow: state.shadow,
       creatorHist: [...creatorHist.entries()],
@@ -685,6 +686,7 @@ function loadState() {
     if (saved.demoTrades) state.demoTrades = saved.demoTrades;
     if (saved.realTrades) state.realTrades = saved.realTrades;
     if (saved.movements) state.movements = saved.movements;
+    if (Array.isArray(saved.rechazadas)) state.rechazadas = saved.rechazadas;   // [31-ago] veredictos manuales
     if (saved.stats) state.stats = { ...state.stats, ...saved.stats };
     if (saved.shadow && process.env.SHADOW_RESET !== "true") {
       state.shadow = saved.shadow;
@@ -995,6 +997,41 @@ async function registrarCalidadPremig(mint, symbol) {
   }
 }
 
+// [31-ago] aviso de RECHAZO al panel, con lo que se sabía del token al descartarlo
+function migRechazada(entry, motivo) {
+  try {
+    if (!state.rechazadas) state.rechazadas = [];
+    const data = {
+      id: `rej-${entry.mint}-${Date.now()}`, mint: entry.mint, symbol: entry.symbol, name: entry.name,
+      motivo, ts: Date.now(), dur: Math.round((Date.now() - entry.startTime) / 1000),
+      mc: entry.migratedMcUsd || null, vol: Math.round(entry.volumeUSD || 0), trades: entry.tradeCount || 0,
+      sig: entry.sigPct != null ? entry.sigPct : null, mov2s: entry.qualMov2s != null ? entry.qualMov2s : null,
+      ultimo: (entry.firstPrice > 0 && entry.lastPrice > 0) ? +((entry.lastPrice / entry.firstPrice - 1) * 100).toFixed(1) : null,
+      serie: entry.serie || [],
+      veredicto: null, maxVisto: null,       // los rellena el humano desde el panel
+    };
+    state.rechazadas.unshift(data);
+    if (state.rechazadas.length > 300) state.rechazadas.length = 300;
+    broadcast({ event: "migRechazada", data });
+  } catch {}
+}
+
+// [31-ago] VEREDICTO MANUAL sobre una rechazada: el humano la mira en pump.fun y dice si el
+// filtro acertó ("bien") o se equivocó ("mal"), con el máximo que vio. Queda en el estado y en
+// el log ([REJ-VEREDICTO]) para poder medir la tasa de acierto de cada filtro.
+app.post("/api/rechazada/veredicto", (req, res) => {
+  const { id, veredicto, maxVisto } = req.body || {};
+  const r = (state.rechazadas || []).find(x => x.id === id);
+  if (!r) return res.status(404).json({ error: "rechazada no encontrada" });
+  if (!["bien", "mal", null].includes(veredicto)) return res.status(400).json({ error: "veredicto: bien | mal | null" });
+  r.veredicto = veredicto;
+  r.maxVisto = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
+  addLog(`[REJ-VEREDICTO] mint=${r.mint} sym=${r.symbol} motivo=${r.motivo} veredicto=${veredicto} maxVisto=${r.maxVisto ?? "n/a"} ultimo=${r.ultimo ?? "n/a"} dur=${r.dur}s mc=${r.mc ?? "n/a"}`, "info");
+  broadcast({ event: "migRechazadaVeredicto", data: { id, veredicto: r.veredicto, maxVisto: r.maxVisto } });
+  saveState();
+  res.json({ ok: true });
+});
+
 function migStartWatching(coin) {
   if (seenMigMints.has(coin.mint)) return;
   if (!solPriceReady) { addLog("⏳ Esperando precio real de SOL antes de operar", "warn"); return; }
@@ -1047,6 +1084,16 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   entry.tradeCount++;
   entry.lastPrice = price;
   if (!entry.firstPrice && price > 0) entry.firstPrice = price;
+  // [31-ago] serie de precio de la vigilancia: sirve para ver en el panel qué hizo el token
+  // desde que migró hasta que lo rechazamos (≤120 puntos, en % desde el primer tick)
+  if (entry.firstPrice > 0) {
+    if (!entry.serie) entry.serie = [];
+    const tRel = Math.round((Date.now() - entry.startTime) / 1000);
+    const pRel = +((price / entry.firstPrice - 1) * 100).toFixed(1);
+    const ult = entry.serie[entry.serie.length - 1];
+    if (!ult || ult[0] !== tRel) entry.serie.push([tRel, pRel]); else ult[1] = pRel;
+    if (entry.serie.length > 120) entry.serie.splice(0, entry.serie.length - 120);
+  }
   const elapsed = Date.now() - entry.startTime;
   if (OBSERVER_MODE && entry.volumeUSD >= OBS_MIN_VOL && price > 0) {
     clearTimeout(entry.timer); entry.entered = true; state.migWatching.delete(mint);
@@ -1071,7 +1118,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
   const mcEntryUsdPre = entryPriceB * 1_000_000_000;
   if (mcEntryUsdPre > MIG_MAX_MC_ENTRY) {
     addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsdPre)} > tope ${formatMC(MIG_MAX_MC_ENTRY)} (riesgo honeypot/pump inflado)`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "MIG MC ALTO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
     return;
   }
@@ -1085,7 +1132,7 @@ function migQualityGateThenOpen(entry, entryPriceB) {
     if (!entry.qualGate) return;
     entry.qualGate = false;
     addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | nunca dio mov2s>+${MIG_QUAL_MOV2S_MIN}% en ${(MIG_QUAL_MAX_WAIT_MS/60000).toFixed(0)}min`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "MIG FILTRO CALIDAD"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
   }, MIG_QUAL_MAX_WAIT_MS);
 }
@@ -1107,7 +1154,7 @@ function migQualTick(entry, price) {
     // [FIX 29-jul] UNA-STRIKE: primera señal débil = fuera para siempre (no vuelve a observación)
     if (mov2 < MIG_QUAL_ONE_STRIKE) {
       addLog(`🚫 MIG UNA-STRIKE: ${entry.symbol} descartada | 1ª señal mov2s +${mov2.toFixed(1)}% < +${MIG_QUAL_ONE_STRIKE}% (débil = fuera, sin los 10 min de re-vigilancia)`, "filter");
-      state.stats.mig_rejected++;
+      migRechazada(entry, "MIG UNA-STRIKE"); state.stats.mig_rejected++;
       state.migWatching.delete(entry.mint);
       unsubscribeToken(entry.mint);
       broadcast({ event: "stats", data: state.stats });
@@ -1130,18 +1177,18 @@ function migQualTick(entry, price) {
       if (precioB < precioSenal * (1 - MIG_MAX_CAIDA_DELAY)) {
         const caida = ((precioB / precioSenal - 1) * 100).toFixed(1);
         addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}% en la confirmación`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        migRechazada(entry, "MIG ENTRADA ABORTADA"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       const mcEntryUsd = precioB * 1_000_000_000;
       if (mcEntryUsd < MIG_MIN_MC_ENTRY) {
         addLog(`🛑 MIG MC BASURA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} < mínimo ${formatMC(MIG_MIN_MC_ENTRY)} (token glitch/muerto, inejecutable en real)`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        migRechazada(entry, "MIG MC BASURA"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       if (mcEntryUsd > MIG_MAX_MC_ENTRY) {
         addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} > tope ${formatMC(MIG_MAX_MC_ENTRY)}`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        migRechazada(entry, "MIG MC ALTO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       // [v11.1] VETO DE FÁBRICA: creador con 2+ malas con nosotros → ni tocarlo
@@ -1150,7 +1197,7 @@ function migQualTick(entry, price) {
         const hC = preV && preV.creator ? creatorHist.get(preV.creator) : null;
         if (hC && hC.malas >= MIG_CREATOR_VETO_MALAS) {
           addLog(`🏭 MIG VETO FÁBRICA: ${entry.symbol} descartada | creador ${preV.creator.slice(0,8)}… con ${hC.tokens} tokens / ${hC.malas} malas con nosotros`, "filter");
-          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          migRechazada(entry, "MIG VETO FÁBRICA"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
@@ -1159,7 +1206,7 @@ function migQualTick(entry, price) {
         const preA = premigData.get(entry.mint);
         if (preA && preA.creator && abyssCreators.has(preA.creator)) {
           addLog(`☠️ MIG VETO ABISMO: ${entry.symbol} descartada | creador ${preA.creator.slice(0,8)}… en lista negra de por vida (pull previo ≤${MIG_ABYSS_PNL}%)`, "filter");
-          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          migRechazada(entry, "MIG VETO ABISMO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
@@ -1168,7 +1215,7 @@ function migQualTick(entry, price) {
       const preD = premigData.get(entry.mint);
       if (preD && preD.holders !== null && preD.holders < MIG_MIN_HOLDERS) {
         addLog(`🚫 MIG HOLDERS: ${entry.symbol} descartada | holders=${preD.holders} < ${MIG_MIN_HOLDERS} (supply ultra-concentrado, perfil rug)`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        migRechazada(entry, "MIG HOLDERS"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       // [FIX 26-jul] 💎 FILTRO topBal (mando del lab): billeteras top pobres = perfil rug
@@ -1177,7 +1224,7 @@ function migQualTick(entry, price) {
         if (tbF == null && preD.hq) { const mT = preD.hq.match(/topBalMed=([\d.]+)/); if (mT) tbF = +mT[1]; }
         if (tbF != null && tbF < MIG_MIN_TOPBAL) {
           addLog(`💎 MIG topBal: ${entry.symbol} descartada | topBalMed=${tbF} SOL < ${MIG_MIN_TOPBAL} (billeteras top sin fondos, perfil rug)`, "filter");
-          state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+          migRechazada(entry, "MIG topBal"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
           broadcast({ event: "stats", data: state.stats }); return;
         }
       }
@@ -1186,7 +1233,7 @@ function migQualTick(entry, price) {
         || (MIG_RED_MODO === "tg" ? preD.tg === true : (preD.tg === true || preD.tw === true));
       if (!redOK) {
         addLog(`✈️ MIG SIN REDES [${MIG_RED_MODO}]: ${entry.symbol} descartada | tg=${preD.tg?1:0} tw=${preD.tw?1:0}`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+        migRechazada(entry, "MIG SIN REDES MIG_RED_MODO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       migExamThenOpen(entry, precioB);   // [FIX 28-jul] el examen de 2s decide la entrada
@@ -1199,7 +1246,7 @@ function volverAlPortero(entry, precioRef, motivo) {
   const resto = MIG_QUAL_MAX_WAIT_MS - (Date.now() - entry.startTime);
   addLog(`↩️ ${entry.symbol}: ${motivo} — ${resto > 5000 ? "vuelve al portero (" + Math.round(resto/60000) + "min restantes)" : "sin tiempo, descartada"}`, "filter");
   if (resto <= 5000) {
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "sin tiempo tras el examen: " + motivo); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
     return;
   }
@@ -1209,7 +1256,7 @@ function volverAlPortero(entry, precioRef, motivo) {
     if (!entry.qualGate) return;
     entry.qualGate = false;
     addLog(`🚫 MIG FILTRO CALIDAD: ${entry.symbol} descartada | sin tirón limpio tras volver al portero`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "MIG FILTRO CALIDAD"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
   }, resto);
 }
@@ -1277,7 +1324,7 @@ function migEvaluate(mint) {
       if (precioB < precioA * (1 - MIG_MAX_CAIDA_DELAY)) {
         const caida = ((precioB / precioA - 1) * 100).toFixed(1);
         addLog(`🚫 MIG ENTRADA ABORTADA: ${entry.symbol} cayó ${caida}%`, "filter");
-        state.stats.mig_rejected++; state.migWatching.delete(mint); unsubscribeToken(mint);
+        migRechazada(entry, "MIG ENTRADA ABORTADA"); state.stats.mig_rejected++; state.migWatching.delete(mint); unsubscribeToken(mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
       entry.pendingEntry = true;
@@ -1287,7 +1334,7 @@ function migEvaluate(mint) {
   } else {
     state.migWatching.delete(mint); unsubscribeToken(mint);
     addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
-    state.stats.mig_rejected++; broadcast({ event: "stats", data: state.stats });
+    migRechazada(entry, "MIG RECHAZADO"); state.stats.mig_rejected++; broadcast({ event: "stats", data: state.stats });
   }
 }
 
@@ -2110,7 +2157,7 @@ function migOpenTrades(entry) {
   const mcOpen = price * 1_000_000_000;
   if (mcOpen > MIG_MAX_MC_ENTRY || mcOpen < MIG_MIN_MC_ENTRY) {
     addLog(`🛑 MIG MC FUERA DE RANGO (cinturón en apertura): ${entry.symbol} bloqueada | MC ${formatMC(mcOpen)} (rango válido ${formatMC(MIG_MIN_MC_ENTRY)}–${formatMC(MIG_MAX_MC_ENTRY)})`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "MIG MC FUERA DE RANGO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
     return;
   }
@@ -2119,7 +2166,7 @@ function migOpenTrades(entry) {
   const velSeg = +(((Date.now() - entry.startTime) / 1000).toFixed(1));
   if (velSeg > MIG_MAX_VEL_S) {
     addLog(`🐢 MIG VETO LENTOS: ${entry.symbol} descartada | vel=${velSeg}s > ${MIG_MAX_VEL_S}s (migración→entrada demasiado lenta)`, "filter");
-    state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    migRechazada(entry, "MIG VETO LENTOS"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
     broadcast({ event: "stats", data: state.stats });
     return;
   }
@@ -3159,7 +3206,8 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   frontendClients.add(ws);
-  ws.send(JSON.stringify({ event: "fullState", data: {   // [FIX 26-jul] el frontend escucha "fullState", no "init"
+  ws.send(JSON.stringify({ event: "fullState", data: {
+    rechazadas: (state.rechazadas || []).slice(0, 150),   // [FIX 26-jul] el frontend escucha "fullState", no "init"
     wsStatus: "connected",
     demoTrades: state.demoTrades.slice(0, 100),
     realTrades: state.realTrades.slice(0, 100),
