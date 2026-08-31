@@ -2923,6 +2923,15 @@ function espiaConectar() {
     if (!mint) return;
     const c0 = espia.cuenta.get(mint);
     if (!c0) return;
+    // [31-ago] con commitment "processed" la misma transacción llega varias veces (re-procesos y
+    // bifurcaciones). Sin esto salían ratios de 10-20× que no eran trades de más, eran repes.
+    const firma = m.params?.result?.signature;
+    if (firma) {
+      if (!c0.vistas) c0.vistas = new Set();
+      if (c0.vistas.has(firma)) { c0.repes = (c0.repes || 0) + 1; return; }
+      c0.vistas.add(firma);
+      if (c0.vistas.size > 4000) c0.vistas = new Set([...c0.vistas].slice(-2000));
+    }
     c0.helius++; c0.ultH = Date.now();
     // precio = reservas de WSOL / reservas del token en la piscina (las cuentas con más saldo)
     const meta = m.params?.result?.transaction?.meta;
@@ -2956,9 +2965,15 @@ function espiaConectar() {
       if (mejor) { c0.pool = mejor.owner; tok = mejor.o.tok; sol = mejor.o.sol; }
     }
     if (!(tok > 0 && sol > 0)) return;              // no es una transacción de la piscina
+    // ¿han cambiado de verdad las reservas? si no, la transacción tocó la piscina pero no operó
+    const clave = tok.toFixed(6) + "/" + sol.toFixed(9);
+    if (c0.ultReservas === clave) return;
+    c0.ultReservas = clave;
     c0.swaps = (c0.swaps || 0) + 1;                 // esto sí es comparable con un tick de PumpPortal
     {
-      c0.precioH = sol / tok;
+      // la piscina da SOL por token; PumpPortal manda DÓLARES por token (de ahí el 99% de "diferencia"
+      // que salía en los primeros informes: era el cambio SOL→USD, no un desacuerdo de precios).
+      c0.precioH = (sol / tok) * (solPriceUSD || 0);
       c0.tPrecioH = Date.now();
       const rec0 = state.liveRecordings.get(mint);
       if (rec0 && rec0.lastPrice > 0 && Date.now() - (rec0.lastTickAt || 0) < 15_000) {
@@ -3012,7 +3027,7 @@ setInterval(() => {
   const difPeor = dTot.length ? Math.max(...dTot.map(x => x.difMax || 0)) : null;
   addLog(`[ESPIA] portal=${tot.p} helius-swaps=${tot.h} (de ${tot.tx} tx) · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
     + (difMedia != null ? ` · PRECIO: dif media ${difMedia.toFixed(2)}% · peor ${difPeor.toFixed(2)}% (${dTot.length} tokens)` : " · PRECIO: sin comparaciones aún")
-    + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · con saldos ${espia.conSaldos || 0}/${(espia.conSaldos || 0) + (espia.sinSaldos || 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
+    + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · repes=${[...espia.cuenta.values()].reduce((a, x) => a + (x.repes || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
 
 if (ESPIA_ON) setTimeout(espiaConectar, 8000);
