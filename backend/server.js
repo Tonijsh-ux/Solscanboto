@@ -1993,9 +1993,9 @@ function liveRecEmit(mint) {
   uniFinish(rec);   // [23-ago] 🤝 UNIDA: cerrar posiciones vivas antes de apagar la cámara
   rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
   { const c0 = espia.cuenta.get(mint);   // [30-ago] veredicto del espía al cerrar la cámara
-    if (c0) addLog(`[ESPIA-FIN] ${rec.symbol} dur=${rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length-1].t : 0}s · portal=${c0.portal} helius=${c0.helius}`
+    if (c0) addLog(`[ESPIA-FIN] ${rec.symbol} dur=${rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length-1].t : 0}s · portal=${c0.portal} helius-swaps=${c0.swaps || 0} (${c0.helius}tx)`
       + (c0.difN ? ` · precio dif media ${(c0.difSum / c0.difN).toFixed(2)}% peor ${(c0.difMax || 0).toFixed(2)}%` : "")
-      + (c0.helius > c0.portal * 1.2 ? " ⚠️ HELIUS VIO MÁS" : "")
+      + ((c0.swaps || 0) > c0.portal * 1.2 ? " ⚠️ HELIUS VIO MÁS" : "")
       + (c0.precioH && rec.lastPrice ? ` · último precio H=${c0.precioH.toPrecision(4)} P=${rec.lastPrice.toPrecision(4)}` : ""), "info"); }
   espiaDesuscribir(mint);
   const pts = rec.puntos;
@@ -2902,13 +2902,31 @@ function espiaConectar() {
       return;
     }
     espia.conSaldos = (espia.conSaldos || 0) + 1;
-    let tok = 0, sol = 0;
+    // [31-ago] FIJAR LA PISCINA. Llegan TODAS las transacciones que tocan el mint (transferencias,
+    // bots, agregadores...), y en la mayoría no está la piscina: coger "la cuenta con más tokens"
+    // daba precios de ballenas (dif media 70%, pico 1178%). La piscina es el único owner que
+    // tiene a la vez una cuenta del token y otra de WSOL; la identificamos una vez y la exigimos.
+    const porOwner = new Map();
     for (const b of post) {
       const amt = +(b.uiTokenAmount?.uiAmountString || b.uiTokenAmount?.uiAmount || 0);
-      if (b.mint === mint) { if (amt > tok) tok = amt; }
-      else if (b.mint === WSOL_MINT) { if (amt > sol) sol = amt; }
+      if (!b.owner) continue;
+      const o = porOwner.get(b.owner) || { tok: 0, sol: 0 };
+      if (b.mint === mint && amt > o.tok) o.tok = amt;
+      else if (b.mint === WSOL_MINT && amt > o.sol) o.sol = amt;
+      porOwner.set(b.owner, o);
     }
-    if (tok > 0 && sol > 0) {
+    let tok = 0, sol = 0;
+    if (c0.pool) {                                  // piscina ya conocida: solo ella vale
+      const o = porOwner.get(c0.pool);
+      if (o && o.tok > 0 && o.sol > 0) { tok = o.tok; sol = o.sol; }
+    } else {                                        // aún no: el owner con token+WSOL y más tokens
+      let mejor = null;
+      for (const [owner, o] of porOwner) if (o.tok > 0 && o.sol > 0 && (!mejor || o.tok > mejor.o.tok)) mejor = { owner, o };
+      if (mejor) { c0.pool = mejor.owner; tok = mejor.o.tok; sol = mejor.o.sol; }
+    }
+    if (!(tok > 0 && sol > 0)) return;              // no es una transacción de la piscina
+    c0.swaps = (c0.swaps || 0) + 1;                 // esto sí es comparable con un tick de PumpPortal
+    {
       c0.precioH = sol / tok;
       c0.tPrecioH = Date.now();
       const rec0 = state.liveRecordings.get(mint);
@@ -2954,14 +2972,14 @@ setInterval(() => {
     const mudoP = c0.ultP && Date.now() - c0.ultP > 90_000;
     const mudoH = c0.ultH && Date.now() - c0.ultH > 90_000;
     const dm = c0.difN ? (c0.difSum / c0.difN) : null;
-    filas.push(`${shortAddr(mint)}:P${c0.portal}/H${c0.helius}${dm != null ? `·Δ${dm.toFixed(2)}%` : ""}${mudoP && !mudoH ? "⚠️PORTAL-MUDO" : ""}${mudoH && !mudoP ? "·helius-mudo" : ""}${vivo ? "" : "·cerrada"}`);
+    filas.push(`${shortAddr(mint)}:P${c0.portal}/H${c0.swaps || 0}(${c0.helius}tx)${dm != null ? `·Δ${dm.toFixed(2)}%` : ""}${mudoP && !mudoH ? "⚠️PORTAL-MUDO" : ""}${mudoH && !mudoP ? "·helius-mudo" : ""}${vivo ? "" : "·cerrada"}`);
     if (!vivo && Date.now() - c0.t0 > 30 * 60_000) espia.cuenta.delete(mint);
   }
-  const tot = [...espia.cuenta.values()].reduce((a, x) => ({ p: a.p + x.portal, h: a.h + x.helius }), { p: 0, h: 0 });
+  const tot = [...espia.cuenta.values()].reduce((a, x) => ({ p: a.p + x.portal, h: a.h + (x.swaps || 0), tx: a.tx + x.helius }), { p: 0, h: 0, tx: 0 });
   const dTot = [...espia.cuenta.values()].filter(x => x.difN);
   const difMedia = dTot.length ? (dTot.reduce((a, x) => a + x.difSum / x.difN, 0) / dTot.length) : null;
   const difPeor = dTot.length ? Math.max(...dTot.map(x => x.difMax || 0)) : null;
-  addLog(`[ESPIA] portal=${tot.p} helius=${tot.h} · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
+  addLog(`[ESPIA] portal=${tot.p} helius-swaps=${tot.h} (de ${tot.tx} tx) · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
     + (difMedia != null ? ` · PRECIO: dif media ${difMedia.toFixed(2)}% · peor ${difPeor.toFixed(2)}% (${dTot.length} tokens)` : " · PRECIO: sin comparaciones aún")
     + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · con saldos ${espia.conSaldos || 0}/${(espia.conSaldos || 0) + (espia.sinSaldos || 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
