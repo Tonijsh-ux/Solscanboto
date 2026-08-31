@@ -26,6 +26,7 @@ function useBackend() {
  const [migMonitored, setMigMonitored] = useState([]);
  const [momMonitored, setMomMonitored] = useState([]);
  const [signals, setSignals] = useState([]);
+ const [rechazadas, setRechazadas] = useState([]);   // [31-ago] migraciones descartadas por los filtros
  const [demoTrades, setDemoTrades] = useState([]);
  const [realTrades, setRealTrades] = useState([]);
  const [movements, setMovements] = useState([]);
@@ -50,6 +51,7 @@ function useBackend() {
            setMigMonitored(data.migMonitored || []);
            setMomMonitored(data.momMonitored || []);
            setSignals(data.signals || []);
+           if (Array.isArray(data.rechazadas)) setRechazadas(data.rechazadas);   // [31-ago] con sus veredictos
            setDemoTrades(data.demoTrades || []);
            setRealTrades(data.realTrades || []);
            setMovements(data.movements || []);
@@ -67,6 +69,8 @@ function useBackend() {
          if (event === "migTokenUpdate") { setMigMonitored(p => p.map(t => t.mint === data.mint ? { ...t, ...data } : t)); return; }
          if (event === "removeToken") { setMigMonitored(p => p.filter(t => t.mint !== data.mint)); setMomMonitored(p => p.filter(t => t.mint !== data.mint)); return; }
          if (event === "newSignal") { setSignals(p => [data, ...p].slice(0, 100)); if (navigator.vibrate) navigator.vibrate([200,100,200]); return; }
+         if (event === "migRechazada") { setRechazadas(p => [data, ...p].slice(0, 150)); return; }
+         if (event === "migRechazadaVeredicto") { setRechazadas(p => p.map(r => r.id === data.id ? { ...r, veredicto: data.veredicto, maxVisto: data.maxVisto } : r)); return; }
          if (event === "newDemoTrade" || event === "demoTradeOpened") { const d = { ...data, _lastUp: Date.now() }; setDemoTrades(p => p.find(t => t.id === d.id) ? p : [d, ...p].slice(0, 500)); return; }
          if (event === "demoTradeUpdate") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...t, ...data, _lastUp: Date.now() } : t)); return; }
          if (event === "demoTradeClosed") { setDemoTrades(p => p.map(t => t.id === data.id ? { ...data, _lastUp: Date.now() } : t)); return; }
@@ -85,7 +89,7 @@ function useBackend() {
    return () => { ws?.close(); clearTimeout(t); };
  }, []);
 
- return { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre };
+ return { migWatching, migMonitored, momMonitored, signals, rechazadas, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre };
 }
 
 // ── COMPONENTES ────────────────────────────────────────────────
@@ -310,6 +314,62 @@ function TokenCard({ mint, trades, post }) {
             <a href={`https://pump.fun/coin/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#4ade80", fontSize: 11 }}>💊 pump.fun</a>
             <a href={`https://solscan.io/token/${mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8", fontSize: 11 }}>🔎 Solscan</a>
             <span onClick={(e) => { e.stopPropagation(); navigator.clipboard && navigator.clipboard.writeText(mint); }} style={{ color: "#94a3b8", fontSize: 11, cursor: "pointer" }}>📋 copiar mint</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// [31-ago] tarjeta de una migración RECHAZADA
+function Rechazada({ r, onVeredicto }) {
+  const [abierta, setAbierta] = useState(false);
+  const [maxTxt, setMaxTxt] = useState(r.maxVisto != null ? String(r.maxVisto) : "");
+  const ultimo = r.ultimo == null ? null : r.ultimo;
+  const col = ultimo == null ? "#64748b" : ultimo >= 0 ? "#22c55e" : "#ef4444";
+  const sym = (r.symbol && r.symbol !== "???") ? r.symbol : r.mint.slice(0, 6);
+  const serie = (r.serie || []).map(x => x[1]);
+  const maxS = serie.length ? Math.max(...serie) : null, minS = serie.length ? Math.min(...serie) : null;
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderLeft: "3px solid #f97316", borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+      <div onClick={() => setAbierta(!abierta)} style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#e2e8f0", fontSize: 14 }}>{sym}</span>
+            <span style={{ fontSize: 10, color: "#f97316", background: "#f9731618", border: "1px solid #f9731644", borderRadius: 5, padding: "1px 5px" }}>{r.motivo}</span>
+            {r.veredicto === "bien" && <span style={{ fontSize: 10, color: "#22c55e" }}>✅ bien descartada{r.maxVisto != null ? ` (máx +${r.maxVisto}%)` : ""}</span>}
+            {r.veredicto === "mal" && <span style={{ fontSize: 10, color: "#ef4444", fontWeight: 700 }}>❌ MAL descartada{r.maxVisto != null ? ` (llegó a +${r.maxVisto}%)` : ""}</span>}
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3, fontFamily: "monospace", fontSize: 12 }}>
+            <span style={{ color: col, fontSize: 16, fontWeight: 700 }}>{ultimo == null ? "—" : (ultimo >= 0 ? "+" : "") + ultimo.toFixed(1) + "%"}</span>
+            <span style={{ color: "#64748b" }}>al descartar · {r.dur}s vigilada</span>
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 2, fontSize: 11, fontFamily: "monospace", color: "#64748b" }}>
+            <span>🕐 {new Date(r.ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}</span>
+            {r.mc != null && <span>MC ${Math.round(r.mc / 1000)}K</span>}
+            {maxS != null && <span style={{ color: "#22c55e" }}>▲ +{maxS.toFixed(0)}%</span>}
+            {minS != null && <span style={{ color: "#ef4444" }}>▼ {minS.toFixed(0)}%</span>}
+          </div>
+        </div>
+        {serie.length > 2 && <Spark datos={serie} compras={[]} salida={null} />}
+      </div>
+      {abierta && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #1e2d40", fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>
+          <div>volumen ${r.vol} · {r.trades} trades{r.sig != null ? ` · señal ${r.sig >= 0 ? "+" : ""}${r.sig}%` : ""}{r.mov2s != null ? ` · mov2s ${r.mov2s >= 0 ? "+" : ""}${r.mov2s}%` : ""}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            <span style={{ color: "#64748b" }}>tu veredicto:</span>
+            <input value={maxTxt} onChange={e => setMaxTxt(e.target.value)} onClick={e => e.stopPropagation()} placeholder="máx % visto" inputMode="decimal"
+              style={{ width: 84, background: "#161b22", color: "#e6edf3", border: "1px solid #30363d", borderRadius: 6, padding: "4px 6px", fontSize: 11 }} />
+            <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "bien", maxTxt); }}
+              style={{ background: r.veredicto === "bien" ? "#22c55e22" : "#0d1117", border: `1px solid ${r.veredicto === "bien" ? "#22c55e" : "#30363d"}`, color: "#22c55e", borderRadius: 6, padding: "4px 8px", fontSize: 11 }}>✅ bien</button>
+            <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, "mal", maxTxt); }}
+              style={{ background: r.veredicto === "mal" ? "#ef444422" : "#0d1117", border: `1px solid ${r.veredicto === "mal" ? "#ef4444" : "#30363d"}`, color: "#ef4444", borderRadius: 6, padding: "4px 8px", fontSize: 11 }}>❌ mal</button>
+            {r.veredicto && <button onClick={(e) => { e.stopPropagation(); onVeredicto(r.id, null, ""); }} style={{ background: "transparent", border: "none", color: "#64748b", fontSize: 11 }}>quitar</button>}
+          </div>
+          <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
+            <a href={`https://pump.fun/coin/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>💊 pump.fun</a>
+            <a href={`https://solscan.io/token/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8" }}>🔎 Solscan</a>
+            <span onClick={(e) => { e.stopPropagation(); navigator.clipboard && navigator.clipboard.writeText(r.mint); }} style={{ cursor: "pointer" }}>📋 copiar mint</span>
           </div>
         </div>
       )}
@@ -775,10 +835,17 @@ function Calendar({ realTrades, movements, setMovements }) {
 
 // ── APP PRINCIPAL ──────────────────────────────────────────────
 export default function App() {
- const { migWatching, migMonitored, momMonitored, signals, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre
+ const { migWatching, migMonitored, momMonitored, signals, rechazadas, demoTrades, realTrades, movements, setMovements, log, stats, shadow, wsStatus, postCierre } = useBackend();   // [5-ago] +postCierre · [31-ago] +rechazadas
  const [tab, setTab] = useState("migration");
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
- const [demoStratFilter, setDemoStratFilter] = useState("unida");   // [23-ago] demo arranca enseñando solo la unida
+ const [demoStratFilter, setDemoStratFilter] = useState("unida");
+ const [rejFilter, setRejFilter] = useState("all");   // [31-ago] filtro por motivo de rechazo
+ const mandarVeredicto = async (id, veredicto, maxVisto) => {
+   try {
+     await fetch(`${BACKEND_HTTP}/api/rechazada/veredicto`, { method: "POST", headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ id, veredicto, maxVisto }) });
+   } catch (e) { console.error("veredicto", e); }
+ };   // [23-ago] demo arranca enseñando solo la unida
  const [realStatusFilter, setRealStatusFilter] = useState("all");
  const [realStratFilter, setRealStratFilter] = useState("all");
  const [chartPeriod, setChartPeriod] = useState("daily");
@@ -877,7 +944,7 @@ export default function App() {
      <div style={{ display: "flex", background: "#0d1117", borderBottom: "1px solid #1e2d40", overflowX: "auto" }}>
        {[
          { id: "migration", label: "🌉 Mig", badge: migWatching.length + migMonitored.length, accent: "#facc15" },
-         { id: "signals", label: "🎯", badge: signals.length, accent: "#38bdf8" },
+         { id: "signals", label: "🚫", badge: rechazadas.length, accent: "#f97316" },
          { id: "demo", label: "💰 Demo", badge: (stats.demoOpen||0) },
          { id: "real", label: "🔴 Real", badge: (stats.realOpen||0), accent: "#f97316" },
          { id: "shadow", label: "🏟️", badge: shadow?.n || 0, accent: "#facc15" },
@@ -943,7 +1010,46 @@ export default function App() {
 
        {tab === "signals" && (
          <>
-           {signals.length === 0 && <EmptyState icon="🎯" text="Las señales aparecerán aquí." />}
+           <div style={{ fontSize: 11, color: "#64748b", marginBottom: 8 }}>🚫 Migraciones que los filtros descartaron, con lo que hizo el precio mientras se vigilaban. Toca una para desplegar.</div>
+           {(() => {
+             // [31-ago] chips por MOTIVO: se construyen solos con los motivos que van llegando
+             const cuenta = {}, bien = {}, mal = {};
+             for (const r of rechazadas) { cuenta[r.motivo] = (cuenta[r.motivo] || 0) + 1; if (r.veredicto === "bien") bien[r.motivo] = (bien[r.motivo] || 0) + 1; if (r.veredicto === "mal") mal[r.motivo] = (mal[r.motivo] || 0) + 1; }
+             const motivos = Object.entries(cuenta).sort((a, b) => b[1] - a[1]);
+             const totBien = Object.values(bien).reduce((a, b) => a + b, 0), totMal = Object.values(mal).reduce((a, b) => a + b, 0);
+             const corto = (m) => m.replace(/^MIG\s+/i, "").replace(/^sin tiempo tras el examen:.*/i, "sin tiempo").slice(0, 16);
+             const lista = rejFilter === "all" ? rechazadas : rechazadas.filter(r => r.motivo === rejFilter);
+             return (
+               <>
+                 {motivos.length > 0 && (
+                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                     {[["all", "Todas", rechazadas.length], ...motivos.map(([m, n]) => [m, corto(m), n])].map(([id, label, n]) => (
+                       <button key={id} onClick={() => setRejFilter(id)}
+                         style={{ background: rejFilter === id ? "#f9731622" : "#0d1117", border: `1px solid ${rejFilter === id ? "#f97316" : "#1e2d40"}`,
+                                  color: rejFilter === id ? "#f97316" : "#94a3b8", borderRadius: 8, padding: "5px 9px", fontSize: 11, fontFamily: "monospace", cursor: "pointer" }}>
+                         {label} <span style={{ opacity: .7 }}>{n}</span>
+                         {(id === "all" ? (totBien + totMal) : ((bien[id] || 0) + (mal[id] || 0))) > 0 && (
+                           <span style={{ marginLeft: 4 }}>
+                             <span style={{ color: "#22c55e" }}>✅{id === "all" ? totBien : (bien[id] || 0)}</span>
+                             <span style={{ color: "#ef4444", marginLeft: 3 }}>❌{id === "all" ? totMal : (mal[id] || 0)}</span>
+                           </span>
+                         )}
+                       </button>
+                     ))}
+                   </div>
+                 )}
+                 {lista.length === 0 && <EmptyState icon="🚫" text="Aquí aparecerán las migraciones rechazadas." />}
+                 {rejFilter !== "all" && ((bien[rejFilter] || 0) + (mal[rejFilter] || 0)) > 0 && (
+                   <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8, fontFamily: "monospace" }}>
+                     este filtro acierta el <b style={{ color: "#22c55e" }}>{Math.round(100 * (bien[rejFilter] || 0) / ((bien[rejFilter] || 0) + (mal[rejFilter] || 0)))}%</b> de las que has revisado
+                     {(mal[rejFilter] || 0) > 0 && <span> · se equivocó en {mal[rejFilter]}</span>}
+                   </div>
+                 )}
+                 {lista.map(r => <Rechazada key={r.id} r={r} onVeredicto={mandarVeredicto} />)}
+               </>
+             );
+           })()}
+           {signals.length > 0 && <div style={{ fontSize: 11, color: "#475569", margin: "14px 0 6px" }}>🎯 señales antiguas</div>}
            {signals.map(s => (
              <div key={s.id} style={{ background: "#0d1117", border: `1px solid ${s.strategy === "migration" ? "#facc15" : "#a78bfa"}33`, borderRadius: 10, padding: "10px 14px" }}>
                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
