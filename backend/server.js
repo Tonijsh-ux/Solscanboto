@@ -235,17 +235,30 @@ const UNI_MUERTO_S = 60;           //   → liquida el paquete a mercado y deja 
 const UNI2_ON = true;
 const UNI2 = {
   id: "unida2",
-  bot: { sl: -15, mult: 2, arm: 30, p1: 36, p2: 17, ndT: 0, ndM: 12, relNL: false },
-  giro: 10, tau: 20, md: 0, mv: 20,
+  // [30-ago] config afinada en el laboratorio. Sobre las 292 ops del 17→28, con el wash
+  // medido COMO LO VE EL BOT (dato parcial en el momento de comprar, no el del minuto entero):
+  //   17-19: +58.98 · 23-26: +37.35 · 27-28: +25.08  →  TOTAL +121.4 SOL (la variante A: +47.5)
+  // Último cambio: no-despegue de 10s/+29% a 20s/+35% (+10 SOL, todos del 17-19: la pierna
+  // del bot aguanta el doble antes de rendirse y pilla los arranques lentos). Meseta entre
+  // +30% y +40%; a 15s se cae a +102, así que el salto que importa es el del tiempo.
+  // Gana en las tres ventanas. Ojo: 4 ops aportan la mayor parte; es una estrategia de pocos
+  // aciertos grandes, así que un mes flojo puede dejarla plana.
+  bot: { sl: -15, mult: 3, arm: 80, p1: -20, p2: 150, ndT: 20, ndM: 35, relNL: false },
+  giro: 10, tau: 85, md: 2, mv: 20,
   maxlot: 8, maxvend: 5, rug: 50,
-  muertoPct: 0, muertoS: 60,      // 0 = sin regla del muerto
-  washMax: 20,                     // solo entra el relevo si el wash del primer minuto ≤ 20
+  muertoPct: 60, muertoS: 60,      // 💀 60s seguidos bajo -60% → liquida y abandona
+                                   //    (+2.2 SOL, gana en las tres ventanas)
+  washMax: 20,                     // el relevo solo entra si el wash del primer minuto ≤ 20
+  tp: 500,                         // 🎯 cobra el paquete entero al llegar a +500% sobre su media
+  rojaFrac: 0.5,                   // 🔴 en la roja vende solo la MITAD y deja correr el resto
+  plazoMin: 35,                    // ⏳ deja de ABRIR compras nuevas pasado este minuto
+                                   //    (meseta 25-45 min: +8.7 SOL, todo el efecto en 23-26)
 };
 const UNI1 = {
   id: "unida",
   bot: UNI_BOT, giro: UNI_GIRO, tau: UNI_TAU, md: UNI_MD, mv: UNI_MV,
   maxlot: UNI_MAXLOT, maxvend: UNI_MAXVEND, rug: UNI_RUG,
-  muertoPct: UNI_MUERTO_PCT, muertoS: UNI_MUERTO_S, washMax: 0,
+  muertoPct: UNI_MUERTO_PCT, muertoS: UNI_MUERTO_S, washMax: 0, tp: 0, rojaFrac: 1, plazoMin: 0,   // la A, sin cambios
 };
 const UNI_VARIANTES = () => UNI2_ON ? [UNI1, UNI2] : [UNI1];
 
@@ -1390,6 +1403,20 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   rec.puntos.push({ t: Math.round(dt/1000), p: pct });
   if (rec.mov2s === null && dt >= 2000) rec.mov2s = pct;
   if (pct < rec.minP) rec.minP = pct;
+
+  // [30-ago] FLUJO en tramos de 30s: volumen, compras, ventas y carteras distintas.
+  // Con solo precio no se puede distinguir "plano porque no opera nadie" de "plano con
+  // alguien acumulando", que es lo que hace falta para juzgar los suelos largos.
+  {
+    const seg = Math.round(dt / 1000), cubo = Math.floor(seg / 30) * 30;
+    if (!rec.flujo) rec.flujo = [];
+    let fx = rec.flujo[rec.flujo.length - 1];
+    if (!fx || fx.t !== cubo) { fx = { t: cubo, v: 0, c: 0, s: 0, w: new Set() }; rec.flujo.push(fx); }
+    fx.v += volUSD || 0;
+    if (isBuy) fx.c++; else fx.s++;
+    if (trader) fx.w.add(trader);
+    if (rec.flujo.length > 480) rec.flujo.shift();   // tope: 4 horas
+  }
   uniSample(rec, price, pct, Math.round(dt/1000));     // [23-ago] 🤝 UNIDA: decide en cadencia de muestra
 }
 
@@ -1527,7 +1554,8 @@ function uniSampleUno(rec, u, price, pct, tSec) {
   if (u.mixOn) {
     let hecho = false;
     const solEnJuego = state.demoTrades.reduce((s, t) => s + (t.strategy === "unida" && t.status === "OPEN" ? (t.sizeSol || 0) : 0), 0);
-    if (u.lotes.length < C.maxlot && u.vendidos < C.maxvend && u.mins.length >= 2 && solEnJuego + UNI_SIZE <= UNI_MAX_SOL) {
+    const dentroDePlazo = !C.plazoMin || t <= C.plazoMin * 60;   // [29-ago] ⏳ deja de comprar tarde
+    if (u.lotes.length < C.maxlot && u.vendidos < C.maxvend && u.mins.length >= 2 && dentroDePlazo && solEnJuego + UNI_SIZE <= UNI_MAX_SOL) {
       const A = u.mins[u.mins.length - 2], B = u.mins[u.mins.length - 1];
       const dtN = B.t - A.t;
       const soporte = dtN ? A.p + (B.p - A.p) * (t - A.t) / dtN : B.p;   // niv() del lab
@@ -1569,11 +1597,49 @@ function uniSampleUno(rec, u, price, pct, tSec) {
     }
     if (!hecho && u.lotes.length && t > u.tUlt) {
       const up = (upRatio * uniF(C.mv) - 1) * 100;
-      if (u.prev < up && v >= up) {
-        u.vendidos += u.lotes.length;
-        addLog(`🤝 UNIDA vende paquete ×${u.lotes.length}: ${rec.symbol} a ${v.toFixed(0)}% (roja ${up.toFixed(0)}%) | vendidos ${u.vendidos}/${C.maxvend}`, "info");
-        uniCierra(rec, u.tradePack, price, "ROJA");
-        u.tradePack = null; u.lotes = []; u.sumInv = 0;
+      // [29-ago] 🎯 objetivo: si el paquete alcanza +tp% sobre SU media, cobra entero.
+      // Validado en 3 ventanas con las dos configuraciones (mejora en todas).
+      const mediaR = u.lotes.length / u.sumInv;
+      const ganPk = (price / mediaR - 1) * 100;
+      const porTP = C.tp > 0 && ganPk >= C.tp;
+      if (porTP || (u.prev < up && v >= up)) {
+        // [29-ago] en la roja se puede vender solo una PARTE del paquete y dejar correr el resto:
+        // medido sobre 292 ops, el 31% de las ventas en la roja se dejaban +100% por delante.
+        // El objetivo (TP) sí cobra siempre el paquete entero.
+        const frac = porTP ? 1 : (C.rojaFrac > 0 && C.rojaFrac < 1 ? C.rojaFrac : 1);
+        const nVende = frac >= 1 ? u.lotes.length : Math.max(1, Math.round(u.lotes.length * frac));
+        const parcial = nVende < u.lotes.length;
+        u.vendidos += nVende;
+        addLog(porTP
+          ? `🎯 ${C.id}: ${rec.symbol} OBJETIVO +${C.tp}% alcanzado (paquete a +${ganPk.toFixed(0)}%) → cobra ×${nVende}`
+          : `🔴 ${C.id} vende ${parcial ? "MEDIO paquete" : "paquete"} ×${nVende}: ${rec.symbol} a ${v.toFixed(0)}% (roja ${up.toFixed(0)}%)${parcial ? ` · siguen ${u.lotes.length - nVende} lotes` : ""} | vendidos ${u.vendidos}/${C.maxvend}`, porTP ? "accept" : "info");
+        if (!parcial) {
+          uniCierra(rec, u.tradePack, price, porTP ? "TP" : "ROJA");
+          u.tradePack = null; u.lotes = []; u.sumInv = 0;
+        } else {
+          // cobra media posición: cierra un trade por la parte vendida y deja el paquete vivo
+          // OJO: sumInv acumula precios ABSOLUTOS (1/price), no ratios. Mantener las mismas
+          // unidades aquí es imprescindible: con ratios la media quedaría dividida por el
+          // precio de entrada del token y el objetivo saltaría cuando no debe.
+          const abs = (pct) => rec.entryPrice * uniF(pct);
+          const compradas = u.tradePack.compras || [];
+          const vendidosLotes = u.lotes.slice(0, nVende);
+          const quedan = u.lotes.slice(nVende);
+          let invV = 0; for (const l of vendidosLotes) invV += 1 / abs(l);
+          const pkV = u.tradePack;
+          pkV.entryPrice = vendidosLotes.length / invV;
+          pkV.sizeSol = +(UNI_SIZE * nVende).toFixed(2);
+          pkV.compras = compradas.slice(0, nVende);
+          uniCierra(rec, pkV, price, "ROJA_MEDIA");
+          // el resto sigue en un paquete nuevo, con su media re-basada
+          u.lotes = quedan;
+          u.sumInv = 0; for (const l of quedan) u.sumInv += 1 / abs(l);
+          const mediaQ = quedan.length / u.sumInv;
+          u.tradePack = uniOpenTrade(rec, mediaQ, `UNI_RELEVO×${quedan.length}`, C.id);
+          u.tradePack.compras = compradas.slice(nVende);
+          u.tradePack.sizeSol = +(UNI_SIZE * quedan.length).toFixed(2);
+          u.tradePack.mcEntry = rec.mc && rec.entryPrice ? +(rec.mc * (mediaQ / rec.entryPrice)).toFixed(0) : null;
+        }
       }
     }
     if (u.tradePack) {
@@ -1936,7 +2002,7 @@ function liveRecEmit(mint) {
     const wash = ws.filter(w => w.buys > 0 && w.sells > 0).length;
     wStr = ` buyers60=${buyers.length} topBuyer=${totalBuy > 0 ? (100*topBuy/totalBuy).toFixed(0) : 0}% wash60=${wash}`;
   }
-  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} ex2s=${rec.ex2s!=null?(rec.ex2s>=0?"+":"")+rec.ex2s+"%":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""} pts=${ptsRaw}`, "rec");
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} ex2s=${rec.ex2s!=null?(rec.ex2s>=0?"+":"")+rec.ex2s+"%":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""}${rec.flujo&&rec.flujo.length?` flujo=${rec.flujo.map(x=>`${x.t}:${Math.round(x.v)}:${x.c}:${x.s}:${x.w.size}`).join(",")}`:""} pts=${ptsRaw}`, "rec");
   try { shadowProcesa(rec); } catch (e) { if (!state._shErr) { state._shErr = true; addLog(`⚠️ shadowProcesa error: ${e.message}`, "warn"); } }   // [v11.9]
   labStats.migrecs++;
 }
