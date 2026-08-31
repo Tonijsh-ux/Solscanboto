@@ -462,6 +462,14 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const SOLANA_RPC = process.env.SOLANA_RPC
   || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "https://api.mainnet-beta.solana.com");
 const PUMPPORTAL_API_KEY = process.env.PUMPPORTAL_API_KEY || "";
+
+// ── [30-ago] ESPÍA DE HELIUS ─────────────────────────────────────────────────
+// No opera ni decide nada: se suscribe a los MISMOS mints que PumpPortal y solo
+// cuenta. Sirve para responder con datos a una pregunta concreta: cuando PumpPortal
+// deja de mandar los trades de un token (153 grabaciones truncadas en 12 días),
+// ¿los sigue viendo Helius? Si la respuesta es sí, la cámara debe cambiar de fuente.
+const ESPIA_ON = process.env.ESPIA_ON !== "0" && !!HELIUS_API_KEY;
+const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
   : "wss://pumpportal.fun/api/data";
@@ -1350,6 +1358,7 @@ function liveRecStart(entry, entryPrice) {
   rec._emitTimer = setTimeout(() => liveRecEmit(entry.mint), MIG_HARD_MAX_MS);
   rec._ventanaMin = Math.round(MIG_HARD_MAX_MS / 60000);
   uniInit(rec, entryPrice);   // [23-ago] 🤝 UNIDA: pierna bot dentro desde la entrada
+  espiaSuscribir(entry.mint);   // [30-ago] el espía mira el mismo token, sin operar
 }
 
 function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
@@ -1357,6 +1366,7 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
   rec.lastPrice = price; rec.lastTickAt = Date.now();   // [5-ago] último precio · [16-ago] y cuándo, para el vigilante
+  if (trader) { const c0 = espia.cuenta.get(mint); if (c0) { c0.portal++; c0.ultP = Date.now(); c0.sym = rec.symbol; } }   // solo ticks reales, no el rescate
   // [16-ago] TOKEN MUERTO: por debajo de -90% desde la entrada ya no hay nada que observar.
   // Cerramos la cámara, liberamos la suscripción y dejamos de re-suscribir un cadáver.
   if (!rec.finished && rec.entryPrice > 0 && price <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
@@ -1982,6 +1992,12 @@ function liveRecEmit(mint) {
   if (!rec || rec.finished) return;
   uniFinish(rec);   // [23-ago] 🤝 UNIDA: cerrar posiciones vivas antes de apagar la cámara
   rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
+  { const c0 = espia.cuenta.get(mint);   // [30-ago] veredicto del espía al cerrar la cámara
+    if (c0) addLog(`[ESPIA-FIN] ${rec.symbol} dur=${rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length-1].t : 0}s · portal=${c0.portal} helius=${c0.helius}`
+      + (c0.difN ? ` · precio dif media ${(c0.difSum / c0.difN).toFixed(2)}% peor ${(c0.difMax || 0).toFixed(2)}%` : "")
+      + (c0.helius > c0.portal * 1.2 ? " ⚠️ HELIUS VIO MÁS" : "")
+      + (c0.precioH && rec.lastPrice ? ` · último precio H=${c0.precioH.toPrecision(4)} P=${rec.lastPrice.toPrecision(4)}` : ""), "info"); }
+  espiaDesuscribir(mint);
   const pts = rec.puntos;
   if (pts.length < 2) return;
   let min=pts[0], max=pts[0];
@@ -2838,6 +2854,119 @@ setInterval(async () => {
 // ════════════════════════════════════════════════════════════════
 // PUMPPORTAL WEBSOCKET
 // ════════════════════════════════════════════════════════════════
+
+// ═══ [30-ago] ESPÍA: Helius en paralelo, solo mide ═══
+const espia = {
+  ws: null, subs: new Map(),        // mint → id de suscripción
+  pend: new Map(),                  // id de petición → mint
+  cuenta: new Map(),                // mint → { helius, portal, t0, ultH, ultP }
+  reconex: 0, credEst: 0,
+};
+function espiaConectar() {
+  if (!ESPIA_ON || !HELIUS_WS) return;
+  try { if (espia.ws) espia.ws.terminate(); } catch {}
+  espia.ws = new WebSocket(HELIUS_WS);
+  espia.ws.on("open", () => {
+    addLog("🕵️ ESPÍA Helius conectado", "info");
+    espia.subs.clear();
+    for (const mint of state.liveRecordings.keys()) espiaSuscribir(mint);
+  });
+  espia.ws.on("message", (raw) => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (!m || typeof m !== "object") return;
+    espia.credEst += raw.length;
+    if (m.id && espia.pend.has(m.id)) {            // respuesta a una suscripción
+      const mintP = espia.pend.get(m.id); espia.pend.delete(m.id);
+      if (m.error) {                                // p.ej. método no disponible en el plan
+        if (!espia.errAvisado) { espia.errAvisado = true;
+          addLog(`🕵️ ESPÍA: Helius rechazó la suscripción (${m.error.message || JSON.stringify(m.error)}) — el espía no medirá nada`, "warn"); }
+        return;
+      }
+      espia.subs.set(mintP, m.result);
+      return;
+    }
+    if (m.method !== "transactionNotification" && m.method !== "logsNotification") return;
+    const sub = m.params?.subscription;
+    let mint = null;
+    for (const [k, v] of espia.subs) if (v === sub) { mint = k; break; }
+    if (!mint) return;
+    const c0 = espia.cuenta.get(mint);
+    if (!c0) return;
+    c0.helius++; c0.ultH = Date.now();
+    // precio = reservas de WSOL / reservas del token en la piscina (las cuentas con más saldo)
+    const meta = m.params?.result?.transaction?.meta;
+    const post = meta?.postTokenBalances;
+    if (!Array.isArray(post) || !post.length) {
+      espia.sinSaldos = (espia.sinSaldos || 0) + 1;
+      if (espia.sinSaldos === 50 && !espia.conSaldos) addLog("🕵️ ESPÍA: 50 mensajes sin postTokenBalances — probar transactionDetails: \"full\"", "warn");
+      return;
+    }
+    espia.conSaldos = (espia.conSaldos || 0) + 1;
+    let tok = 0, sol = 0;
+    for (const b of post) {
+      const amt = +(b.uiTokenAmount?.uiAmountString || b.uiTokenAmount?.uiAmount || 0);
+      if (b.mint === mint) { if (amt > tok) tok = amt; }
+      else if (b.mint === WSOL_MINT) { if (amt > sol) sol = amt; }
+    }
+    if (tok > 0 && sol > 0) {
+      c0.precioH = sol / tok;
+      c0.tPrecioH = Date.now();
+      const rec0 = state.liveRecordings.get(mint);
+      if (rec0 && rec0.lastPrice > 0 && Date.now() - (rec0.lastTickAt || 0) < 15_000) {
+        const dif = Math.abs(c0.precioH / rec0.lastPrice - 1) * 100;
+        c0.difSum = (c0.difSum || 0) + dif; c0.difN = (c0.difN || 0) + 1;
+        if (dif > (c0.difMax || 0)) c0.difMax = dif;
+      }
+    }
+  });
+  espia.ws.on("close", () => { espia.reconex++; setTimeout(espiaConectar, 5000); });
+  espia.ws.on("error", () => {});
+}
+let espiaId = 1000;
+function espiaSuscribir(mint) {
+  if (!ESPIA_ON || espia.ws?.readyState !== WebSocket.OPEN || espia.subs.has(mint)) return;
+  const id = ++espiaId;
+  espia.pend.set(id, mint);
+  // transactionSubscribe (plan Developer) trae los saldos pre/post de cada transacción:
+  // con eso se calcula el precio de la piscina sin decodificar el binario del programa.
+  espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe",
+    params: [{ accountInclude: [mint], failed: false, vote: false },
+             { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] }));
+  if (!espia.cuenta.has(mint)) espia.cuenta.set(mint, { helius: 0, portal: 0, t0: Date.now(), ultH: 0, ultP: 0, sym: "" });
+}
+function espiaDesuscribir(mint) {
+  if (!ESPIA_ON) return;
+  const sub = espia.subs.get(mint);
+  if (sub && espia.ws?.readyState === WebSocket.OPEN) {
+    espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++espiaId, method: "transactionUnsubscribe", params: [sub] }));
+  }
+  espia.subs.delete(mint);
+}
+// ping cada minuto: Helius cierra los sockets ociosos a los 10
+setInterval(() => { try { if (espia.ws?.readyState === WebSocket.OPEN) espia.ws.ping(); } catch {} }, 60_000);
+
+// informe cada 10 minutos: solo los tokens donde las dos fuentes discrepan
+setInterval(() => {
+  if (!ESPIA_ON || !espia.cuenta.size) return;
+  const filas = [];
+  for (const [mint, c0] of espia.cuenta) {
+    const vivo = state.liveRecordings.has(mint);
+    const mudoP = c0.ultP && Date.now() - c0.ultP > 90_000;
+    const mudoH = c0.ultH && Date.now() - c0.ultH > 90_000;
+    const dm = c0.difN ? (c0.difSum / c0.difN) : null;
+    filas.push(`${shortAddr(mint)}:P${c0.portal}/H${c0.helius}${dm != null ? `·Δ${dm.toFixed(2)}%` : ""}${mudoP && !mudoH ? "⚠️PORTAL-MUDO" : ""}${mudoH && !mudoP ? "·helius-mudo" : ""}${vivo ? "" : "·cerrada"}`);
+    if (!vivo && Date.now() - c0.t0 > 30 * 60_000) espia.cuenta.delete(mint);
+  }
+  const tot = [...espia.cuenta.values()].reduce((a, x) => ({ p: a.p + x.portal, h: a.h + x.helius }), { p: 0, h: 0 });
+  const dTot = [...espia.cuenta.values()].filter(x => x.difN);
+  const difMedia = dTot.length ? (dTot.reduce((a, x) => a + x.difSum / x.difN, 0) / dTot.length) : null;
+  const difPeor = dTot.length ? Math.max(...dTot.map(x => x.difMax || 0)) : null;
+  addLog(`[ESPIA] portal=${tot.p} helius=${tot.h} · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
+    + (difMedia != null ? ` · PRECIO: dif media ${difMedia.toFixed(2)}% · peor ${difPeor.toFixed(2)}% (${dTot.length} tokens)` : " · PRECIO: sin comparaciones aún")
+    + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · con saldos ${espia.conSaldos || 0}/${(espia.conSaldos || 0) + (espia.sinSaldos || 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
+}, 10 * 60_000);
+
+if (ESPIA_ON) setTimeout(espiaConectar, 8000);
 
 // ═══ [1-ago] VIGILANTE DEL FEED ═══
 // Sintoma real (31-jul): el WS quedo zombi a las 6:00 — conectado, sin cerrarse y sin recibir
