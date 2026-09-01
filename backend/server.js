@@ -494,7 +494,7 @@ const ESPIA_RELEVO_MS = 25_000;
 // ahora daba PumpPortal. Sus ticks siguen contándose para poder comparar, pero ya no graban.
 // Motivo: el espía midió precio equivalente (1.8% de diferencia), 5-6% más de swaps vistos y
 // tokens enteros donde PumpPortal enmudecía. Además subscribeTokenTrade se paga en SOL.
-const HELIUS_PRIMARIO = true;
+const HELIUS_PRIMARIO = process.env.HELIUS_PRIMARIO === "1";
 const HELIUS_CAIDO_MS = 45_000;   // sin swaps de Helius durante este tiempo ⇒ vuelve PumpPortal
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
@@ -2945,7 +2945,15 @@ setInterval(async () => {
   for (const t of state.demoTrades) if (t.status === "OPEN") mints.add(t.mint);
   for (const t of state.realTrades) if (t.status === "OPEN") mints.add(t.mint);
   for (const mint of mints) {
-    const last = lastTickAt.get(mint) || 0;
+    // [1-sep] el rescate debe mirar a la fuente que de verdad alimenta la cámara. Con Helius
+    // de principal, los ticks de PumpPortal ya no graban: si nos guiáramos por ellos, el
+    // rescate no saltaría nunca aunque Helius estuviera mudo, y saltaría de más cuando el
+    // que calla es PumpPortal (con Helius dando precios perfectamente).
+    let last = lastTickAt.get(mint) || 0;
+    if (HELIUS_PRIMARIO) {
+      const cH = espia.cuenta.get(mint);
+      last = cH ? (cH.ultH || 0) : 0;
+    }
     if (now - last < RESCUE_SILENCE_MS) continue;
     if (now - (lastRescueAt.get(mint) || 0) < RESCUE_COOLDOWN_MS) continue;
     lastRescueAt.set(mint, now);
@@ -3078,10 +3086,20 @@ function espiaConectar() {
         hVol = Math.abs(d) * (solPriceUSD || 0);
       }
       c0.ultSol = sol;
-      const keys = m.params?.result?.transaction?.transaction?.message?.accountKeys;
-      if (Array.isArray(keys)) {
-        const firm = keys.find(k => k && k.signer);
-        hTrader = firm ? (firm.pubkey || firm) : (typeof keys[0] === "string" ? keys[0] : keys[0]?.pubkey || null);
+      // [1-sep] OJO con la ruta: con transactionDetails:"accounts" las cuentas NO cuelgan de
+      // message, sino directamente de transaction.accountKeys. Buscarlas donde no están dejaba
+      // hTrader a null y con Helius de fuente principal el wash y los compradores salían a CERO
+      // (o sea: el filtro de wash dejaba pasar todo). Probamos las dos formas.
+      const tr = m.params?.result?.transaction?.transaction;
+      const keys = tr?.accountKeys || tr?.message?.accountKeys;
+      if (Array.isArray(keys) && keys.length) {
+        const firm = keys.find(k => k && typeof k === "object" && k.signer);
+        hTrader = firm ? (firm.pubkey || null)
+                : (typeof keys[0] === "string" ? keys[0] : (keys[0]?.pubkey || null));
+      }
+      if (!hTrader && !espia.avisoSinCartera) {
+        espia.avisoSinCartera = true;
+        addLog("⚠️ ESPÍA: no encuentro la cartera en los mensajes de Helius — el wash y los compradores quedarían a cero", "warn");
       }
     }
     {
