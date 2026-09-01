@@ -474,7 +474,28 @@ const ESPIA_ON = process.env.ESPIA_ON !== "0" && !!HELIUS_API_KEY;
 // Sin esto, 153 de 292 grabaciones se truncaban con el token vivo y los paquetes abiertos
 // se liquidaban a mercado sin motivo. Si Helius falla, todo vuelve al comportamiento de antes.
 const ESPIA_ALIMENTA = process.env.ESPIA_ALIMENTA !== "0";
+
+// ── [1-sep] MAYHEM MODE de pump.fun ──────────────────────────────────────────────
+// Tokens creados con esa opción reciben 1.000 millones de tokens EXTRA (2.000 en total)
+// que un agente de IA usa para comprar y vender AL AZAR durante sus primeras 24 horas.
+// Nos afecta de tres formas: (1) el MC nos salía a la mitad, porque lo calculábamos con
+// 1.000 millones de supply; (2) el wash y los compradores se inflan con un bot; (3) los
+// pivotes y la envolvente leen un paseo aleatorio, no un mercado.
+// De momento solo se DETECTA y se apunta; el veto se enciende cuando los datos lo digan.
+const MAYHEM_VETO = process.env.MAYHEM_VETO === "1";
+const supplyCache = new Map();   // mint → { supply, mayhem }
+// el MC se calculaba SIEMPRE con 1.000 millones de supply. En un token Mayhem el supply es
+// el doble, así que el MC real es el doble del que veíamos y los filtros de MC decidían con
+// la mitad del valor. Esta función devuelve el supply que toca en cada caso.
+const supplyDe = (mint) => (supplyCache.get(mint)?.supply) || 1_000_000_000;
 const ESPIA_RELEVO_MS = 25_000;
+// [1-sep] HELIUS COMO FUENTE PRINCIPAL de la cámara. Con esto encendido, cada swap que llega
+// de Helius alimenta la grabación con precio, cartera, dirección y volumen — todo lo que hasta
+// ahora daba PumpPortal. Sus ticks siguen contándose para poder comparar, pero ya no graban.
+// Motivo: el espía midió precio equivalente (1.8% de diferencia), 5-6% más de swaps vistos y
+// tokens enteros donde PumpPortal enmudecía. Además subscribeTokenTrade se paga en SOL.
+const HELIUS_PRIMARIO = true;
+const HELIUS_CAIDO_MS = 45_000;   // sin swaps de Helius durante este tiempo ⇒ vuelve PumpPortal
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
@@ -891,6 +912,22 @@ setInterval(async () => {
 // filtro de entrada por holders pueda usarlo, y (b) registra top5Pct y top10Pct
 // (la concentración del top-5/top-10 delata al deployer con el supply repartido
 // en varias wallets; el topPct del top-1 solo demostró no separar nada).
+// [1-sep] supply real del token: 2.000 millones ⇒ Mayhem Mode. Una llamada por migración.
+async function miraSupply(mint) {
+  if (supplyCache.has(mint)) return supplyCache.get(mint);
+  let r = { supply: null, mayhem: false };
+  try {
+    if (connection) {
+      const s = await connection.getTokenSupply(new PublicKey(mint));
+      const n = s?.value?.uiAmount;
+      if (n > 0) r = { supply: n, mayhem: n > 1.5e9 };
+    }
+  } catch {}
+  supplyCache.set(mint, r);
+  if (supplyCache.size > 2000) supplyCache.delete(supplyCache.keys().next().value);
+  return r;
+}
+
 async function registrarCalidadPremig(mint, symbol) {
   try {
     if (!connection) { addLog(`[PREMIG] sym=${symbol} mint=${mint} edad=sin-conexion`, "info"); return; }
@@ -1033,6 +1070,12 @@ function migStartWatching(coin) {
   state.stats.mig_migrations++;
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
   registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
+  miraSupply(coin.mint).then(s => {                        // [1-sep] ¿es un token Mayhem?
+    const e = state.migWatching.get(coin.mint);
+    if (!e) return;
+    e.supply = s.supply; e.mayhem = s.mayhem;
+    if (s.mayhem) addLog(`🤖 MAYHEM: ${e.symbol} tiene supply de ${Math.round(s.supply / 1e6)}M — el agente de pump.fun opera al azar 24h${MAYHEM_VETO ? " → DESCARTADA" : " (solo anotado)"}`, "warn");
+  }).catch(() => {});
   const mcUsd = (coin.marketCapSol || 0) * solPriceUSD;
   const mcMin = OBSERVER_MODE ? OBS_MIN_MC : MIG_MIN_MC;
   const mcMax = OBSERVER_MODE ? Infinity : MIG_MAX_MC;
@@ -1099,13 +1142,13 @@ function migUpdateWatching(mint, price, solAmount, entry) {
   broadcast({ event: "migWatchUpdate", data: {
     mint, symbol: entry.symbol, volumeUSD: entry.volumeUSD, tradeCount: entry.tradeCount,
     needed: elapsed < MIG_FAST_WINDOW_MS ? MIG_VOL_FAST_EFF : MIG_VOL_SLOW_EFF,   // [28-ago] usaban constantes borradas
-    timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed), mc: price * 1_000_000_000,
+    timeLeft: Math.max(0, MIG_WINDOW_MS - elapsed), mc: price * supplyDe(mint),
   }});
 }
 
 function migQualityGateThenOpen(entry, entryPriceB) {
   // Tope de MC de entrada: se aplica SIEMPRE, con o sin qual_gate.
-  const mcEntryUsdPre = entryPriceB * 1_000_000_000;
+  const mcEntryUsdPre = entryPriceB * supplyDe(entry.mint);   // [1-sep] supply real (Mayhem = 2.000M)
   if (mcEntryUsdPre > MIG_MAX_MC_ENTRY) {
     addLog(`🛑 MIG MC ALTO: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsdPre)} > tope ${formatMC(MIG_MAX_MC_ENTRY)} (riesgo honeypot/pump inflado)`, "filter");
     migRechazada(entry, "MIG MC ALTO"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
@@ -1170,7 +1213,7 @@ function migQualTick(entry, price) {
         migRechazada(entry, "MIG ENTRADA ABORTADA"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
         broadcast({ event: "stats", data: state.stats }); return;
       }
-      const mcEntryUsd = precioB * 1_000_000_000;
+      const mcEntryUsd = precioB * supplyDe(entry.mint);   // [1-sep] supply real (Mayhem = 2.000M)
       if (mcEntryUsd < MIG_MIN_MC_ENTRY) {
         addLog(`🛑 MIG MC BASURA: ${entry.symbol} descartada | MC ${formatMC(mcEntryUsd)} < mínimo ${formatMC(MIG_MIN_MC_ENTRY)} (token glitch/muerto, inejecutable en real)`, "filter");
         migRechazada(entry, "MIG MC BASURA"); state.stats.mig_rejected++; state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
@@ -1263,6 +1306,12 @@ function migRefPrice(entry) {
   return v[v.length >> 1];
 }
 function migExamThenOpen(entry, precioBase) {
+  if (MAYHEM_VETO && entry.mayhem) {
+    addLog(`🤖 MIG MAYHEM: ${entry.symbol} descartada | token con agente de IA operando al azar`, "filter");
+    migRechazada(entry, "MIG MAYHEM"); state.stats.mig_rejected++;
+    state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats }); return;
+  }
   if (!MIG_EX2S_ON) {
     entry.entered = true; state.stats.mig_entered++;
     state.migWatching.delete(entry.mint); entry.firstPrice = precioBase;
@@ -1383,7 +1432,7 @@ function obsSimulaGestionActual(pts) {
 function liveRecStart(entry, entryPrice) {
   if (!LIVE_RECORD || entryPrice <= 0) return;
   const velMs = Date.now() - entry.startTime;
-  const rec = { mint: entry.mint, symbol: entry.symbol, vel: +(velMs/1000).toFixed(1),
+  const rec = { supply: entry.supply || null, mayhem: !!entry.mayhem, mint: entry.mint, symbol: entry.symbol, vel: +(velMs/1000).toFixed(1),
     mc: entry.migratedMcUsd || (entryPrice*1_000_000_000), vol: Math.round(entry.volumeUSD||0),
     t0: Date.now(), entryPrice, puntos: [{t:0,p:0}], lastSample: Date.now(), mov2s: null, sigMov2s: entry.sigMov2s ?? null, sigT: entry.sigT ?? null, ex2s: entry.ex2s ?? null, finished: false,
     volSeg: [], lastVolSec: -1, minP: 0, reentered: false,
@@ -1398,12 +1447,30 @@ function liveRecStart(entry, entryPrice) {
   espiaSuscribir(entry.mint);   // [30-ago] el espía mira el mismo token, sin operar
 }
 
-function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
+function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false, fuente = "pp") {
   if (!LIVE_RECORD) return;
   const rec = state.liveRecordings.get(mint);
   if (!rec || rec.finished || price <= 0) return;
+  if (fuente === "pp" && trader) { const c0 = espia.cuenta.get(mint); if (c0) { c0.portal++; c0.ultP = Date.now(); c0.sym = rec.symbol; } }   // solo ticks reales, no el rescate
+  // [1-sep] con Helius de fuente principal, los ticks de PumpPortal se siguen contando (arriba)
+  // para poder comparar, pero NO graban: si no, cada trade entraría dos veces en la curva.
+  if (HELIUS_PRIMARIO && fuente === "pp") {
+    // RED DE SEGURIDAD: si Helius lleva HELIUS_CAIDO_MS sin traer un solo swap de este token
+    // (se cayó, perdió la suscripción, cambió la piscina...), PumpPortal vuelve a grabar. Sin
+    // esto la cámara se quedaría congelada sin avisar y la unida gestionaría con precio viejo.
+    const cH = espia.cuenta.get(mint);
+    const ultimoH = cH ? (cH.ultH || 0) : 0;
+    const heliusCaido = !ultimoH || Date.now() - ultimoH > HELIUS_CAIDO_MS;
+    if (!heliusCaido) { rec.lastTickAt = Date.now(); return; }
+    if (cH && !cH.avisoCaido) {
+      cH.avisoCaido = true;
+      addLog(`⚠️ HELIUS SIN DATOS en ${rec.symbol} (${Math.round((Date.now() - ultimoH) / 1000)}s) — la cámara vuelve a PumpPortal`, "warn");
+    }
+  } else if (fuente === "helius") {
+    const cH = espia.cuenta.get(mint);
+    if (cH && cH.avisoCaido) { cH.avisoCaido = false; addLog(`✅ Helius vuelve a dar datos en ${rec.symbol}`, "info"); }
+  }
   rec.lastPrice = price; rec.lastTickAt = Date.now();   // [5-ago] último precio · [16-ago] y cuándo, para el vigilante
-  if (trader) { const c0 = espia.cuenta.get(mint); if (c0) { c0.portal++; c0.ultP = Date.now(); c0.sym = rec.symbol; } }   // solo ticks reales, no el rescate
   // [16-ago] TOKEN MUERTO: por debajo de -90% desde la entrada ya no hay nada que observar.
   // Cerramos la cámara, liberamos la suscripción y dejamos de re-suscribir un cadáver.
   if (!rec.finished && rec.entryPrice > 0 && price <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
@@ -1618,6 +1685,10 @@ function uniSampleUno(rec, u, price, pct, tSec) {
           // [27-ago] la variante con filtro solo despliega el relevo en tokens con poco
           // wash del primer minuto (si aún no ha pasado 1 min, se usa lo acumulado).
           const q = calidadEntrada(rec.mint);
+          // [1-sep] anotar el wash que se veía EN ESE INSTANTE. El laboratorio solo tenía el del
+          // minuto completo y lo estimaba como wash60×(t/60); con tokens muy sucios esa estimación
+          // se separaba del recuento real y el cuadre fallaba (9zgcyrfS: real bajo, estimado 119).
+          if (q && rec.washCompra == null) { rec.washCompra = q.wash; rec.washCompraT = t; }
           if (q && q.wash > C.washMax) {
             u.vetado = true; u.mixOn = false;
             addLog(`🧼 ${C.id}: ${rec.symbol} descartada por wash ${q.wash} > ${C.washMax}`, "filter");
@@ -2061,7 +2132,7 @@ function liveRecEmit(mint) {
     const wash = ws.filter(w => w.buys > 0 && w.sells > 0).length;
     wStr = ` buyers60=${buyers.length} topBuyer=${totalBuy > 0 ? (100*topBuy/totalBuy).toFixed(0) : 0}% wash60=${wash}`;
   }
-  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} ex2s=${rec.ex2s!=null?(rec.ex2s>=0?"+":"")+rec.ex2s+"%":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""}${rec.flujo&&rec.flujo.length?` flujo=${rec.flujo.map(x=>`${x.t}:${Math.round(x.v)}:${x.c}:${x.s}:${x.w.size}`).join(",")}`:""} pts=${ptsRaw}`, "rec");
+  addLog(`[MIGREC] sym=${rec.symbol} mint=${rec.mint} vel=${rec.vel}s MC=${formatMC(rec.mc)} vol=${rec.vol} mov2s=${mov2s} sig=${rec.sigMov2s!=null?(rec.sigMov2s>=0?"+":"")+rec.sigMov2s+"%@"+rec.sigT+"s":"n/a"} ex2s=${rec.ex2s!=null?(rec.ex2s>=0?"+":"")+rec.ex2s+"%":"n/a"} MIN=${min.p}%@${min.t}s MAX=${max.p}%@${max.t}s orden=${orden} cruces[10,15,20]=${cruces[0]},${cruces[1]},${cruces[2]} cierre_real=${cd!=null?(cd>=0?"+":"")+cd:"n/a"}% dur_rec=${pts[pts.length-1].t}s volPost=${Math.round(rec.volPost||0)}${wStr}${vol60?` vol60=${vol60}`:""}${rec.washCompra!=null?` washCompra=${rec.washCompra}@${rec.washCompraT}s`:""}${rec.supply?` supply=${Math.round(rec.supply/1e6)}M mayhem=${rec.mayhem?1:0}`:""}${rec.flujo&&rec.flujo.length?` flujo=${rec.flujo.map(x=>`${x.t}:${Math.round(x.v)}:${x.c}:${x.s}:${x.w.size}`).join(",")}`:""} pts=${ptsRaw}`, "rec");
   try { shadowProcesa(rec); } catch (e) { if (!state._shErr) { state._shErr = true; addLog(`⚠️ shadowProcesa error: ${e.message}`, "warn"); } }   // [v11.9]
   labStats.migrecs++;
 }
@@ -2901,6 +2972,7 @@ setInterval(async () => {
 // ═══ [30-ago] ESPÍA: Helius en paralelo, solo mide ═══
 const espia = {
   ws: null, subs: new Map(),        // mint → id de suscripción
+  porSub: new Map(),                // id de suscripción → mint (varios ids pueden apuntar al mismo)
   pend: new Map(),                  // id de petición → mint
   cuenta: new Map(),                // mint → { helius, portal, t0, ultH, ultP }
   reconex: 0, credEst: 0,
@@ -2911,7 +2983,8 @@ function espiaConectar() {
   espia.ws = new WebSocket(HELIUS_WS);
   espia.ws.on("open", () => {
     addLog("🕵️ ESPÍA Helius conectado", "info");
-    espia.subs.clear();
+    espia.subs.clear(); espia.porSub.clear();
+    for (const c1 of espia.cuenta.values()) c1.atada = false;   // al reconectar hay que volver a atar
     for (const mint of state.liveRecordings.keys()) espiaSuscribir(mint);
   });
   espia.ws.on("message", (raw) => {
@@ -2926,12 +2999,15 @@ function espiaConectar() {
         return;
       }
       espia.subs.set(mintP, m.result);
+      espia.porSub.set(m.result, mintP);
       return;
     }
     if (m.method !== "transactionNotification" && m.method !== "logsNotification") return;
+    // [1-sep] búsqueda por id: al atar un token a su piscina se crea una suscripción nueva y
+    // se da de baja la vieja. Si solo mirásemos el mapa mint→id, los mensajes que llegan en ese
+    // hueco se perderían. Con el mapa inverso, los dos ids siguen apuntando al mismo token.
     const sub = m.params?.subscription;
-    let mint = null;
-    for (const [k, v] of espia.subs) if (v === sub) { mint = k; break; }
+    const mint = espia.porSub.get(sub);
     if (!mint) return;
     const c0 = espia.cuenta.get(mint);
     if (!c0) return;
@@ -2982,6 +3058,32 @@ function espiaConectar() {
     if (c0.ultReservas === clave) return;
     c0.ultReservas = clave;
     c0.swaps = (c0.swaps || 0) + 1;                 // esto sí es comparable con un tick de PumpPortal
+    // [1-sep] lo que hasta ahora solo daba PumpPortal, sacado de la propia transacción:
+    //  · dirección: si la reserva de WSOL de la piscina SUBE, alguien metió SOL → fue una COMPRA
+    //  · volumen: cuánto SOL se movió, pasado a dólares
+    //  · cartera: el firmante de la transacción
+    let hVol = 0, hCompra = false, hTrader = null;
+    {
+      let solAntes = null;
+      const pre = meta?.preTokenBalances;
+      if (Array.isArray(pre)) {
+        for (const b of pre) if (b.mint === WSOL_MINT && b.owner === c0.pool) {
+          solAntes = +(b.uiTokenAmount?.uiAmountString || b.uiTokenAmount?.uiAmount || 0);
+        }
+      }
+      if (solAntes == null && c0.ultSol != null) solAntes = c0.ultSol;
+      if (solAntes != null) {
+        const d = sol - solAntes;
+        hCompra = d > 0;
+        hVol = Math.abs(d) * (solPriceUSD || 0);
+      }
+      c0.ultSol = sol;
+      const keys = m.params?.result?.transaction?.transaction?.message?.accountKeys;
+      if (Array.isArray(keys)) {
+        const firm = keys.find(k => k && k.signer);
+        hTrader = firm ? (firm.pubkey || firm) : (typeof keys[0] === "string" ? keys[0] : keys[0]?.pubkey || null);
+      }
+    }
     {
       // la piscina da SOL por token; PumpPortal manda DÓLARES por token (de ahí el 99% de "diferencia"
       // que salía en los primeros informes: era el cambio SOL→USD, no un desacuerdo de precios).
@@ -2993,14 +3095,18 @@ function espiaConectar() {
         c0.difSum = (c0.difSum || 0) + dif; c0.difN = (c0.difN || 0) + 1;
         if (dif > (c0.difMax || 0)) c0.difMax = dif;
       }
-      // RELEVO: si PumpPortal lleva callado en este token, que la cámara siga viva con Helius.
-      // liveRecSample sin 'trader' no cuenta como tick del portal ni ensucia el wash ni el flujo.
-      if (ESPIA_ALIMENTA && rec0 && !rec0.finished && c0.precioH > 0
-          && Date.now() - (rec0.lastTickAt || 0) > ESPIA_RELEVO_MS) {
-        const primera = !c0.relevo;
-        c0.relevo = (c0.relevo || 0) + 1;
-        if (primera) addLog(`🩺 RELEVO HELIUS: ${rec0.symbol} — PumpPortal lleva ${Math.round((Date.now() - (rec0.lastTickAt || 0)) / 1000)}s mudo, la cámara sigue con Helius`, "warn");
-        try { liveRecSample(mint, c0.precioH); } catch {}
+      // La cámara come de Helius: siempre si es la fuente principal; si no, solo cuando
+      // PumpPortal lleva callado (relevo). Con cartera y dirección, el wash y el flujo salen igual.
+      if (rec0 && !rec0.finished && c0.precioH > 0) {
+        const mudo = Date.now() - (rec0.lastTickAt || 0) > ESPIA_RELEVO_MS;
+        if (HELIUS_PRIMARIO || (ESPIA_ALIMENTA && mudo)) {
+          if (mudo && !HELIUS_PRIMARIO) {
+            const primera = !c0.relevo;
+            c0.relevo = (c0.relevo || 0) + 1;
+            if (primera) addLog(`🩺 RELEVO HELIUS: ${rec0.symbol} — PumpPortal lleva ${Math.round((Date.now() - (rec0.lastTickAt || 0)) / 1000)}s mudo, la cámara sigue con Helius`, "warn");
+          }
+          try { liveRecSample(mint, c0.precioH, hVol, hTrader, hCompra, "helius"); } catch {}
+        }
       }
     }
   });
@@ -3029,7 +3135,7 @@ function espiaAtarAPiscina(mint, pool) {
   c0.atada = true;
   const viejo = espia.subs.get(mint);
   if (viejo) espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++espiaId, method: "transactionUnsubscribe", params: [viejo] }));
-  espia.subs.delete(mint);
+  espia.subs.delete(mint);   // (el mapa por id se mantiene: el viejo sigue resolviendo al token)
   const id = ++espiaId;
   espia.pend.set(id, mint);
   espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe",
@@ -3045,6 +3151,7 @@ function espiaDesuscribir(mint) {
     espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++espiaId, method: "transactionUnsubscribe", params: [sub] }));
   }
   espia.subs.delete(mint);
+  for (const [id, mi] of espia.porSub) if (mi === mint) espia.porSub.delete(id);
 }
 // ping cada minuto: Helius cierra los sockets ociosos a los 10
 setInterval(() => { try { if (espia.ws?.readyState === WebSocket.OPEN) espia.ws.ping(); } catch {} }, 60_000);
