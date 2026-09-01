@@ -469,6 +469,12 @@ const PUMPPORTAL_API_KEY = process.env.PUMPPORTAL_API_KEY || "";
 // deja de mandar los trades de un token (153 grabaciones truncadas en 12 días),
 // ¿los sigue viendo Helius? Si la respuesta es sí, la cámara debe cambiar de fuente.
 const ESPIA_ON = process.env.ESPIA_ON !== "0" && !!HELIUS_API_KEY;
+// [1-sep] el espía deja de ser solo observador: cuando PumpPortal lleva callado más de
+// ESPIA_RELEVO_MS en un token, Helius alimenta la cámara con el precio de la piscina.
+// Sin esto, 153 de 292 grabaciones se truncaban con el token vivo y los paquetes abiertos
+// se liquidaban a mercado sin motivo. Si Helius falla, todo vuelve al comportamiento de antes.
+const ESPIA_ALIMENTA = process.env.ESPIA_ALIMENTA !== "0";
+const ESPIA_RELEVO_MS = 25_000;
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
@@ -1453,9 +1459,14 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false) {
     if (!rec.flujo) rec.flujo = [];
     let fx = rec.flujo[rec.flujo.length - 1];
     if (!fx || fx.t !== cubo) { fx = { t: cubo, v: 0, c: 0, s: 0, w: new Set() }; rec.flujo.push(fx); }
-    fx.v += volUSD || 0;
-    if (isBuy) fx.c++; else fx.s++;
-    if (trader) fx.w.add(trader);
+    // OJO: los precios que pone el relevo de Helius (o el rescate) llegan sin 'trader'. No son
+    // trades: si los contáramos, cada uno sumaría una VENTA falsa y ensuciaría justo el dato
+    // que sirve para detectar acumulación. Solo cuentan los ticks con cartera.
+    if (trader) {
+      fx.v += volUSD || 0;
+      if (isBuy) fx.c++; else fx.s++;
+      fx.w.add(trader);
+    }
     if (rec.flujo.length > 480) rec.flujo.shift();   // tope: 4 horas
   }
   uniSample(rec, price, pct, Math.round(dt/1000));     // [23-ago] 🤝 UNIDA: decide en cadencia de muestra
@@ -2027,6 +2038,7 @@ function liveRecEmit(mint) {
     if (c0) addLog(`[ESPIA-FIN] ${rec.symbol} dur=${rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length-1].t : 0}s · portal=${c0.portal} helius-swaps=${c0.swaps || 0} (${c0.helius}tx)`
       + (c0.difN ? ` · precio dif media ${(c0.difSum / c0.difN).toFixed(2)}% peor ${(c0.difMax || 0).toFixed(2)}%` : "")
       + ((c0.swaps || 0) > c0.portal * 1.2 ? " ⚠️ HELIUS VIO MÁS" : "")
+      + (c0.relevo ? ` · 🩺 ${c0.relevo} precios puestos por Helius` : "")
       + (c0.precioH && rec.lastPrice ? ` · último precio H=${c0.precioH.toPrecision(4)} P=${rec.lastPrice.toPrecision(4)}` : ""), "info"); }
   espiaDesuscribir(mint);
   const pts = rec.puntos;
@@ -2962,7 +2974,7 @@ function espiaConectar() {
     } else {                                        // aún no: el owner con token+WSOL y más tokens
       let mejor = null;
       for (const [owner, o] of porOwner) if (o.tok > 0 && o.sol > 0 && (!mejor || o.tok > mejor.o.tok)) mejor = { owner, o };
-      if (mejor) { c0.pool = mejor.owner; tok = mejor.o.tok; sol = mejor.o.sol; }
+      if (mejor) { c0.pool = mejor.owner; tok = mejor.o.tok; sol = mejor.o.sol; espiaAtarAPiscina(mint, c0.pool); }
     }
     if (!(tok > 0 && sol > 0)) return;              // no es una transacción de la piscina
     // ¿han cambiado de verdad las reservas? si no, la transacción tocó la piscina pero no operó
@@ -2981,6 +2993,15 @@ function espiaConectar() {
         c0.difSum = (c0.difSum || 0) + dif; c0.difN = (c0.difN || 0) + 1;
         if (dif > (c0.difMax || 0)) c0.difMax = dif;
       }
+      // RELEVO: si PumpPortal lleva callado en este token, que la cámara siga viva con Helius.
+      // liveRecSample sin 'trader' no cuenta como tick del portal ni ensucia el wash ni el flujo.
+      if (ESPIA_ALIMENTA && rec0 && !rec0.finished && c0.precioH > 0
+          && Date.now() - (rec0.lastTickAt || 0) > ESPIA_RELEVO_MS) {
+        const primera = !c0.relevo;
+        c0.relevo = (c0.relevo || 0) + 1;
+        if (primera) addLog(`🩺 RELEVO HELIUS: ${rec0.symbol} — PumpPortal lleva ${Math.round((Date.now() - (rec0.lastTickAt || 0)) / 1000)}s mudo, la cámara sigue con Helius`, "warn");
+        try { liveRecSample(mint, c0.precioH); } catch {}
+      }
     }
   });
   espia.ws.on("close", () => { espia.reconex++; setTimeout(espiaConectar, 5000); });
@@ -2998,6 +3019,25 @@ function espiaSuscribir(mint) {
              { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] }));
   if (!espia.cuenta.has(mint)) espia.cuenta.set(mint, { helius: 0, portal: 0, t0: Date.now(), ultH: 0, ultP: 0, sym: "" });
 }
+// [1-sep] al conocer la piscina cambiamos la suscripción del MINT a la PISCINA: solo llegan
+// las transacciones que la tocan (los swaps), no transferencias ni bots. Medido en los logs:
+// de 44.300 transacciones solo 6.790 eran swaps → alrededor del 85% menos de datos.
+function espiaAtarAPiscina(mint, pool) {
+  if (!ESPIA_ON || !pool || espia.ws?.readyState !== WebSocket.OPEN) return;
+  const c0 = espia.cuenta.get(mint);
+  if (!c0 || c0.atada) return;
+  c0.atada = true;
+  const viejo = espia.subs.get(mint);
+  if (viejo) espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++espiaId, method: "transactionUnsubscribe", params: [viejo] }));
+  espia.subs.delete(mint);
+  const id = ++espiaId;
+  espia.pend.set(id, mint);
+  espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe",
+    params: [{ accountInclude: [pool], failed: false, vote: false },
+             { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] }));
+  addLog(`🕵️ ESPÍA: ${shortAddr(mint)} atado a su piscina ${shortAddr(pool)} (menos tráfico)`, "info");
+}
+
 function espiaDesuscribir(mint) {
   if (!ESPIA_ON) return;
   const sub = espia.subs.get(mint);
@@ -3027,7 +3067,7 @@ setInterval(() => {
   const difPeor = dTot.length ? Math.max(...dTot.map(x => x.difMax || 0)) : null;
   addLog(`[ESPIA] portal=${tot.p} helius-swaps=${tot.h} (de ${tot.tx} tx) · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
     + (difMedia != null ? ` · PRECIO: dif media ${difMedia.toFixed(2)}% · peor ${difPeor.toFixed(2)}% (${dTot.length} tokens)` : " · PRECIO: sin comparaciones aún")
-    + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · repes=${[...espia.cuenta.values()].reduce((a, x) => a + (x.repes || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
+    + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · relevos=${[...espia.cuenta.values()].reduce((a, x) => a + (x.relevo || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
 
 if (ESPIA_ON) setTimeout(espiaConectar, 8000);
