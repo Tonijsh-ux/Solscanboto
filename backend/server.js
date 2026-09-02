@@ -847,7 +847,12 @@ function unsubscribeToken(mint) {
   // GUARD anti-ceguera: no desuscribir si el mint sigue en uso por otra parte del sistema
   if (state.migMonitored.has(mint)) return;
   if (state.migWatching.has(mint)) return;
-  if (state.liveRecordings.has(mint)) return;   // LAB: grabación extendida activa
+  if (state.liveRecordings.has(mint)) {   // LAB: grabación extendida activa
+    const r0 = state.liveRecordings.get(mint);
+    if (r0 && !r0._avisoDesus) { r0._avisoDesus = true;
+      addLog(`🛡️ alguien intentó desuscribir ${r0.symbol} con la cámara viva — bloqueado (el fallo de las 292s)`, "info"); }
+    return;
+  }
   if (state.obsRecordings?.has?.(mint)) return;
   if (state.realTrades.some(t => t.mint === mint && (t.status === "OPEN" || t.status === "CLOSING"))) return;
   if (state.demoTrades.some(t => t.mint === mint && t.status === "OPEN")) return;   // [v11.9] demo vivos del mismo mint
@@ -1441,7 +1446,7 @@ function liveRecStart(entry, entryPrice) {
   // [16-ago] TOPE DESDE EL MINUTO CERO. Antes el temporizador solo nacía en liveRecFinish (al cerrar
   // una op): si la op no cerraba nunca —y ya no hay expiración— la cámara grababa sin límite,
   // acumulando puntos y suscripción para siempre. Al cerrar se reprograma con la ventana correcta.
-  rec._emitTimer = setTimeout(() => liveRecEmit(entry.mint), MIG_HARD_MAX_MS);
+  rec._emitTimer = setTimeout(() => liveRecEmit(entry.mint, 'tope 6h'), MIG_HARD_MAX_MS);
   rec._ventanaMin = Math.round(MIG_HARD_MAX_MS / 60000);
   uniInit(rec, entryPrice);   // [23-ago] 🤝 UNIDA: pierna bot dentro desde la entrada
   espiaSuscribir(entry.mint);   // [30-ago] el espía mira el mismo token, sin operar
@@ -1475,8 +1480,8 @@ function liveRecSample(mint, price, volUSD = 0, trader = null, isBuy = false, fu
   // Cerramos la cámara, liberamos la suscripción y dejamos de re-suscribir un cadáver.
   if (!rec.finished && rec.entryPrice > 0 && price <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
     const caida = ((price / rec.entryPrice - 1) * 100).toFixed(1);
-    addLog(`⚰️ TOKEN MUERTO: ${rec.symbol} a ${caida}% de la entrada — cámara cerrada y suscripción liberada`, "info");
-    liveRecEmit(mint);
+    addLog(`⚰️ TOKEN MUERTO: ${rec.symbol} a ${caida}% de la entrada — cámara cerrada · precio=${price.toPrecision(4)} entrada=${rec.entryPrice.toPrecision(4)} fuente=${fuente}`, "warn");
+    liveRecEmit(mint, 'muerto -90%');
     return;
   }
   // [5-ago] seguimiento post-cierre: cuánto se movió el token DESDE que vendimos
@@ -2040,13 +2045,13 @@ setInterval(() => {
     // umbral de muerte, o llevamos muchos reintentos sin éxito, se cierra la cámara.
     if (rec.lastPrice && rec.entryPrice > 0 && rec.lastPrice <= rec.entryPrice * (1 - MUERTO_PCT / 100)) {
       addLog(`⚰️ TOKEN MUERTO (mudo): ${rec.symbol} — cámara cerrada, no se re-suscribe`, "info");
-      liveRecEmit(mint); continue;
+      liveRecEmit(mint, 'muerto mudo'); continue;
     }
     const ultimo = rec.lastTickAt || rec.t0;
     if (Date.now() - ultimo > 90_000) {
       if ((rec.resubs || 0) >= 5) {   // 5 intentos sin recuperar ticks: darlo por perdido
         addLog(`🔇 SIN TICKS: ${rec.symbol} tras ${rec.resubs} re-suscripciones — cámara cerrada`, "warn");
-        liveRecEmit(mint); continue;
+        liveRecEmit(mint, 'sin ticks'); continue;
       }
       mudos.push(mint); rec.resubs = (rec.resubs || 0) + 1; rec.lastTickAt = Date.now();
     }
@@ -2099,10 +2104,21 @@ function emitirVeredicto(mint, rec) {
     + `(ahora ${p.ultimo >= 0 ? "+" : ""}${p.ultimo}%) → ${veredicto === "pronto" ? "❌ vendimos PRONTO" : veredicto === "repunte" ? "✅ buen cierre (repuntó y murió)" : veredicto === "justo" ? "🟡 justo" : "✅ buen cierre"}`, "rec");
 }
 
-function liveRecEmit(mint) {
+function liveRecEmit(mint, motivo = "?") {
   const rec = state.liveRecordings.get(mint);
   if (rec && rec.post) emitirVeredicto(mint, rec);   // [5-ago]
   if (!rec || rec.finished) return;
+  // [2-sep] TRAZA: 14 cámaras se apagaron con el token vivo y los ticks llegando cada 2-3s,
+  // sin dejar ni una línea en el log. Hasta saber quién las cierra no se puede arreglar.
+  {
+    const dur = rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length - 1].t : 0;
+    const pct = (rec.lastPrice && rec.entryPrice) ? ((rec.lastPrice / rec.entryPrice - 1) * 100).toFixed(1) : "?";
+    const mudez = Math.round((Date.now() - (rec.lastTickAt || rec.t0)) / 1000);
+    const ab = state.demoTrades.filter(t => t.mint === mint && t.status === "OPEN");
+    const abiertas = ab.length;
+    const porEstr = ab.reduce((a, t) => { a[t.strategy] = (a[t.strategy] || 0) + 1; return a; }, {});
+    addLog(`🎬 CÁMARA CERRADA (${motivo}): ${rec.symbol} · dur=${dur}s · precio ${pct}% · ${mudez}s desde el último tick · ${abiertas} abiertas ${JSON.stringify(porEstr)} · resubs=${rec.resubs || 0} · cierreDemo=${rec.cierreDemo != null ? "sí" : "no"} · ventana=${rec._ventanaMin || "-"}min`, "warn");
+  }
   uniFinish(rec);   // [23-ago] 🤝 UNIDA: cerrar posiciones vivas antes de apagar la cámara
   rec.finished = true; state.liveRecordings.delete(mint); unsubscribeToken(mint);
   { const c0 = espia.cuenta.get(mint);   // [30-ago] veredicto del espía al cerrar la cámara
@@ -2179,13 +2195,13 @@ function liveRecFinish(mint, cierreRealPct) {
   // Si ya cerró, seguimos grabando LAB_EXTEND (2h) para ver qué hizo el token después de vender.
   const ventana = sigueAbierta ? MIG_HARD_MAX_MS : LAB_EXTEND_MS;
   const restante = (rec.t0 + ventana) - Date.now();
-  if (restante <= 0) { liveRecEmit(mint); return; }
+  if (restante <= 0) { liveRecEmit(mint, 'ventana agotada'); return; }
   // [16-ago] REPROGRAMAR SIEMPRE. Antes se creaba el timer una sola vez (`if (!rec._emitTimer)`),
   // así que si la op cerraba con la re-caza aún abierta se fijaba la ventana de 6h y ya no se
   // recortaba al cerrar esta: la cámara seguía horas sobre un token muerto, gastando suscripción.
   // Y al revés, si la ventana debía ampliarse (re-caza que entra después), tampoco se ampliaba.
   if (rec._emitTimer) clearTimeout(rec._emitTimer);
-  rec._emitTimer = setTimeout(() => liveRecEmit(mint), restante);
+  rec._emitTimer = setTimeout(() => liveRecEmit(mint, 'fin de ventana'), restante);
   rec._ventanaMin = Math.round(ventana / 60000);
 }
 
