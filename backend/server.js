@@ -3132,7 +3132,11 @@ function espiaConectar() {
       // La cámara come de Helius: siempre si es la fuente principal; si no, solo cuando
       // PumpPortal lleva callado (relevo). Con cartera y dirección, el wash y el flujo salen igual.
       if (rec0 && !rec0.finished && c0.precioH > 0) {
-        const mudo = Date.now() - (rec0.lastTickAt || 0) > ESPIA_RELEVO_MS;
+        // [2-sep] el mudez se mide con el ÚLTIMO TICK DE PUMPPORTAL (c0.ultP), no con
+        // rec.lastTickAt: ese lo actualiza el propio relevo al grabar, así que se estrangulaba
+        // solo y dejaba una muestra cada 25s exactos. Medido en 7Vwj: 404 puntos en 2 horas,
+        // uno cada 25s, y por eso se perdió el pico del token (+331% grabado, ~1M en pump.fun).
+        const mudo = Date.now() - (c0.ultP || rec0.t0 || 0) > ESPIA_RELEVO_MS;
         if (HELIUS_PRIMARIO || (ESPIA_ALIMENTA && mudo)) {
           if (mudo && !HELIUS_PRIMARIO) {
             const primera = !c0.relevo;
