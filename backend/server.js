@@ -258,7 +258,13 @@ const UNI1 = {
   id: "unida",
   bot: UNI_BOT, giro: UNI_GIRO, tau: UNI_TAU, md: UNI_MD, mv: UNI_MV,
   maxlot: UNI_MAXLOT, maxvend: UNI_MAXVEND, rug: UNI_RUG,
-  muertoPct: UNI_MUERTO_PCT, muertoS: UNI_MUERTO_S, washMax: 0, tp: 0, rojaFrac: 1, plazoMin: 0,   // la A, sin cambios
+  muertoPct: UNI_MUERTO_PCT, muertoS: UNI_MUERTO_S, washMax: 0, rojaFrac: 1, plazoMin: 0,
+  // [2-sep] único cambio en la A desde el 23-ago: objetivo de venta al +500%. Es lo más limpio
+  // que hemos medido: 62.1 → 80.8 SOL sobre 371 ops, ganando en las CUATRO ventanas (incluida
+  // la del 1-2 sep, que no se usó para ajustar nada) y con solo 3 disparos. No toca la entrada
+  // ni el resto de salidas. Ojo: la media roja y el plazo, que van en la B, restaban en esa
+  // ventana nueva, así que aquí NO se ponen.
+  tp: 500,
 };
 const UNI_VARIANTES = () => UNI2_ON ? [UNI1, UNI2] : [UNI1];
 
@@ -518,7 +524,11 @@ function initWallet() {
 
 let cachedBalance = 0;
 let lastBalanceFetch = 0;
-const BALANCE_CACHE_MS = 30_000;
+// [2-sep] 30s → 5min. El saldo solo se muestra en el panel (estamos en demo), y con el
+// WebSocket de Helius moviendo ~1,6 GB/día por la misma clave, las consultas sueltas
+// rebotaban con 500. Menos llamadas = menos rechazos y menos ruido en el log.
+const BALANCE_CACHE_MS = 300_000;
+let balanceFallos = 0;
 
 async function getWalletBalance(force = false) {
   if (!wallet || !connection) return cachedBalance;
@@ -528,11 +538,22 @@ async function getWalletBalance(force = false) {
     try {
       cachedBalance = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
       lastBalanceFetch = Date.now();
+      if (balanceFallos >= 5) addLog(`✅ el saldo vuelve a leerse (${cachedBalance.toFixed(4)} SOL)`, "info");
+      balanceFallos = 0;
       return cachedBalance;
     }
     catch (e) {
-      if (i < 2) { await new Promise(r => setTimeout(r, 2000)); }
-      else { addLog(`⚠️ getWalletBalance falló 3 veces: ${e.message}`, "warn"); return cachedBalance; }
+      // espera creciente: 1s, 3s. Un 500 de Helius suele ser un bache de segundos.
+      if (i < 2) { await new Promise(r => setTimeout(r, 1000 * (i + 1) * (i + 1))); }
+      else {
+        balanceFallos++;
+        lastBalanceFetch = Date.now();   // no reintentar en bucle: espera el ciclo completo
+        // el aviso, solo la primera vez y luego cada 10, para no llenar el log
+        if (balanceFallos === 1 || balanceFallos % 10 === 0) {
+          addLog(`⚠️ no se puede leer el saldo (${balanceFallos} veces): ${String(e.message).slice(0, 60)} — se sigue usando ${cachedBalance.toFixed(4)} SOL`, "warn");
+        }
+        return cachedBalance;
+      }
     }
   }
   return cachedBalance;
@@ -899,9 +920,12 @@ async function updateSolPrice() {
 setInterval(updateSolPrice, 60_000);
 updateSolPrice();
 
+// [2-sep] el panel refrescaba el saldo cada 30s aunque la caché dure 5min: eran llamadas
+// inútiles que se comían el cupo y rebotaban con 500. Ahora va al mismo ritmo que la caché.
+// En real, antes de comprar se pide con force=true, así que ahí el dato siempre es fresco.
 setInterval(async () => {
   if (wallet) { state.stats.walletBalance = await getWalletBalance(); broadcast({ event: "stats", data: state.stats }); }
-}, 30_000);
+}, BALANCE_CACHE_MS);
 
 
 
@@ -2497,7 +2521,7 @@ async function openRealTrade(signal) {
   if (signal.strategy === "migration" && signal.mcUsd > MIG_MAX_MC_REAL) {
     addLog(`⚠️ REAL: MC ${formatMC(signal.mcUsd)} > ${formatMC(MIG_MAX_MC_REAL)}, skip`, "warn"); return;
   }
-  const balance = await getWalletBalance();
+  const balance = await getWalletBalance(true);   // [2-sep] antes de gastar, saldo fresco
   const solIn = SOL_PER_TRADE_REAL;
   if (balance < solIn + 0.01) { addLog(`⚠️ Balance bajo: ${balance.toFixed(3)}`, "warn"); return; }
 
