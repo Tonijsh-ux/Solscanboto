@@ -331,7 +331,7 @@ function Rechazada({ r, onVeredicto }) {
   const serie = (r.serie || []).map(x => x[1]);
   const maxS = serie.length ? Math.max(...serie) : null, minS = serie.length ? Math.min(...serie) : null;
   return (
-    <div style={{ background: "#0d1117", border: "1px solid #1e2d40", borderLeft: "3px solid #f97316", borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+    <div style={{ background: r.soloHelius ? "#1a1206" : "#0d1117", border: "1px solid #1e2d40", borderLeft: `3px solid ${r.soloHelius ? "#f59e0b" : "#f97316"}`, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
       <div onClick={() => setAbierta(!abierta)} style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
@@ -352,8 +352,12 @@ function Rechazada({ r, onVeredicto }) {
             {r.veredicto === "mal" && <span style={{ fontSize: 10, color: "#ef4444", fontWeight: 700 }}>❌ MAL descartada{r.maxVisto != null ? ` (llegó a +${r.maxVisto}%)` : ""}</span>}
           </div>
           <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3, fontFamily: "monospace", fontSize: 12 }}>
-            <span style={{ color: col, fontSize: 16, fontWeight: 700 }}>{ultimo == null ? "—" : (ultimo >= 0 ? "+" : "") + ultimo.toFixed(1) + "%"}</span>
-            <span style={{ color: "#64748b" }}>al descartar · {r.dur}s vigilada</span>
+            {r.soloHelius
+              ? <span style={{ color: "#f59e0b" }}>el bot nunca la vio — no se vigiló ni se operó</span>
+              : <>
+                  <span style={{ color: col, fontSize: 16, fontWeight: 700 }}>{ultimo == null ? "—" : (ultimo >= 0 ? "+" : "") + ultimo.toFixed(1) + "%"}</span>
+                  <span style={{ color: "#64748b" }}>al descartar · {r.dur}s vigilada</span>
+                </>}
           </div>
           <div style={{ display: "flex", gap: 10, marginTop: 2, fontSize: 11, fontFamily: "monospace", color: "#64748b" }}>
             <span>🕐 {new Date(r.ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}</span>
@@ -1047,6 +1051,7 @@ export default function App() {
              const totBien = Object.values(bien).reduce((a, b) => a + b, 0), totMal = Object.values(mal).reduce((a, b) => a + b, 0);
              const corto = (m) => m.replace(/^MIG\s+/i, "").replace(/^sin tiempo tras el examen:.*/i, "sin tiempo").slice(0, 16);
              const cuál = (r) => {
+               if (r.soloHelius) return "soloH";
                if (!r.helius) return "sin";
                const ppSi = (r.vol || 0) > 0, heSi = (r.helius.vol || 0) > 0;
                return ppSi === heSi ? "iguales" : heSi ? "soloH" : "soloP";
