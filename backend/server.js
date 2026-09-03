@@ -524,7 +524,10 @@ const ESPIA_RELEVO_MS = 25_000;
 // ahora daba PumpPortal. Sus ticks siguen contándose para poder comparar, pero ya no graban.
 // Motivo: el espía midió precio equivalente (1.8% de diferencia), 5-6% más de swaps vistos y
 // tokens enteros donde PumpPortal enmudecía. Además subscribeTokenTrade se paga en SOL.
-const HELIUS_PRIMARIO = process.env.HELIUS_PRIMARIO === "1";
+// [3-sep] ACTIVADO por defecto. Los logs del 2-sep lo dejan claro: 33 avisos de PORTAL-MUDO
+// en un día, ratios de 3 a 5 (un token dio 749 ticks por PumpPortal y 3.693 swaps por Helius)
+// y diferencia de precio de solo 1,3-2%. Se apaga con HELIUS_PRIMARIO=0 si hiciera falta.
+const HELIUS_PRIMARIO = process.env.HELIUS_PRIMARIO !== "0";
 const HELIUS_CAIDO_MS = 45_000;   // sin swaps de Helius durante este tiempo ⇒ vuelve PumpPortal
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
