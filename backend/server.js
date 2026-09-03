@@ -207,7 +207,31 @@ const migFlowTimes = [];             // timestamps de migraciones detectadas
 // OJO honesto: histórico completo depurado ≈ -2.3 SOL → estrategia SOMBRA en demo hasta que
 // los días nuevos la confirmen. SIN espejo real a propósito.
 const UNI_ON = true;
-const UNI_SIZE = 0.5;              // lote demo por compra (pierna bot y cada relevo)
+const UNI_SIZE = 0.5;              // lote demo por compra (referencia histórica)
+// [2-sep] REPARTO DEL LOTE. Medido sobre 371 ops, separando la pierna del bot de cada compra
+// del relevo. Dos hallazgos:
+//  · la pierna del bot PIERDE 7,81 SOL en 370 ops (31% de aciertos): su función es armar el
+//    relevo, así que cuanto más pequeña, menos peaje. Bajarla de 0,5 a 0,15 sube la unida de
+//    80,8 a 86,3 y la rentabilidad sobre capital del 18% al 27%, ganando en las 4 ventanas.
+//  · cargar la PRIMERA compra del relevo funciona en la unida (112,5 SOL, y el máximo
+//    comprometido por paquete BAJA de 6,5 a 5,2 porque casi ninguna op llena los 8 lotes),
+//    pero EMPEORA en la wash (104,8 vs 117,6): sus paquetes son más cortos por el plazo de
+//    35min y la media roja, y no le da tiempo a que el promediado trabaje.
+//  · [2-sep, AL IMPLEMENTAR] la primera compra grande NO se pone: existe UNI_MAX_SOL=25, un
+//    tope de capital desplegado que el laboratorio no modela (asume dinero infinito). Con la
+//    1ª a 2,0 ese tope se alcanza mucho antes y el bot deja de abrir paquetes: el validador
+//    midió 27 de 111 ops con distinto nº de lotes y el 17-19 caía de 43,4 a 27,6 SOL. O sea
+//    que la mejora del laboratorio (+31 SOL) era un espejismo de capital ilimitado.
+//    Se queda SOLO la pierna del bot achicada, que sí gana en las 4 ventanas y además
+//    LIBERA capital (mueve 130 SOL menos), con lo que el tope estorba menos.
+const UNI_LOTES = {
+  unida:  { bot: 0.15, primera: 0.5, resto: 0.5 },
+  unida2: { bot: 0.15, primera: 0.5, resto: 0.5 },
+};
+const loteDe = (id, n) => {
+  const L = UNI_LOTES[id] || { bot: UNI_SIZE, primera: UNI_SIZE, resto: UNI_SIZE };
+  return n === 0 ? L.primera : L.resto;      // n = índice de la compra del relevo
+};
 const UNI_MAX_OPEN = 12;           // tope global de TOKENS con unida abierta a la vez
 const UNI_LATIDO_MS = 6_000;       // [28-ago] cada cuánto refresca el panel una posición abierta
 const UNI_MAX_SOL = 25;            // [27-ago] tope de capital desplegado: no abre compras nuevas
@@ -763,6 +787,7 @@ function loadState() {
   } catch (e) { addLog(`⚠️ Error cargando estado: ${e.message}`, "warn"); }
 }
 
+let reconIntentos = 0;
 async function reconcileStateOnBoot() {
   if (!wallet || !connection) {
     let n = 0;
@@ -793,8 +818,20 @@ async function reconcileStateOnBoot() {
       if (amt > 0) onChain.set(info.mint, amt);
     }
   } catch (e) {
-    addLog(`⚠️ Reconciliación: no se pudo leer la wallet (${e.message}). Por seguridad, NO expiro reales; reintento en 30s.`, "warn");
-    setTimeout(reconcileStateOnBoot, 30_000);
+    // [2-sep] antes reintentaba cada 30s PARA SIEMPRE y llenaba el log de avisos idénticos
+    // cuando el RPC devolvía 500. Ahora: espera creciente (30s, 1min, 2min, 4min... hasta 15min),
+    // avisa solo la 1ª y luego cada 5, y si no hay posiciones reales abiertas ni lo intenta.
+    const hayReales = state.realTrades.some(t => t.status === "OPEN" || t.status === "CLOSING");
+    reconIntentos = (reconIntentos || 0) + 1;
+    if (!hayReales) {
+      if (reconIntentos === 1) addLog(`ℹ️ Reconciliación aplazada (RPC: ${String(e.message).slice(0, 50)}) — no hay posiciones reales abiertas, no hace falta`, "info");
+      return;
+    }
+    const espera = Math.min(15 * 60_000, 30_000 * Math.pow(2, reconIntentos - 1));
+    if (reconIntentos === 1 || reconIntentos % 5 === 0) {
+      addLog(`⚠️ Reconciliación: no se pudo leer la wallet (${String(e.message).slice(0, 50)}) · intento ${reconIntentos} · NO expiro reales · reintento en ${Math.round(espera / 1000)}s`, "warn");
+    }
+    setTimeout(reconcileStateOnBoot, espera);
     return;
   }
 
@@ -827,6 +864,7 @@ async function reconcileStateOnBoot() {
   }
 
   state.stats.realOpen = state.realTrades.filter(t => t.status === "OPEN").length;
+  reconIntentos = 0;
   addLog(`✅ Reconciliación: ${resumed} reanudadas, ${gone} cerradas (gone), ${onChain.size} huérfanos. Reales abiertas: ${state.stats.realOpen}`, "info");
   broadcast({ event: "stats", data: state.stats });
   saveState();
@@ -1581,13 +1619,13 @@ function uniAbiertas(id) {   // [27-ago] cuenta TOKENS distintos, no trades (cad
   return mints.size;
 }
 
-function uniOpenTrade(rec, price, fase, id) {
+function uniOpenTrade(rec, price, fase, id, sol = null) {
   const trade = {
     id: `${id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     strategy: id, mint: rec.mint, symbol: rec.symbol, name: rec.symbol,
     entryPrice: price, tp: +(price * 1e9).toFixed(12),   // sin TP: cierra el motor
     sl: 0,                                               // informativo: el stop vive en rec.uni
-    sizeSol: UNI_SIZE,
+    sizeSol: sol != null ? sol : (UNI_LOTES[id] || { bot: UNI_SIZE }).bot,   // [2-sep] bot o lote del relevo
     openTime: Date.now(), closeTime: null, closePrice: null,
     result: null, pnlPct: null, maxGainPct: 0, maxLossPct: 0, currentPct: 0,
     trailingPhase: fase, status: "OPEN",
@@ -1725,14 +1763,15 @@ function uniSampleUno(rec, u, price, pct, tSec) {
           }
         }
         if (!u.tradePack) {
-          u.tradePack = uniOpenTrade(rec, price, "UNI_RELEVO", C.id);
+          u.tradePack = uniOpenTrade(rec, price, "UNI_RELEVO", C.id, loteDe(C.id, 0));   // 1er lote del relevo
           u.tradePack.compras = [{ t, p: +v.toFixed(1) }];   // [23-ago] desglose para el detalle del panel
           addLog(`🤝 UNIDA compra 1/${C.maxlot}: ${rec.symbol} a ${v.toFixed(0)}% (soporte ${nn.toFixed(0)}%)`, "accept");
         } else {
           const pk = u.tradePack;
           const oldE = pk.entryPrice;
           pk.entryPrice = u.lotes.length / u.sumInv;   // media ARMÓNICA: lotes de SOL iguales → mismo total que el lab
-          pk.sizeSol = +(UNI_SIZE * u.lotes.length).toFixed(2);
+          // [2-sep] el paquete ya no son N lotes iguales: la 1ª compra puede pesar distinto
+          pk.sizeSol = +(u.lotes.reduce((s, _, n) => s + loteDe(C.id, n), 0)).toFixed(2);
           pk.trailingPhase = `UNI_RELEVO×${u.lotes.length}`;
           pk.compras.push({ t, p: +v.toFixed(1) });   // [23-ago] desglose para el detalle del panel
           // [23-ago] la media cambió → re-basar TODO sobre la nueva media (mismos precios, otra referencia):
@@ -1780,16 +1819,18 @@ function uniSampleUno(rec, u, price, pct, tSec) {
           let invV = 0; for (const l of vendidosLotes) invV += 1 / abs(l);
           const pkV = u.tradePack;
           pkV.entryPrice = vendidosLotes.length / invV;
-          pkV.sizeSol = +(UNI_SIZE * nVende).toFixed(2);
+          // se venden los lotes más antiguos: los que ocupan las primeras posiciones
+          pkV.sizeSol = +(Array.from({ length: nVende }, (_, n) => loteDe(C.id, n)).reduce((a, b) => a + b, 0)).toFixed(2);
           pkV.compras = compradas.slice(0, nVende);
           uniCierra(rec, pkV, price, "ROJA_MEDIA");
           // el resto sigue en un paquete nuevo, con su media re-basada
           u.lotes = quedan;
           u.sumInv = 0; for (const l of quedan) u.sumInv += 1 / abs(l);
           const mediaQ = quedan.length / u.sumInv;
-          u.tradePack = uniOpenTrade(rec, mediaQ, `UNI_RELEVO×${quedan.length}`, C.id);
+          u.tradePack = uniOpenTrade(rec, mediaQ, `UNI_RELEVO×${quedan.length}`, C.id,
+            +(quedan.reduce((s, _, n) => s + loteDe(C.id, n + nVende), 0)).toFixed(2));
           u.tradePack.compras = compradas.slice(nVende);
-          u.tradePack.sizeSol = +(UNI_SIZE * quedan.length).toFixed(2);
+          u.tradePack.sizeSol = +(quedan.reduce((s, _, n) => s + loteDe(C.id, n + nVende), 0)).toFixed(2);
           u.tradePack.mcEntry = rec.mc && rec.entryPrice ? +(rec.mc * (mediaQ / rec.entryPrice)).toFixed(0) : null;
         }
       }
