@@ -337,6 +337,17 @@ function Rechazada({ r, onVeredicto }) {
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#e2e8f0", fontSize: 14 }}>{sym}</span>
             <span style={{ fontSize: 10, color: "#f97316", background: "#f9731618", border: "1px solid #f9731644", borderRadius: 5, padding: "1px 5px" }}>{r.motivo}</span>
+            {(() => {
+              // [3-sep] ¿las dos fuentes habrían decidido lo mismo? El filtro de volumen exige >0.
+              if (!r.helius) return null;
+              const pp = r.vol || 0, he = r.helius.vol || 0;
+              const ppSi = pp > 0, heSi = he > 0;
+              const est = ppSi === heSi
+                ? { t: "🤝 las dos igual", c: "#64748b" }
+                : heSi ? { t: "⚡ solo Helius la vería", c: "#f59e0b" }
+                       : { t: "📡 solo PumpPortal la vería", c: "#8b5cf6" };
+              return <span style={{ fontSize: 10, color: est.c, border: `1px solid ${est.c}44`, borderRadius: 5, padding: "1px 5px" }}>{est.t}</span>;
+            })()}
             {r.veredicto === "bien" && <span style={{ fontSize: 10, color: "#22c55e" }}>✅ bien descartada{r.maxVisto != null ? ` (máx +${r.maxVisto}%)` : ""}</span>}
             {r.veredicto === "mal" && <span style={{ fontSize: 10, color: "#ef4444", fontWeight: 700 }}>❌ MAL descartada{r.maxVisto != null ? ` (llegó a +${r.maxVisto}%)` : ""}</span>}
           </div>
@@ -366,6 +377,13 @@ function Rechazada({ r, onVeredicto }) {
       {abierta && (
         <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #1e2d40", fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>
           <div>volumen ${r.vol} · {r.trades} trades{r.sig != null ? ` · señal ${r.sig >= 0 ? "+" : ""}${r.sig}%` : ""}{r.mov2s != null ? ` · mov2s ${r.mov2s >= 0 ? "+" : ""}${r.mov2s}%` : ""}</div>
+          {r.helius && (
+            <div style={{ marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <span style={{ color: "#8b5cf6" }}>📡 PumpPortal ${r.vol || 0} · {r.trades || 0} trades</span>
+              <span style={{ color: "#f59e0b" }}>⚡ Helius ${r.helius.vol} · {r.helius.swaps} swaps · {r.helius.carteras} carteras</span>
+              {(r.vol || 0) > 0 && <span style={{ color: "#64748b" }}>×{(r.helius.vol / (r.vol || 1)).toFixed(1)}</span>}
+            </div>
+          )}
           <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
             <a href={`https://pump.fun/coin/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>💊 pump.fun</a>
             <a href={`https://solscan.io/token/${r.mint}`} target="_blank" rel="noreferrer" style={{ color: "#38bdf8" }}>🔎 Solscan</a>
@@ -840,6 +858,7 @@ export default function App() {
  const [demoStatusFilter, setDemoStatusFilter] = useState("all");
  const [demoStratFilter, setDemoStratFilter] = useState("unida");
  const [rejFilter, setRejFilter] = useState("all");   // [31-ago] filtro por motivo de rechazo
+ const [rejFuente, setRejFuente] = useState("all");   // [3-sep] filtro por acuerdo entre fuentes
  const mandarVeredicto = async (id, veredicto, maxVisto) => {
    const mv = (maxVisto === "" || maxVisto == null || isNaN(+maxVisto)) ? null : +maxVisto;
    const antes = rechazadas;
@@ -1027,7 +1046,15 @@ export default function App() {
              const motivos = Object.entries(cuenta).sort((a, b) => b[1] - a[1]);
              const totBien = Object.values(bien).reduce((a, b) => a + b, 0), totMal = Object.values(mal).reduce((a, b) => a + b, 0);
              const corto = (m) => m.replace(/^MIG\s+/i, "").replace(/^sin tiempo tras el examen:.*/i, "sin tiempo").slice(0, 16);
-             const lista = rejFilter === "all" ? rechazadas : rechazadas.filter(r => r.motivo === rejFilter);
+             const cuál = (r) => {
+               if (!r.helius) return "sin";
+               const ppSi = (r.vol || 0) > 0, heSi = (r.helius.vol || 0) > 0;
+               return ppSi === heSi ? "iguales" : heSi ? "soloH" : "soloP";
+             };
+             const porMotivo = rejFilter === "all" ? rechazadas : rechazadas.filter(r => r.motivo === rejFilter);
+             const lista = rejFuente === "all" ? porMotivo : porMotivo.filter(r => cuál(r) === rejFuente);
+             const cF = { iguales: 0, soloH: 0, soloP: 0, sin: 0 };
+             for (const r of porMotivo) cF[cuál(r)]++;
              return (
                <>
                  {motivos.length > 0 && (
@@ -1048,6 +1075,21 @@ export default function App() {
                    </div>
                  )}
                  {lista.length === 0 && <EmptyState icon="🚫" text="Aquí aparecerán las migraciones rechazadas." />}
+                 {(cF.soloH + cF.soloP + cF.iguales) > 0 && (
+                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                     {[["all", "Cualquier fuente", porMotivo.length, "#64748b"],
+                       ["iguales", "🤝 las dos igual", cF.iguales, "#64748b"],
+                       ["soloH", "⚡ solo Helius", cF.soloH, "#f59e0b"],
+                       ["soloP", "📡 solo PumpPortal", cF.soloP, "#8b5cf6"]].map(([id, label, n, col]) => (
+                       <button key={id} onClick={() => setRejFuente(id)} disabled={n === 0 && id !== "all"}
+                         style={{ background: rejFuente === id ? col + "22" : "#0d1117", border: `1px solid ${rejFuente === id ? col : "#1e2d40"}`,
+                                  color: n === 0 && id !== "all" ? "#334155" : (rejFuente === id ? col : "#94a3b8"),
+                                  borderRadius: 8, padding: "5px 9px", fontSize: 11, fontFamily: "monospace" }}>
+                         {label} <span style={{ opacity: .7 }}>{n}</span>
+                       </button>
+                     ))}
+                   </div>
+                 )}
                  {rejFilter !== "all" && ((bien[rejFilter] || 0) + (mal[rejFilter] || 0)) > 0 && (
                    <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8, fontFamily: "monospace" }}>
                      este filtro acierta el <b style={{ color: "#22c55e" }}>{Math.round(100 * (bien[rejFilter] || 0) / ((bien[rejFilter] || 0) + (mal[rejFilter] || 0)))}%</b> de las que has revisado
