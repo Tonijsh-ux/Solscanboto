@@ -3331,6 +3331,31 @@ function espiaMigracion(m) {
   } catch {}
 }
 
+// [3-sep] cada minuto: las graduaciones que Helius vio y PumpPortal NO trajo en 2 minutos.
+// Van al panel como tarjeta con su enlace, para poder mirar a ojo si eran buenas.
+setInterval(() => {
+  if (!ESPIA_MIGS) return;
+  const ahora = Date.now();
+  for (const [mint, h] of espia.migs) {
+    if (ahora - h.t < 120_000) continue;
+    espia.migs.delete(mint);
+    espia.migPerdidas = (espia.migPerdidas || 0) + 1;
+    addLog(`🏁 SOLO HELIUS: ${shortAddr(mint)} se graduó hace 2min y PumpPortal no la mandó · piscina ${shortAddr(h.pool)}`, "warn");
+    try {
+      const data = {
+        id: `soloH-${mint}`, mint, symbol: "???", name: null,
+        motivo: "⚡ SOLO HELIUS (PumpPortal no la mandó)", ts: h.t, dur: 120,
+        mc: null, vol: null, trades: null, sig: null, mov2s: null, ultimo: null,
+        serie: [], veredicto: null, maxVisto: null, soloHelius: true, pool: h.pool,
+      };
+      if (!state.rechazadas) state.rechazadas = [];
+      state.rechazadas.unshift(data);
+      if (state.rechazadas.length > 300) state.rechazadas.length = 300;
+      broadcast({ event: "migRechazada", data });
+    } catch {}
+  }
+}, 60_000);
+
 // [3-sep] alta de un token en la fase de vigilancia (solo para medir)
 function espiaVigilaAlta(mint, sym) {
   if (!ESPIA_ON || espia.ws?.readyState !== WebSocket.OPEN) return;
@@ -3390,7 +3415,7 @@ setInterval(() => {
     + (ESPIA_MIGS ? ` · MIGS: helius=${espia.migsN || 0} coinciden=${espia.migVistas || 0}`
         + (espia.migAdelanto && espia.migAdelanto.length
             ? ` adelanto medio ${(espia.migAdelanto.reduce((a, b) => a + b, 0) / espia.migAdelanto.length).toFixed(1)}s` : "")
-        + ` soloPP=${espia.migSoloPP || 0} pendientes=${espia.migs.size}` : "")
+        + ` soloPP=${espia.migSoloPP || 0} soloHelius=${espia.migPerdidas || 0} pendientes=${espia.migs.size}` : "")
     + ` · vigilando=${espia.vig.size}${espia.vigN ? ` (${espia.vigN} medidas, ${espia.vigSalvadas || 0} con \$0 en portal y datos en Helius${espia.vigLlenos ? `, ${espia.vigLlenos} sin hueco` : ""})` : ""}`
     + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · relevos=${[...espia.cuenta.values()].reduce((a, x) => a + (x.relevo || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
