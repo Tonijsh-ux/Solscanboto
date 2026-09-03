@@ -539,6 +539,16 @@ const HELIUS_CAIDO_MS = 45_000;   // sin swaps de Helius durante este tiempo ⇒
 // Coste medido: ~1.007 migraciones/día × 60s ≈ 0,12 GB/día ≈ 2.400 créditos (0,7% del plan).
 const ESPIA_VIGILA = process.env.ESPIA_VIGILA !== "0";
 const ESPIA_VIG_MAX = 40;          // tope de suscripciones de vigilancia a la vez (el plan da 100)
+
+// ── [3-sep] ESPÍA DE MIGRACIONES ─────────────────────────────────────────────────
+// Las migraciones las dispara PumpPortal (gratis, subscribeMigration). Pero el mismo
+// aviso está en la cadena: el programa envoltorio de migración de pump.fun emite un
+// evento cuando un token se gradúa, con el mint y la piscina de PumpSwap ya dentro.
+// Escucharlo por Helius no depende de nadie y trae la piscina de regalo (hoy el espía
+// tiene que esperar al primer swap para descubrirla). De momento solo MIDE: apunta cada
+// migración y, cuando llega la de PumpPortal, calcula cuántos segundos de diferencia hubo.
+const MIG_PROGRAM = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
+const ESPIA_MIGS = process.env.ESPIA_MIGS !== "0";
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
@@ -1153,6 +1163,18 @@ function migStartWatching(coin) {
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
   registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
   if (ESPIA_VIGILA) espiaVigilaAlta(coin.mint, coin.symbol || "???");   // [3-sep] Helius mira en paralelo
+  if (ESPIA_MIGS) {                       // [3-sep] ¿la había visto Helius antes?
+    const h = espia.migs.get(coin.mint);
+    if (h) {
+      const dif = (Date.now() - h.t) / 1000;
+      espia.migAdelanto = (espia.migAdelanto || []).concat(dif).slice(-200);
+      espia.migVistas = (espia.migVistas || 0) + 1;
+      addLog(`🏁 MIGRACIÓN: ${coin.symbol} · Helius la vio ${dif.toFixed(1)}s ${dif >= 0 ? "ANTES" : "DESPUÉS"} · piscina ${shortAddr(h.pool)}`, "info");
+      espia.migs.delete(coin.mint);
+    } else {
+      espia.migSoloPP = (espia.migSoloPP || 0) + 1;   // PumpPortal la trajo y Helius no (aún)
+    }
+  }
   miraSupply(coin.mint).then(s => {                        // [1-sep] ¿es un token Mayhem?
     const e = state.migWatching.get(coin.mint);
     if (!e) return;
@@ -3080,6 +3102,7 @@ const espia = {
   ws: null, subs: new Map(),        // mint → id de suscripción
   porSub: new Map(),                // id de suscripción → mint (varios ids pueden apuntar al mismo)
   vig: new Map(),                   // [3-sep] tokens en fase de vigilancia que Helius mide en paralelo
+  migs: new Map(),                  // [3-sep] graduaciones vistas por Helius, a la espera de la de PumpPortal
   pend: new Map(),                  // id de petición → mint
   cuenta: new Map(),                // mint → { helius, portal, t0, ultH, ultP }
   reconex: 0, credEst: 0,
@@ -3091,6 +3114,13 @@ function espiaConectar() {
   espia.ws.on("open", () => {
     addLog("🕵️ ESPÍA Helius conectado", "info");
     espia.subs.clear(); espia.porSub.clear();
+    if (ESPIA_MIGS) {                       // [3-sep] escuchar las graduaciones en la cadena
+      const idM = ++espiaId;
+      espia.pendMig = idM;
+      espia.ws.send(JSON.stringify({ jsonrpc: "2.0", id: idM, method: "transactionSubscribe",
+        params: [{ accountInclude: [MIG_PROGRAM], failed: false, vote: false },
+                 { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] }));
+    }
     for (const c1 of espia.cuenta.values()) c1.atada = false;   // al reconectar hay que volver a atar
     for (const mint of state.liveRecordings.keys()) espiaSuscribir(mint);
   });
@@ -3109,11 +3139,18 @@ function espiaConectar() {
       espia.porSub.set(m.result, mintP);
       return;
     }
+    if (m.id && m.id === espia.pendMig) {   // [3-sep] confirmación de la suscripción de migraciones
+      if (m.error) { addLog(`🏁 ESPÍA migraciones: Helius rechazó la suscripción (${m.error.message || "?"})`, "warn"); espia.pendMig = null; return; }
+      espia.subMig = m.result; espia.pendMig = null;
+      addLog("🏁 ESPÍA: escuchando las graduaciones directamente en la cadena", "info");
+      return;
+    }
     if (m.method !== "transactionNotification" && m.method !== "logsNotification") return;
     // [1-sep] búsqueda por id: al atar un token a su piscina se crea una suscripción nueva y
     // se da de baja la vieja. Si solo mirásemos el mapa mint→id, los mensajes que llegan en ese
     // hueco se perderían. Con el mapa inverso, los dos ids siguen apuntando al mismo token.
     const sub = m.params?.subscription;
+    if (ESPIA_MIGS && sub === espia.subMig) { espiaMigracion(m); return; }   // [3-sep]
     const mint = espia.porSub.get(sub);
     if (!mint) return;
     const c0 = espia.cuenta.get(mint);
@@ -3270,6 +3307,30 @@ function espiaAtarAPiscina(mint, pool) {
   addLog(`🕵️ ESPÍA: ${shortAddr(mint)} atado a su piscina ${shortAddr(pool)} (menos tráfico)`, "info");
 }
 
+// [3-sep] una graduación vista por Helius. De los saldos posteriores sacamos el mint que
+// se ha migrado: es el único token, aparte de WSOL, con reservas nuevas en la piscina.
+function espiaMigracion(m) {
+  try {
+    const post = m.params?.result?.transaction?.meta?.postTokenBalances;
+    if (!Array.isArray(post) || !post.length) return;
+    let mint = null, pool = null, mejor = 0;
+    const porOwner = new Map();
+    for (const b of post) {
+      if (!b.owner || !b.mint) continue;
+      const amt = +(b.uiTokenAmount?.uiAmountString || b.uiTokenAmount?.uiAmount || 0);
+      const o = porOwner.get(b.owner) || {};
+      if (b.mint === WSOL_MINT) o.sol = Math.max(o.sol || 0, amt);
+      else if (amt > (o.tok || 0)) { o.tok = amt; o.mint = b.mint; }
+      porOwner.set(b.owner, o);
+    }
+    for (const [owner, o] of porOwner) if (o.sol > 0 && o.tok > mejor) { mejor = o.tok; mint = o.mint; pool = owner; }
+    if (!mint) return;
+    espia.migs.set(mint, { t: Date.now(), pool });
+    if (espia.migs.size > 400) espia.migs.delete(espia.migs.keys().next().value);
+    espia.migsN = (espia.migsN || 0) + 1;
+  } catch {}
+}
+
 // [3-sep] alta de un token en la fase de vigilancia (solo para medir)
 function espiaVigilaAlta(mint, sym) {
   if (!ESPIA_ON || espia.ws?.readyState !== WebSocket.OPEN) return;
@@ -3326,6 +3387,10 @@ setInterval(() => {
   const difPeor = dTot.length ? Math.max(...dTot.map(x => x.difMax || 0)) : null;
   addLog(`[ESPIA] portal=${tot.p} helius-swaps=${tot.h} (de ${tot.tx} tx) · ratio=${tot.p ? (tot.h / tot.p).toFixed(2) : "-"}`
     + (difMedia != null ? ` · PRECIO: dif media ${difMedia.toFixed(2)}% · peor ${difPeor.toFixed(2)}% (${dTot.length} tokens)` : " · PRECIO: sin comparaciones aún")
+    + (ESPIA_MIGS ? ` · MIGS: helius=${espia.migsN || 0} coinciden=${espia.migVistas || 0}`
+        + (espia.migAdelanto && espia.migAdelanto.length
+            ? ` adelanto medio ${(espia.migAdelanto.reduce((a, b) => a + b, 0) / espia.migAdelanto.length).toFixed(1)}s` : "")
+        + ` soloPP=${espia.migSoloPP || 0} pendientes=${espia.migs.size}` : "")
     + ` · vigilando=${espia.vig.size}${espia.vigN ? ` (${espia.vigN} medidas, ${espia.vigSalvadas || 0} con \$0 en portal y datos en Helius${espia.vigLlenos ? `, ${espia.vigLlenos} sin hueco` : ""})` : ""}`
     + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · relevos=${[...espia.cuenta.values()].reduce((a, x) => a + (x.relevo || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
