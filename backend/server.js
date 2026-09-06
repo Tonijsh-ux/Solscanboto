@@ -1458,7 +1458,17 @@ function migEvaluate(mint) {
   const entry = state.migWatching.get(mint);
   if (!entry || entry.entered || entry.pendingEntry) return;
   const elapsed = ((Date.now() - entry.startTime) / 1000).toFixed(1);
-  if (entry.volumeUSD >= MIG_VOL_SLOW_EFF && entry.lastPrice) {
+  // [6-sep] El filtro de volumen pedía ≥1 dólar, que no filtra nada de verdad... salvo
+  // cuando la cartera de PumpPortal se queda sin saldo: entonces no llegan trades, el
+  // volumen se queda en 0 y se rechaza TODO con "$0 vol". No es un token parado, es que
+  // no tenemos datos. Como Helius ya alimenta la cámara, el volumen deja de ser condición:
+  // basta con tener precio. Y si Helius vio movimiento en la vigilancia, también vale.
+  const volHel = (ESPIA_VIGILA && espia.vig.get(mint)) ? espia.vig.get(mint).vol : 0;
+  const hayDatos = entry.lastPrice || volHel > 0;
+  if (hayDatos) {
+    if (!(entry.volumeUSD >= MIG_VOL_SLOW_EFF) && volHel > 0) {
+      addLog(`📡 ${entry.symbol}: PumpPortal no mandó volumen pero Helius vio $${Math.round(volHel)} — sigue adelante`, "info");
+    }
     entry.pendingEntry = true;
     const precioA = entry.lastPrice;
     addLog(`✅ MIG LENTA: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol | ${elapsed}s — confirmando 3s`, "accept");
@@ -1477,8 +1487,8 @@ function migEvaluate(mint) {
     }, MIG_ENTRY_DELAY_MS);
   } else {
     state.migWatching.delete(mint); unsubscribeToken(mint);
-    addLog(`❌ MIG RECHAZADO: ${entry.symbol} | $${Math.round(entry.volumeUSD)} vol en ${elapsed}s`, "filter");
-    migRechazada(entry, "MIG RECHAZADO"); state.stats.mig_rejected++; broadcast({ event: "stats", data: state.stats });
+    addLog(`❌ MIG SIN PRECIO: ${entry.symbol} | ninguna fuente dio precio en ${elapsed}s`, "filter");
+    migRechazada(entry, "MIG SIN PRECIO"); state.stats.mig_rejected++; broadcast({ event: "stats", data: state.stats });
   }
 }
 
@@ -3252,7 +3262,19 @@ function espiaConectar() {
       // [3-sep] si el token está en fase de vigilancia, apuntamos lo que ve Helius (sin decidir)
     {
       const v = espia.vig.get(mint);
-      if (v) { v.vol += hVol; v.swaps++; if (hTrader) v.carteras.add(hTrader); }
+      if (v) {
+        v.vol += hVol; v.swaps++; if (hTrader) v.carteras.add(hTrader);
+        v.precio = c0.precioH;   // [6-sep] el precio de la piscina, por si PumpPortal calla
+        // si el token está en vigilancia y no tenemos precio de PumpPortal, lo ponemos:
+        // sin esto, con la cartera de PumpPortal seca no entraría ni una sola op.
+        const ent = state.migWatching.get(mint);
+        if (ent && !ent.lastPrice && c0.precioH > 0) {
+          ent.lastPrice = c0.precioH;
+          if (!ent.firstPrice) ent.firstPrice = c0.precioH;
+          if (!ent.avisoPrecioHelius) { ent.avisoPrecioHelius = true;
+            addLog(`📡 ${ent.symbol}: sin precio de PumpPortal — lo pone Helius (${c0.precioH.toPrecision(4)})`, "info"); }
+        }
+      }
     }
     // La cámara come de Helius: siempre si es la fuente principal; si no, solo cuando
       // PumpPortal lleva callado (relevo). Con cartera y dirección, el wash y el flujo salen igual.
