@@ -549,6 +549,18 @@ const ESPIA_VIG_MAX = 40;          // tope de suscripciones de vigilancia a la v
 // migración y, cuando llega la de PumpPortal, calcula cuántos segundos de diferencia hubo.
 const MIG_PROGRAM = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
 const ESPIA_MIGS = process.env.ESPIA_MIGS !== "0";
+
+// [6-sep] HELIUS_TODO: el bot deja de necesitar los trades de PumpPortal para NADA.
+// Todo lo que PumpPortal aportaba —precio, volumen, cartera, dirección— sale igual del
+// espía, que ya lee la piscina. Con esto encendido:
+//   · las migraciones las dispara el programa de graduación en la cadena
+//   · cada swap de Helius alimenta migUpdatePrice igual que lo hacía un trade del portal
+// Así el saldo de la cartera de PumpPortal deja de parar el bot. Se apaga con HELIUS_TODO=0.
+// [6-sep] ACTIVADO. La cartera de PumpPortal se queda sin saldo, deja de mandar trades y
+// el bot se quedaba ciego: volumen 0 y todo rechazado. Helius ya aporta lo mismo (precio de
+// la piscina, cartera del firmante, dirección y volumen) y además ve migraciones que
+// PumpPortal no manda (medido: soloHelius=336 contra soloPP=2). Se apaga con HELIUS_TODO=0.
+const HELIUS_TODO = process.env.HELIUS_TODO !== "0";
 const HELIUS_WS = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "";
 const PUMPPORTAL_WS = PUMPPORTAL_API_KEY
   ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
@@ -1003,6 +1015,22 @@ setInterval(async () => {
 // (la concentración del top-5/top-10 delata al deployer con el supply repartido
 // en varias wallets; el topPct del top-1 solo demostró no separar nada).
 // [1-sep] supply real del token: 2.000 millones ⇒ Mayhem Mode. Una llamada por migración.
+// [6-sep] el símbolo venía en el mensaje de PumpPortal; con HELIUS_TODO hay que leerlo
+const simCache = new Map();
+async function simboloDe(mint) {
+  if (simCache.has(mint)) return simCache.get(mint);
+  let s = null;
+  try {
+    const r = await fetch(SOLANA_RPC, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: mint } }),
+      signal: AbortSignal.timeout(4000) });
+    const j = await r.json();
+    s = j?.result?.content?.metadata?.symbol || null;
+  } catch {}
+  if (s) { simCache.set(mint, s); if (simCache.size > 2000) simCache.delete(simCache.keys().next().value); }
+  return s;
+}
+
 async function miraSupply(mint) {
   if (supplyCache.has(mint)) return supplyCache.get(mint);
   let r = { supply: null, mayhem: false };
@@ -1162,7 +1190,9 @@ function migStartWatching(coin) {
   state.stats.mig_migrations++;
   migFlowTimes.push(Date.now());   // [v10] termómetro del mercado
   registrarCalidadPremig(coin.mint, coin.symbol || "???"); // paralelo, no bloquea
-  if (ESPIA_VIGILA) espiaVigilaAlta(coin.mint, coin.symbol || "???");   // [3-sep] Helius mira en paralelo
+  // [6-sep] con HELIUS_TODO esto deja de ser "mirar en paralelo": es la ÚNICA fuente de
+  // precio y volumen de la vigilancia, así que se suscribe siempre y sin tope.
+  if (ESPIA_VIGILA || HELIUS_TODO) espiaVigilaAlta(coin.mint, coin.symbol || "???");
   if (ESPIA_MIGS) {                       // [3-sep] ¿la había visto Helius antes?
     const h = espia.migs.get(coin.mint);
     if (h) {
@@ -3267,12 +3297,35 @@ function espiaConectar() {
         v.precio = c0.precioH;   // [6-sep] el precio de la piscina, por si PumpPortal calla
         // si el token está en vigilancia y no tenemos precio de PumpPortal, lo ponemos:
         // sin esto, con la cartera de PumpPortal seca no entraría ni una sola op.
+        // [6-sep] con HELIUS_TODO, cada swap entra por la MISMA puerta que un trade de
+        // PumpPortal: mismo precio, mismo volumen, misma cartera, misma dirección.
+        if (HELIUS_TODO && state.migWatching.has(mint) && c0.precioH > 0) {
+          const mcImp = c0.precioH * supplyDe(mint);
+          if (mcImp > 5_000 && mcImp < 5_000_000) {
+            lastTickAt.set(mint, Date.now());
+            try { migUpdatePrice(mint, c0.precioH, hVol / (solPriceUSD || 1), hTrader, hCompra); } catch {}
+          }
+        }
+        // [6-sep] Helius pone el precio de la vigilancia cuando PumpPortal calla.
+        // Dos correcciones sobre el primer intento:
+        //  · antes solo lo ponía UNA vez (if !lastPrice), así que el precio se congelaba
+        //    y todas las rechazadas salían con "+0.0% al descartar".
+        //  · y hace falta un guardián: justo al migrar hay varias cuentas con token y WSOL,
+        //    el espía puede coger la equivocada y el precio sale inflado. Se vio en vivo:
+        //    89 tokens rechazados seguidos por "MC ALTO". Si el MC que implica ese precio
+        //    es absurdo, NO se usa.
         const ent = state.migWatching.get(mint);
-        if (ent && !ent.lastPrice && c0.precioH > 0) {
-          ent.lastPrice = c0.precioH;
-          if (!ent.firstPrice) ent.firstPrice = c0.precioH;
-          if (!ent.avisoPrecioHelius) { ent.avisoPrecioHelius = true;
-            addLog(`📡 ${ent.symbol}: sin precio de PumpPortal — lo pone Helius (${c0.precioH.toPrecision(4)})`, "info"); }
+        if (ent && c0.precioH > 0) {
+          const mcImplicito = c0.precioH * supplyDe(mint);
+          if (mcImplicito > 5_000 && mcImplicito < 5_000_000) {
+            ent.lastPrice = c0.precioH;
+            if (!ent.firstPrice) ent.firstPrice = c0.precioH;
+            if (!ent.avisoPrecioHelius) { ent.avisoPrecioHelius = true;
+              addLog(`📡 ${ent.symbol}: sin precio de PumpPortal — lo pone Helius (MC ${formatMC(mcImplicito)})`, "info"); }
+          } else if (!ent.avisoPrecioRaro) {
+            ent.avisoPrecioRaro = true;
+            addLog(`⚠️ ${ent.symbol}: el precio de Helius implica MC ${formatMC(mcImplicito)} — descartado por absurdo`, "warn");
+          }
         }
       }
     }
@@ -3350,6 +3403,16 @@ function espiaMigracion(m) {
     espia.migs.set(mint, { t: Date.now(), pool });
     if (espia.migs.size > 400) espia.migs.delete(espia.migs.keys().next().value);
     espia.migsN = (espia.migsN || 0) + 1;
+    // [6-sep] con HELIUS_TODO el disparador es este, no el de PumpPortal
+    if (HELIUS_TODO && !state.migWatching.has(mint) && !state.liveRecordings.has(mint)) {
+      espia.migDisparadas = (espia.migDisparadas || 0) + 1;
+      // el símbolo ya no lo manda PumpPortal: se pide a la cadena y se rellena después
+      try { migStartWatching({ mint, name: null, symbol: mint.slice(0, 6), marketCapSol: null }); } catch {}
+      simboloDe(mint).then(s => {
+        const e = state.migWatching.get(mint);
+        if (e && s) e.symbol = s;
+      }).catch(() => {});
+    }
   } catch {}
 }
 
@@ -3381,7 +3444,9 @@ setInterval(() => {
 // [3-sep] alta de un token en la fase de vigilancia (solo para medir)
 function espiaVigilaAlta(mint, sym) {
   if (!ESPIA_ON || espia.ws?.readyState !== WebSocket.OPEN) return;
-  if (espia.vig.size >= ESPIA_VIG_MAX) { espia.vigLlenos = (espia.vigLlenos || 0) + 1; return; }
+  // el tope solo aplica cuando el espía es un observador; si es la fuente principal,
+  // quedarse sin hueco significaría no poder decidir esa op
+  if (!HELIUS_TODO && espia.vig.size >= ESPIA_VIG_MAX) { espia.vigLlenos = (espia.vigLlenos || 0) + 1; return; }
   espia.vig.set(mint, { sym, t0: Date.now(), vol: 0, swaps: 0, carteras: new Set() });
   espiaSuscribir(mint);
 }
@@ -3437,7 +3502,8 @@ setInterval(() => {
     + (ESPIA_MIGS ? ` · MIGS: helius=${espia.migsN || 0} coinciden=${espia.migVistas || 0}`
         + (espia.migAdelanto && espia.migAdelanto.length
             ? ` adelanto medio ${(espia.migAdelanto.reduce((a, b) => a + b, 0) / espia.migAdelanto.length).toFixed(1)}s` : "")
-        + ` soloPP=${espia.migSoloPP || 0} soloHelius=${espia.migPerdidas || 0} pendientes=${espia.migs.size}` : "")
+        + ` soloPP=${espia.migSoloPP || 0} soloHelius=${espia.migPerdidas || 0} pendientes=${espia.migs.size}`
+        + (HELIUS_TODO ? ` · 🔀 HELIUS_TODO: ${espia.migDisparadas || 0} migraciones disparadas por Helius` : "") : "")
     + ` · vigilando=${espia.vig.size}${espia.vigN ? ` (${espia.vigN} medidas, ${espia.vigSalvadas || 0} con \$0 en portal y datos en Helius${espia.vigLlenos ? `, ${espia.vigLlenos} sin hueco` : ""})` : ""}`
     + ` · subs=${espia.subs.size} · reconex=${espia.reconex} · ~${Math.round(espia.credEst / 1024)}KB · relevos=${[...espia.cuenta.values()].reduce((a, x) => a + (x.relevo || 0), 0)} | ${filas.slice(0, 10).join(" ")}`, "info");
 }, 10 * 60_000);
