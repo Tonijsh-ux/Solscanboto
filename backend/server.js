@@ -3618,16 +3618,34 @@ app.use(cors());
 app.use(express.json());
 
 // [8-sep] El panel del móvil: un solo HTML que sirve el propio bot, sin depender de
-// Vercel. Se lee una vez al arrancar; si el archivo no está, lo dice en vez de fallar.
-let PANEL_MOVIL = null;
-try { PANEL_MOVIL = fs.readFileSync(new URL("./panel_solana.html", import.meta.url), "utf-8"); }
-catch { try { PANEL_MOVIL = fs.readFileSync("./panel_solana.html", "utf-8"); } catch {} }
+// Vercel. Se busca EN CADA PETICIÓN (con caché de 10s) y en varias rutas: leerlo solo al
+// arrancar obligaba a reiniciar tras cada cambio de nombre o subida del archivo.
+let PANEL_CACHE = null, PANEL_AT = 0;
+function leePanel() {
+  if (PANEL_CACHE && Date.now() - PANEL_AT < 10_000) return PANEL_CACHE;
+  const sitios = [];
+  try { sitios.push(new URL("./panel_solana.html", import.meta.url)); } catch {}
+  sitios.push("./panel_solana.html", "./backend/panel_solana.html",
+              "/app/panel_solana.html", "/app/backend/panel_solana.html");
+  for (const s of sitios) {
+    try { const t = fs.readFileSync(s, "utf-8"); PANEL_CACHE = t; PANEL_AT = Date.now(); return t; } catch {}
+  }
+  return null;
+}
 app.get("/panel", (_, res) => {
-  if (PANEL_MOVIL) return res.type("html").send(PANEL_MOVIL);
+  const html = leePanel();
+  if (html) return res.type("html").send(html);
+  // si no aparece, se dice DÓNDE se ha buscado: adivinar la ruta cuesta más que enseñarla
+  let vistos = [];
+  try { vistos = fs.readdirSync(new URL(".", import.meta.url)).slice(0, 25); } catch {
+    try { vistos = fs.readdirSync(".").slice(0, 25); } catch {}
+  }
   res.type("html").send(`<!doctype html><meta charset=utf-8>
     <body style="background:#0e1420;color:#dde5f2;font-family:system-ui;padding:28px;line-height:1.6">
     <h1 style="font-size:19px">Bot de Solana</h1>
-    <p>Falta <b>panel_solana.html</b> junto a server.js en la carpeta backend.</p></body>`);
+    <p>No encuentro <b>panel_solana.html</b>.</p>
+    <p style="color:#7b8aa5;font-size:13px">En la carpeta del server hay:<br>
+      <span style="font-family:monospace">${vistos.join("<br>") || "(no se pudo leer)"}</span></p></body>`);
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
