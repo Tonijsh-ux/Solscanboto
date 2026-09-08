@@ -512,7 +512,12 @@ const ESPIA_ALIMENTA = process.env.ESPIA_ALIMENTA !== "0";
 // 1.000 millones de supply; (2) el wash y los compradores se inflan con un bot; (3) los
 // pivotes y la envolvente leen un paseo aleatorio, no un mercado.
 // De momento solo se DETECTA y se apunta; el veto se enciende cuando los datos lo digan.
-const MAYHEM_VETO = process.env.MAYHEM_VETO === "1";
+// [6-sep] ACTIVADO. Con HELIUS_TODO el disparador ve un 15% más de migraciones que
+// PumpPortal (medido: soloHelius=336 contra soloPP=2), y comprobado a mano: la mayoría
+// son Mayhem. Antes PumpPortal las filtraba sin querer; ahora entran y salen en el panel
+// como monedas sin verificar. Son tokens con un agente de IA operando al azar 24h y el
+// doble de supply: ni el precio ni el wash significan lo mismo. Se apaga con MAYHEM_VETO=0.
+const MAYHEM_VETO = process.env.MAYHEM_VETO !== "0";
 const supplyCache = new Map();   // mint → { supply, mayhem }
 // el MC se calculaba SIEMPRE con 1.000 millones de supply. En un token Mayhem el supply es
 // el doble, así que el MC real es el doble del que veíamos y los filtros de MC decidían con
@@ -1282,6 +1287,14 @@ function migUpdateWatching(mint, price, solAmount, entry) {
 }
 
 function migQualityGateThenOpen(entry, entryPriceB) {
+  // [6-sep] el veto de Mayhem estaba solo en migExamThenOpen, pero el supply llega por RPC
+  // en paralelo y puede tardar más de los 2s del examen: por esta otra puerta se colaban.
+  if (MAYHEM_VETO && entry.mayhem) {
+    addLog(`🤖 MIG MAYHEM: ${entry.symbol} descartada en la puerta de calidad`, "filter");
+    migRechazada(entry, "MIG MAYHEM"); state.stats.mig_rejected++;
+    state.migWatching.delete(entry.mint); unsubscribeToken(entry.mint);
+    broadcast({ event: "stats", data: state.stats }); return;
+  }
   // Tope de MC de entrada: se aplica SIEMPRE, con o sin qual_gate.
   const mcEntryUsdPre = entryPriceB * supplyDe(entry.mint);   // [1-sep] supply real (Mayhem = 2.000M)
   if (mcEntryUsdPre > MIG_MAX_MC_ENTRY) {
@@ -3575,7 +3588,18 @@ function connectPumpPortal() {
         if (price > 0) {
           lastTickAt.set(msg.mint, Date.now());   // [v11.9] pulso del feed para el rescatador
           if (OBSERVER_MODE && state.obsRecordings.has(msg.mint)) { obsSample(msg.mint, price); return; }
-          migUpdatePrice(msg.mint, price, msg.solAmount || 0, msg.traderPublicKey || null, msg.txType === "buy");
+          // [6-sep] con HELIUS_TODO los precios los pone Helius. Los trades de PumpPortal
+          // NO deben alimentar también la vigilancia: si lo hicieran, el volumen, los
+          // compradores y el wash se contarían DOS veces (una por fuente) y los filtros
+          // decidirían con números inflados al doble.
+          // Sus MIGRACIONES sí siguen entrando: el disparador es la unión de las dos fuentes.
+          if (!HELIUS_TODO) {
+            migUpdatePrice(msg.mint, price, msg.solAmount || 0, msg.traderPublicKey || null, msg.txType === "buy");
+          } else {
+            lastTickAt.set(msg.mint, Date.now());   // el reloj del rescate sí se refresca
+            const c0 = espia.cuenta.get(msg.mint);
+            if (c0) { c0.portal++; c0.ultP = Date.now(); }   // y el espía sigue comparando
+          }
         }
       }
     } catch {}
@@ -3592,6 +3616,19 @@ function connectPumpPortal() {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// [8-sep] El panel del móvil: un solo HTML que sirve el propio bot, sin depender de
+// Vercel. Se lee una vez al arrancar; si el archivo no está, lo dice en vez de fallar.
+let PANEL_MOVIL = null;
+try { PANEL_MOVIL = fs.readFileSync(new URL("./panel_solana.html", import.meta.url), "utf-8"); }
+catch { try { PANEL_MOVIL = fs.readFileSync("./panel_solana.html", "utf-8"); } catch {} }
+app.get("/panel", (_, res) => {
+  if (PANEL_MOVIL) return res.type("html").send(PANEL_MOVIL);
+  res.type("html").send(`<!doctype html><meta charset=utf-8>
+    <body style="background:#0e1420;color:#dde5f2;font-family:system-ui;padding:28px;line-height:1.6">
+    <h1 style="font-size:19px">Bot de Solana</h1>
+    <p>Falta <b>panel_solana.html</b> junto a server.js en la carpeta backend.</p></body>`);
+});
 
 app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
