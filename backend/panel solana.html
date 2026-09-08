@@ -1,0 +1,396 @@
+<!DOCTYPE html><html lang="es"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0e1420">
+<title>Bot de Solana</title>
+<style>
+/* Mismo lenguaje visual que el panel de Pons: azul pizarra, el dinero es lo único
+   con color fuerte, y el ámbar queda para lo que hace el bot. La diferencia es que
+   aquí conviven TRES estrategias sobre el mismo token, y eso manda en el diseño. */
+:root{
+  --fondo:#0e1420; --sup:#161e2e; --sup2:#1c2638; --linea:#26314a;
+  --txt:#dde5f2; --tenue:#7b8aa5; --sube:#34d399; --baja:#f87171;
+  --bot:#f0a35e; --uni:#4ade80; --wash:#60a5fa;
+  --num:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--fondo);color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  font-size:15px;line-height:1.45;padding:0 12px calc(64px + env(safe-area-inset-bottom));
+  -webkit-font-smoothing:antialiased}
+.num{font-family:var(--num);font-variant-numeric:tabular-nums}
+.sube{color:var(--sube)}.baja{color:var(--baja)}.tenue{color:var(--tenue)}
+a{color:var(--bot);text-decoration:none}
+button{font:inherit}
+
+/* ── foco ── */
+.foco{padding:20px 0 4px;text-align:center}
+.foco .cifra{font-family:var(--num);font-size:52px;font-weight:600;letter-spacing:-.035em;line-height:1}
+.foco .bajo{color:var(--tenue);font-size:13px;margin-top:7px}
+.medidor{display:flex;height:6px;border-radius:4px;overflow:hidden;margin:16px 0 5px;background:var(--linea)}
+.medidor i{display:block;transition:width .4s ease}
+.reparto{font-size:11.5px;color:var(--tenue);display:flex;justify-content:space-between}
+
+/* las tres estrategias, una al lado de otra: es lo que distingue este bot */
+.dos{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin:16px 0 4px}
+.dos div{background:var(--sup);border:1px solid var(--linea);border-radius:12px;padding:11px 8px;text-align:center}
+.dos b{display:block;font-family:var(--num);font-size:19px;font-weight:600;letter-spacing:-.02em}
+.dos span{font-size:10.5px;color:var(--tenue);display:block;margin-top:2px}
+.tres .et{font-size:11px;font-weight:600;margin-bottom:4px}
+.et-mig{color:var(--tenue)}.et-uni{color:var(--uni)}.et-wash{color:var(--wash)}
+
+.trio{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0 4px}
+.trio div{background:var(--sup);border:1px solid var(--linea);border-radius:11px;padding:10px 8px;text-align:center}
+.trio b{display:block;font-family:var(--num);font-size:17px;font-weight:600}
+.trio span{font-size:10.5px;color:var(--tenue)}
+
+.aviso{background:#2a1215;border:1px solid var(--baja);color:#fca5a5;border-radius:11px;
+  padding:10px 12px;margin:12px 0;font-size:12.5px;line-height:1.5}
+
+/* ── pestañas ── */
+.pest{position:sticky;top:0;z-index:10;background:rgba(14,20,32,.94);backdrop-filter:blur(8px);
+  display:flex;gap:6px;padding:11px 0 9px;margin-top:14px;border-bottom:1px solid var(--linea);overflow-x:auto}
+.pest button{flex:0 0 auto;background:none;border:1px solid var(--linea);color:var(--tenue);
+  border-radius:999px;padding:6px 12px;font-size:13px;white-space:nowrap}
+.pest button[aria-pressed=true]{border-color:var(--bot);color:var(--bot);background:rgba(240,163,94,.08)}
+.pest .cuenta{opacity:.65;margin-left:4px}
+
+/* ── fichas ── */
+.ficha{background:var(--sup);border:1px solid var(--linea);border-radius:14px;padding:13px;margin:11px 0}
+.ficha.viva{border-color:rgba(240,163,94,.42)}
+.ficha.uni{border-left:3px solid var(--uni)}
+.ficha.wash{border-left:3px solid var(--wash)}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.top h3{margin:0;font-size:16.5px;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:7px}
+.pulso{width:7px;height:7px;border-radius:50%;background:var(--bot);animation:late 1.8s ease-in-out infinite}
+@keyframes late{0%,100%{opacity:1}50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.pulso{animation:none}}
+.sub{font-size:11.5px;color:var(--tenue);margin-top:3px}
+.pct{font-family:var(--num);font-size:24px;font-weight:600;letter-spacing:-.02em;text-align:right;white-space:nowrap}
+.pct small{display:block;font-size:11px;font-weight:400;color:var(--tenue);letter-spacing:0;margin-top:1px}
+.barra{display:flex;gap:3px;margin:11px 0 9px}
+.barra i{height:4px;border-radius:2px;background:var(--linea);flex:1}
+.barra i.puesto{background:var(--bot)}
+.pie{display:flex;gap:13px;font-size:11.5px;color:var(--tenue);flex-wrap:wrap}
+.pie b{color:var(--txt);font-family:var(--num);font-weight:500}
+.enlaces{display:flex;gap:14px;margin-top:11px;padding-top:10px;border-top:1px solid var(--linea);font-size:12.5px}
+.etiq{display:inline-block;font-size:10px;padding:1px 6px;border-radius:5px;border:1px solid var(--linea);color:var(--tenue);font-weight:500}
+
+.rotulo{font-size:12px;color:var(--tenue);margin:16px 0 2px;display:flex;justify-content:space-between}
+.vacio{color:var(--tenue);font-size:13.5px;text-align:center;padding:34px 16px;line-height:1.6}
+.linea-log{display:grid;grid-template-columns:46px 1fr;gap:9px;font-size:12.5px;padding:6px 0;border-bottom:1px solid rgba(38,49,74,.5)}
+.linea-log .h{font-family:var(--num);font-size:11px;color:var(--tenue)}
+.conex{position:fixed;left:0;right:0;bottom:0;padding:9px 12px calc(9px + env(safe-area-inset-bottom));
+  background:rgba(14,20,32,.96);border-top:1px solid var(--linea);font-size:11.5px;color:var(--tenue);
+  display:flex;justify-content:space-between;align-items:center}
+.punto{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px}
+.conectar{background:var(--sup);border:1px solid var(--bot);border-radius:14px;padding:15px;margin:16px 0}
+.conectar p{margin:0 0 11px;font-size:13.5px;line-height:1.5}
+.conectar .fila{display:flex;gap:8px}
+.conectar input{flex:1;min-width:0;background:var(--fondo);border:1px solid var(--linea);
+  color:var(--txt);border-radius:9px;padding:10px 11px;font:inherit;font-size:14px}
+.conectar button{background:var(--bot);border:none;color:#1a1206;border-radius:9px;
+  padding:10px 15px;font-weight:600;font-size:14px}
+svg{display:block}
+</style></head><body>
+
+<div class="conectar" id="conectar" hidden>
+  <p>Este archivo está abierto suelto. Pega la dirección del bot de Solana:</p>
+  <div class="fila">
+    <input id="urlServer" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="mi-bot.up.railway.app">
+    <button onclick="guardaUrl()">Conectar</button>
+  </div>
+</div>
+
+<div class="foco">
+  <div class="cifra num" id="neto">—</div>
+  <div class="bajo" id="netoPie">conectando…</div>
+</div>
+<div class="medidor"><i id="mVerde" style="width:0;background:var(--sube)"></i><i id="mRojo" style="width:0;background:var(--baja)"></i></div>
+<div class="reparto"><span id="rVerde"></span><span id="rRojo"></span></div>
+
+<div id="avisoRiesgo"></div>
+
+<div class="dos">
+  <div><div class="et et-uni">🤝 unida</div><b class="num" id="pUni">—</b><span id="nUni"></span></div>
+  <div><div class="et et-wash">🧼 wash</div><b class="num" id="pWash">—</b><span id="nWash"></span></div>
+</div>
+
+<div class="trio">
+  <div><b id="kVivas">0</b><span>posiciones vivas</span></div>
+  <div><b id="kVig">0</b><span>vigilando</span></div>
+  <div><b id="kGrab">0</b><span>grabando</span></div>
+</div>
+
+<nav class="pest">
+  <button aria-pressed="true"  data-v="vivas">Ahora<span class="cuenta" id="cVivas"></span></button>
+  <button aria-pressed="false" data-v="cerradas">Cerradas<span class="cuenta" id="cCerr"></span></button>
+  <button aria-pressed="false" data-v="vigilando">Vigilando<span class="cuenta" id="cVig"></span></button>
+  <button aria-pressed="false" data-v="rechazadas">Rechazadas<span class="cuenta" id="cRech"></span></button>
+  <button aria-pressed="false" data-v="log">Actividad</button>
+</nav>
+
+<main id="lista"></main>
+
+<div class="conex"><span><i class="punto" id="pConex" style="background:var(--tenue)"></i><span id="tConex">conectando…</span></span>
+  <span id="tExtra"></span></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SOL_USD = 100;                       // solo para el equivalente en dólares
+const sig = x => (x >= 0 ? "+" : "") + x;
+const cls = x => x >= 0 ? "sube" : "baja";
+const eur = x => Math.round(x * SOL_USD).toLocaleString("es-ES");
+const hace = ms => { const s = Math.round((Date.now() - ms) / 1000);
+  return s < 60 ? s + "s" : s < 3600 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h"; };
+
+// Solo las dos estrategias que importan. La pierna de migración es el peaje que se
+// paga para armar el relevo —pierde por diseño— y ensuciaba la lectura del panel.
+const EST = {
+  unida:  { nom: "🤝 unida", corto: "UNIDA", clase: "uni" },
+  unida2: { nom: "🧼 wash",  corto: "WASH",  clase: "wash" },
+};
+const esMia = (t) => !!EST[t.strategy];
+
+let D = { demoTrades: [], migWatching: [], migMonitored: [], rechazadas: [], log: [], stats: {}, risk: null };
+let vista = "vivas";
+
+function spark(pts, w, h, color){
+  if (!pts || pts.length < 2) return "";
+  const mn = Math.min(...pts), mx = Math.max(...pts), r = (mx - mn) || 1;
+  const d = pts.map((p,i) => `${i?"L":"M"}${(i/(pts.length-1)*w).toFixed(1)},${(h-((p-mn)/r)*h).toFixed(1)}`).join("");
+  const y0 = mn < 0 && mx > 0 ? (h - ((0-mn)/r)*h).toFixed(1) : null;
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none">`
+    + (y0 ? `<line x1="0" y1="${y0}" x2="${w}" y2="${y0}" stroke="#26314a" stroke-width="1"/>` : "")
+    + `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.7" stroke-linejoin="round"/></svg>`;
+}
+
+// el neto de cada estrategia, sumando sus cierres
+function porEstrategia(){
+  const R = {};
+  for (const k of Object.keys(EST)) R[k] = { neto: 0, n: 0, verdes: 0, vivas: 0 };
+  for (const t of D.demoTrades){
+    if (!esMia(t)) continue;
+    const e = R[t.strategy]; if (!e) continue;
+    if (t.status === "OPEN") { e.vivas++; continue; }
+    const sol = (t.sizeSol || 0.5) * ((t.pnlPct || 0) - 4.5) / 100;
+    e.neto += sol; e.n++; if (sol > 0) e.verdes++;
+  }
+  return R;
+}
+
+function pintaFoco(){
+  const R = porEstrategia();
+  const neto = Object.values(R).reduce((s, e) => s + e.neto, 0);
+  const n = Object.values(R).reduce((s, e) => s + e.n, 0);
+  const v = Object.values(R).reduce((s, e) => s + e.verdes, 0);
+
+  $("neto").textContent = sig(neto.toFixed(2));
+  $("neto").className = "cifra num " + cls(neto);
+  $("netoPie").textContent = `SOL netos · ${eur(neto)} $ · ${n} operaciones cerradas`;
+
+  const pv = n ? Math.round(100*v/n) : 0;
+  $("mVerde").style.width = pv + "%";
+  $("mRojo").style.width = (n ? 100-pv : 0) + "%";
+  $("rVerde").textContent = n ? `${v} en verde` : "sin cerrar nada aún";
+  $("rRojo").textContent = n ? `${n-v} en rojo` : "";
+
+  for (const [k, el] of [["unida","Uni"],["unida2","Wash"]]){
+    const e = R[k];
+    $("p"+el).textContent = sig(e.neto.toFixed(2));
+    $("p"+el).className = "num " + cls(e.neto);
+    $("n"+el).textContent = `${e.n} cerradas${e.vivas ? " · " + e.vivas + " viva" + (e.vivas>1?"s":"") : ""}`;
+  }
+
+  const mias = D.demoTrades.filter(esMia);
+  $("kVivas").textContent = mias.filter(t => t.status === "OPEN").length;
+  $("kVig").textContent = (D.migWatching || []).length;
+  $("kGrab").textContent = (D.migMonitored || []).length;
+  $("cVivas").textContent = " " + mias.filter(t => t.status === "OPEN").length;
+  $("cCerr").textContent  = " " + mias.filter(t => t.status !== "OPEN").length;
+  $("cVig").textContent   = " " + (D.migWatching || []).length;
+  $("cRech").textContent  = " " + (D.rechazadas || []).length;
+
+  // el freno de riesgo, si está puesto, es lo primero que hay que ver
+  const r = D.risk;
+  $("avisoRiesgo").innerHTML = (r && (r.paused || r.halted))
+    ? `<div class="aviso">⛔ <b>Bot pausado por riesgo.</b> ${r.motivo || r.reason || ""}</div>` : "";
+}
+
+const enlaces = m => `<div class="enlaces">
+  <a href="https://pump.fun/${m}" target="_blank" rel="noopener">pump.fun</a>
+  <a href="https://solscan.io/token/${m}" target="_blank" rel="noopener">Solscan</a>
+  <a href="#" onclick="navigator.clipboard.writeText('${m}');this.textContent='copiada';return false">copiar mint</a>
+</div>`;
+
+function fichaTrade(t){
+  const e = EST[t.strategy] || EST.migration;
+  const viva = t.status === "OPEN";
+  const pct = viva ? (t.currentPct || 0) : (t.pnlPct || 0);
+  const sol = (t.sizeSol || 0.5) * (pct - (viva ? 0 : 4.5)) / 100;
+  const lotes = t.trailingPhase && /×(\d+)/.test(t.trailingPhase) ? +t.trailingPhase.match(/×(\d+)/)[1] : 0;
+  return `<article class="ficha ${viva ? "viva" : ""} ${e.clase}" data-id="${t.id}">
+    <div class="top">
+      <div><h3>${viva ? '<i class="pulso"></i>' : ""}${t.symbol || "???"}
+             <span class="etiq">${e.corto}</span></h3>
+        <div class="sub">${t.trailingPhase || ""} · ${(t.sizeSol||0).toFixed(2)} SOL dentro${
+          t.mcEntry ? ` · entrada MC $${Math.round(t.mcEntry/1000)}K` : ""}${
+          viva ? "" : " · " + (t.result || "").toLowerCase()}</div></div>
+      <div class="pct ${cls(pct)}">${sig(pct.toFixed(1))}%<small>${sig(sol.toFixed(3))} SOL · ${eur(sol)} $</small></div>
+    </div>
+    ${lotes ? `<div class="barra">${Array.from({length:8},(_,i)=>`<i class="${i<lotes?"puesto":""}"></i>`).join("")}</div>` : ""}
+    <div class="pie">
+      <span>máx <b class="sube">${sig((t.maxGainPct||0).toFixed(0))}%</b></span>
+      <span>suelo <b class="baja">${(t.maxLossPct||0).toFixed(0)}%</b></span>
+      ${t.velSeg != null ? `<span>vel <b>${t.velSeg}s</b></span>` : ""}
+      ${t.mov2s != null ? `<span>mov2s <b>${sig(t.mov2s.toFixed(0))}%</b></span>` : ""}
+      <span>${viva ? "abierta hace" : "duró"} <b>${viva ? hace(t.openTime) : hace(t.openTime)}</b></span>
+    </div>
+    ${enlaces(t.mint)}
+  </article>`;
+}
+
+function fichaVigilando(w){
+  const pct = w.ultimoPct != null ? w.ultimoPct : (w.lastPct || 0);
+  return `<article class="ficha">
+    <div class="top">
+      <div><h3>${w.symbol || "???"}</h3>
+        <div class="sub">vigilando desde hace ${hace(w.startTime || w.t0 || Date.now())}${
+          w.mc ? ` · MC $${Math.round(w.mc/1000)}K` : ""}</div></div>
+      <div class="pct ${cls(pct)}">${sig((pct||0).toFixed(1))}%<small>desde que migró</small></div>
+    </div>
+    <div class="pie" style="margin-top:9px">
+      ${w.volumeUSD != null ? `<span>volumen <b>$${Math.round(w.volumeUSD)}</b></span>` : ""}
+      ${w.trades != null ? `<span><b>${w.trades}</b> trades</span>` : ""}
+      ${w.sigPct != null ? `<span>señal <b>${sig(w.sigPct.toFixed(0))}%</b></span>` : ""}
+    </div>
+    ${enlaces(w.mint)}
+  </article>`;
+}
+
+function fichaRechazada(r){
+  return `<article class="ficha">
+    <div class="top">
+      <div><h3>${r.symbol || r.mint.slice(0,6)}</h3>
+        <div class="sub">${r.motivo || ""} · ${r.dur || 0}s vigilada</div></div>
+      <div class="pct tenue" style="font-size:19px">${r.ultimo != null ? sig(r.ultimo.toFixed(0)) + "%" : "—"}
+        <small>al descartar</small></div>
+    </div>
+    ${r.serie && r.serie.length ? spark(r.serie.map(p => p.p != null ? p.p : p), 300, 40, "#7b8aa5") : ""}
+    <div class="pie" style="margin-top:9px">
+      ${r.mc ? `<span>MC <b>$${Math.round(r.mc/1000)}K</b></span>` : ""}
+      ${r.vol != null ? `<span>vol <b>$${Math.round(r.vol)}</b></span>` : ""}
+      ${r.helius ? `<span class="tenue">⚡ Helius vio $${Math.round(r.helius.vol)}</span>` : ""}
+    </div>
+    ${enlaces(r.mint)}
+  </article>`;
+}
+
+function pinta(){
+  pintaFoco();
+  const L = $("lista");
+  if (vista === "vivas"){
+    const v = D.demoTrades.filter(t => esMia(t) && t.status === "OPEN");
+    L.innerHTML = v.length ? v.map(fichaTrade).join("")
+      : `<p class="vacio">Ninguna posición abierta.<br>El bot está esperando migraciones que pasen los filtros.</p>`;
+  } else if (vista === "cerradas"){
+    const c = D.demoTrades.filter(t => esMia(t) && t.status !== "OPEN");
+    L.innerHTML = c.length ? c.slice(0, 60).map(fichaTrade).join("")
+      : `<p class="vacio">Todavía no se ha cerrado ninguna posición.</p>`;
+  } else if (vista === "vigilando"){
+    const w = D.migWatching || [];
+    L.innerHTML = w.length ? w.map(fichaVigilando).join("")
+      : `<p class="vacio">Ningún token en vigilancia ahora mismo.</p>`;
+  } else if (vista === "rechazadas"){
+    const r = D.rechazadas || [];
+    L.innerHTML = r.length ? r.slice(0, 60).map(fichaRechazada).join("")
+      : `<p class="vacio">Sin migraciones rechazadas todavía.</p>`;
+  } else {
+    L.innerHTML = (D.log || []).length ? D.log.slice(0, 150).map(l => `<div class="linea-log">
+        <span class="h">${new Date(l.time || l.t).toTimeString().slice(0,5)}</span>
+        <span>${l.message || l.msg}</span></div>`).join("")
+      : `<p class="vacio">Sin actividad todavía.</p>`;
+  }
+}
+
+document.querySelectorAll(".pest button").forEach(b => b.onclick = () => {
+  vista = b.dataset.v;
+  document.querySelectorAll(".pest button").forEach(x => x.setAttribute("aria-pressed", x === b));
+  pinta(); window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
+// ── conexión ──
+function baseServer(){
+  if (location.protocol.startsWith("http") && location.host) return location.host;
+  try { return localStorage.getItem("sol_url") || ""; } catch { return ""; }
+}
+function guardaUrl(){
+  let v = ($("urlServer").value || "").trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  if (!v) return;
+  try { localStorage.setItem("sol_url", v); } catch {}
+  location.reload();
+}
+
+let ws, reintento = 1000, sondeo = null;
+function conecta(){
+  const host = baseServer();
+  if (!host){ $("conectar").hidden = false; $("tConex").textContent = "falta la dirección"; return; }
+  const seguro = location.protocol === "https:" || !location.protocol.startsWith("http");
+  ws = new WebSocket((seguro ? "wss://" : "ws://") + host);
+  ws.onopen = () => { reintento = 1000; if (sondeo){clearInterval(sondeo);sondeo=null;}
+    $("pConex").style.background = "var(--sube)"; $("tConex").textContent = "en directo"; };
+  ws.onclose = () => {
+    $("pConex").style.background = "var(--baja)"; $("tConex").textContent = "sin conexión, reintentando";
+    if (!sondeo) sondeo = setInterval(pregunta, 5000);
+    setTimeout(conecta, reintento); reintento = Math.min(reintento * 2, 15000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    const d = m.data;
+    switch (m.event){
+      case "fullState": D = { ...D, ...d }; pinta(); break;
+      case "stats": D.stats = d; pintaFoco(); break;
+      case "risk":  D.risk = d;  pintaFoco(); break;
+      case "newDemoTrade": D.demoTrades.unshift(d); if (esMia(d)) pinta(); break;
+      case "demoTradeUpdate": case "demoTradeClosed": {
+        const i = D.demoTrades.findIndex(t => t.id === d.id);
+        if (i < 0 && !esMia(d)) break;
+        if (i >= 0) D.demoTrades[i] = { ...D.demoTrades[i], ...d }; else D.demoTrades.unshift(d);
+        // solo se repinta la ficha afectada, para que la lista no dé saltos
+        if (vista === "vivas" || vista === "cerradas"){
+          const el = document.querySelector(`.ficha[data-id="${d.id}"]`);
+          const t = D.demoTrades.find(x => x.id === d.id);
+          if (el && t && (t.status === "OPEN") === (vista === "vivas")) el.outerHTML = fichaTrade(t);
+          else pinta();
+        }
+        pintaFoco(); break;
+      }
+      case "migWatchUpdate": {
+        D.migWatching = D.migWatching || [];
+        const i = D.migWatching.findIndex(w => w.mint === d.mint);
+        if (i >= 0) D.migWatching[i] = { ...D.migWatching[i], ...d }; else D.migWatching.push(d);
+        if (vista === "vigilando") pinta(); else pintaFoco(); break;
+      }
+      case "newMigToken": D.migMonitored = [d, ...(D.migMonitored||[])]; pintaFoco(); break;
+      case "removeToken": D.migMonitored = (D.migMonitored||[]).filter(x => x.mint !== d.mint);
+                          D.migWatching = (D.migWatching||[]).filter(x => x.mint !== d.mint);
+                          pintaFoco(); break;
+      case "migRechazada": D.rechazadas = [d, ...(D.rechazadas||[])].slice(0,150);
+                           if (vista === "rechazadas") pinta(); else pintaFoco(); break;
+      case "log": D.log = [d, ...(D.log||[])].slice(0,300); if (vista === "log") pinta(); break;
+    }
+  };
+}
+async function pregunta(){
+  const host = baseServer(); if (!host) return;
+  try {
+    const r = await fetch((location.protocol === "http:" ? "http://" : "https://") + host + "/api/state");
+    D = { ...D, ...(await r.json()) };
+    $("tConex").textContent = "actualizando cada 5s"; $("pConex").style.background = "var(--bot)";
+    pinta();
+  } catch { $("tConex").textContent = "no se llega al bot"; }
+}
+conecta();
+setInterval(() => { if (vista === "vivas" || vista === "vigilando") pinta(); }, 10000);
+</script></body></html>
