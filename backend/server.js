@@ -24,7 +24,8 @@ import WebSocket from "ws";
 
 const HELIUS_API_KEY = (process.env.HELIUS_API_KEY || "").trim();
 const PUMPPORTAL_API_KEY = (process.env.PUMPPORTAL_API_KEY || "").trim();
-const CAMARA_MIN = +(process.env.CAMARA_MIN || 90);
+const CAMARA_MIN = +(process.env.CAMARA_MIN || 60);
+const GRABA_MAYHEM = process.env.GRABA_MAYHEM === "1";   // de serie, los Mayhem (supply > 1,5e9) no se graban: ahorran créditos y no se operarían
 const MAX_SUBS_WS = +(process.env.MAX_SUBS_WS || 40);
 const WS_MAX = +(process.env.WS_MAX || 4);
 const PORT = +(process.env.PORT || 8080);
@@ -71,11 +72,16 @@ function reservasDe(post, mint, poolConocida) {
   return mejor;
 }
 
+// las dos cuentas de la piscina (la del token y la de WSOL): con ellas basta un accountSubscribe por cuenta, mucho más ligero
+function vaultsDe(tx, mint, pool) { const post = tx?.meta?.postTokenBalances || []; const keys = tx?.transaction?.message?.accountKeys || tx?.transaction?.accountKeys || [];
+  const pk = (i) => { const k = keys[i]; return typeof k === "string" ? k : (k?.pubkey || null); }; let base = null, quote = null;
+  for (const b of post) { if (b.owner !== pool) continue; if (b.mint === mint) base = pk(b.accountIndex); else if (b.mint === WSOL) quote = pk(b.accountIndex); }
+  return (base && quote) ? { base, quote } : null; }
 // la transacción de la migración: la piscina y el precio inicial (con reintentos, porque PumpPortal avisa en cuanto la ve)
 async function leeMigracion(firma, mint) {
   for (let i = 0; i < 6; i++) {
     try { const tx = await rpc("getTransaction", [firma, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]);
-      if (tx) { const r = reservasDe(tx.meta?.postTokenBalances, mint, null); if (r) return r; return null; } } catch (e) { if (i === 5) throw e; }
+      if (tx) { const r = reservasDe(tx.meta?.postTokenBalances, mint, null); if (r) { r.vaults = vaultsDe(tx, mint, r.pool); return r; } return null; } } catch (e) { if (i === 5) throw e; }
     await new Promise(r => setTimeout(r, 1500));
   }
   return null;
@@ -94,20 +100,32 @@ function heliusNueva() {
   abre(); S.hel.push(H); return H;
 }
 function heliusConHueco() { for (const H of S.hel) if (H.ok && H.subs.size < MAX_SUBS_WS) return H; if (S.hel.length < WS_MAX) return heliusNueva(); return S.hel.reduce((a, b) => (a.subs.size <= b.subs.size ? a : b)); }
-function suscribe(H, c) { if (!H.ok || H.ws.readyState !== WebSocket.OPEN) return; const id = ++H.nId; H.pend.set(id, c.mint);
-  H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.pool || c.mint], failed: false, vote: false },
-    { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] })); }
-function desuscribe(H, c) { const id = H.subs.get(c.mint); if (id == null) return; H.subs.delete(c.mint); H.porSub.delete(id); if (H.ok && H.ws.readyState === WebSocket.OPEN) H.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++H.nId, method: "transactionUnsubscribe", params: [id] })); }
+function suscribe(H, c) { if (!H.ok || H.ws.readyState !== WebSocket.OPEN) return;
+  if (c.vaults) {   // ligero: solo los saldos de las dos cuentas de la piscina
+    for (const cual of ["base", "quote"]) { const id = ++H.nId; H.pend.set(id, { mint: c.mint, cual, tipo: "cuenta" });
+      H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [c.vaults[cual], { encoding: "jsonParsed", commitment: "processed" }] })); }
+  } else {          // sin piscina aún: las transacciones del mint, solo hasta el 1er swap
+    const id = ++H.nId; H.pend.set(id, { mint: c.mint, cual: "tx", tipo: "tx" });
+    H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.mint], failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] })); } }
+function desuscribe(H, c) { const L = H.subs.get(c.mint); if (!L) return; H.subs.delete(c.mint);
+  for (const { id, tipo } of L) { H.porSub.delete(id); if (H.ok && H.ws.readyState === WebSocket.OPEN) H.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++H.nId, method: tipo === "cuenta" ? "accountUnsubscribe" : "transactionUnsubscribe", params: [id] })); } }
 
 function mensajeHelius(H, m) {
-  if (m.id && H.pend.has(m.id)) { const mint = H.pend.get(m.id); H.pend.delete(m.id);
-    if (m.error) { S.errores++; log(`⚠️ Helius rechazó la suscripción de ${corto(mint)}: ${m.error.message || JSON.stringify(m.error)}`); return; }
-    H.subs.set(mint, m.result); H.porSub.set(m.result, mint); return; }
+  if (m.id && H.pend.has(m.id)) { const { mint, cual, tipo } = H.pend.get(m.id); H.pend.delete(m.id);
+    if (m.error) { S.errores++; log(`⚠️ Helius rechazó la suscripción de ${corto(mint)} (${cual}): ${m.error.message || JSON.stringify(m.error)}`); return; }
+    const L = H.subs.get(mint) || []; L.push({ id: m.result, cual, tipo }); H.subs.set(mint, L); H.porSub.set(m.result, { mint, cual }); return; }
+  if (m.method === "accountNotification") {   // un saldo de una de las dos cuentas de la piscina
+    const q = H.porSub.get(m.params?.subscription); if (!q) return; const c = S.camaras.get(q.mint); if (!c || c.fin) return;
+    const amt = +(m.params?.result?.value?.data?.parsed?.info?.tokenAmount?.uiAmountString || m.params?.result?.value?.data?.parsed?.info?.tokenAmount?.uiAmount || 0); if (!(amt >= 0)) return;
+    if (q.cual === "base") c.resBase = amt; else c.resQuote = amt;
+    clearTimeout(c.timerPrecio); c.timerPrecio = setTimeout(() => precioDesdeReservas(c), 150);   // las dos cuentas cambian a la vez: se espera a tener las dos
+    return; }
   if (m.method !== "transactionNotification") return;
-  const mint = H.porSub.get(m.params?.subscription); if (!mint) return; const c = S.camaras.get(mint); if (!c || c.fin) return;
+  const q0 = H.porSub.get(m.params?.subscription); const mint = q0 && q0.mint; if (!mint) return; const c = S.camaras.get(mint); if (!c || c.fin) return;
   const firma = m.params?.result?.signature; if (firma) { if (c.vistas.has(firma)) return; c.vistas.add(firma); if (c.vistas.size > 4000) c.vistas = new Set([...c.vistas].slice(-2000)); }
   const meta = m.params?.result?.transaction?.meta; const r = reservasDe(meta?.postTokenBalances, mint, c.pool); if (!r) return;
-  if (!c.pool) { c.pool = r.pool; log(`🏊 ${c.sym}: piscina ${corto(c.pool)} descubierta en el 1er swap`); desuscribe(H, c); suscribe(H, c); }   // y a partir de ahora solo las transacciones de la piscina (menos tráfico)
+  if (!c.pool) { c.pool = r.pool; const tx = m.params?.result?.transaction; c.vaults = vaultsDe({ meta, transaction: tx?.transaction || tx }, mint, c.pool);
+    log(`🏊 ${c.sym}: piscina ${corto(c.pool)} descubierta en el 1er swap${c.vaults ? " · paso a vigilar solo sus dos cuentas" : ""}`); desuscribe(H, c); suscribe(H, c); }
   const clave = r.tok.toFixed(6) + "/" + r.sol.toFixed(9); if (c.ultReservas === clave) return; c.ultReservas = clave;
   const precio = r.sol / r.tok; if (!(precio > 0)) return;
   if (!c.precioIni) { c.precioIni = precio; c.ref = "1er swap"; }
@@ -120,6 +138,13 @@ function mensajeHelius(H, m) {
   if (t <= 60 && firmante) { c.min1.swaps++; if (compra === true) { c.min1.compradores.add(firmante); c.min1.solIn += (r.sol - (solAntes ?? r.sol)); } else if (compra === false) { c.min1.vendedores.add(firmante); c.min1.solOut += ((solAntes ?? r.sol) - r.sol); } }
   punto(c, t, precio);
 }
+function precioDesdeReservas(c) { if (c.fin || !(c.resBase > 0) || !(c.resQuote > 0)) return; const precio = c.resQuote / c.resBase; if (!(precio > 0)) return;
+  const clave = c.resBase.toFixed(6) + "/" + c.resQuote.toFixed(9); if (c.ultReservas === clave) return;
+  const subeSol = c.ultQuote != null ? c.resQuote > c.ultQuote : null; const dSol = c.ultQuote != null ? Math.abs(c.resQuote - c.ultQuote) : 0; c.ultQuote = c.resQuote; c.ultReservas = clave;
+  if (!c.precioIni) { c.precioIni = precio; c.ref = "1er swap"; }
+  c.swaps++; S.swaps++; c.ultSwap = Date.now(); const t = (Date.now() - c.t0) / 1000;
+  if (t <= 60) { c.min1.swaps++; if (subeSol === true) c.min1.solIn += dSol; else if (subeSol === false) c.min1.solOut += dSol; }
+  punto(c, t, precio); }
 function punto(c, t, precio) { const p = (precio / c.precioIni - 1) * 100; const ult = c.puntos[c.puntos.length - 1];
   if (ult && t - ult.t < 1) { ult.p = p; return; }            // como mucho un punto por segundo
   c.puntos.push({ t, p }); if (p > c.max.p) c.max = { t, p }; if (p < c.min.p) c.min = { t, p }; c.ultPrecio = precio; }
@@ -147,7 +172,7 @@ async function migracion(m) {
   c.timerFin = setTimeout(() => cierra(c, "fin de la cámara"), CAMARA_MIN * 60e3);
   log(`🐣 MIGRACIÓN ${c.sym} (${corto(mint)})${c.pool ? ` · piscina ${corto(c.pool)} · precio inicial ${c.precioIni.toExponential(3)} SOL` : " · piscina aún no (se verá en el 1er swap)"} · grabando ${CAMARA_MIN} min`);
   // 3) supply (¿Mayhem?) y el nacimiento, en paralelo
-  rpc("getTokenSupply", [mint]).then(s => { const n = +s?.value?.uiAmount; if (n > 0) { c.supply = n; c.mayhem = n > 1.5e9; } }).catch(() => {});
+  rpc("getTokenSupply", [mint]).then(s => { const n = +s?.value?.uiAmount; if (n > 0) { c.supply = n; c.mayhem = n > 1.5e9; if (c.mayhem && !GRABA_MAYHEM) { S.mayhemFuera = (S.mayhemFuera || 0) + 1; cierra(c, "Mayhem: no se graba"); } } }).catch(() => {});
   nacimiento(c).catch(e => { S.nacFallos++; log(`⚠️ nacimiento de ${c.sym}: ${e.message}`); });
 }
 
@@ -161,9 +186,11 @@ const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 async function nacimientoHelius(c) {
   const n = { seg: null, compradores: 0, compras: 0, ventas: 0, exentas: 0, top1: 0, top5: 0, top10: 0, mayorTxPct: 0, mayorTxDest: 1, prim3Pct: 0, creadorPct: 0, vendidoPct: 0, snipeSol: 0, tradesLeidos: 0, fuente: "helius" };
   try { const a = await rpc("getAsset", { id: c.mint }); const sym = a?.content?.metadata?.symbol; if (sym) c.sym = String(sym).slice(0, 14); c.creador = a?.authorities?.[0]?.address || c.creador || null; } catch {}
-  try { const cuentas = await rpc("getProgramAccounts", [TOKEN_PROGRAM, { encoding: "base64", dataSlice: { offset: 32, length: 40 }, filters: [{ dataSize: 165 }, { memcmp: { offset: 0, bytes: c.mint } }] }], 15000);
-    const supply = c.supply || 1e9; const saldos = [];
-    for (const x of cuentas || []) { const b = Buffer.from(x.account.data[0], "base64"); const owner = bs58(b.subarray(0, 32)); const amt = Number(b.readBigUInt64LE(32)) / 1e6; if (amt > 0 && owner !== c.pool) saldos.push({ owner, amt }); }
+  try { const supply = c.supply || 1e9; const saldos = []; let cursor = null;
+    for (let pag = 0; pag < 5; pag++) { const r = await rpc("getTokenAccounts", { mint: c.mint, limit: 1000, cursor: cursor || undefined, options: { showZeroBalance: false } }, 15000);
+      for (const x of r?.token_accounts || []) { const amt = Number(x.amount || 0) / 1e6; if (amt > 0 && x.owner !== c.pool) saldos.push({ owner: x.owner, amt }); }
+      cursor = r?.cursor; if (!cursor || !(r?.token_accounts || []).length) break; }
+    if (!S.avisoTen) { S.avisoTen = true; log(`ℹ️ tenedores por Helius (getTokenAccounts): ${c.sym} → ${saldos.length} cuentas con saldo`); }
     saldos.sort((a, b) => b.amt - a.amt); const pct = (x) => f2(100 * x / supply);
     n.compradores = saldos.length; n.top1 = pct(saldos[0]?.amt || 0); n.top5 = pct(saldos.slice(0, 5).reduce((s, v) => s + v.amt, 0)); n.top10 = pct(saldos.slice(0, 10).reduce((s, v) => s + v.amt, 0));
     if (c.creador) { const cr = saldos.find(v => v.owner === c.creador); n.creadorPct = pct(cr ? cr.amt : 0); } } catch (e) { log(`⚠️ ${c.sym}: tenedores por Helius: ${e.message}`); }
@@ -208,6 +235,7 @@ async function nacimiento(c) {
 // ── el cierre de una cámara: la línea [SOLREC] ──
 function cierra(c, motivo) {
   if (c.fin) return; c.fin = true; clearTimeout(c.timerFin); if (c.hel) desuscribe(c.hel, c); S.camaras.delete(c.mint);
+  if (motivo.startsWith("Mayhem")) { if (!SOLO_LOG) log(`🚫 ${c.sym}: Mayhem (supply ${Math.round((c.supply || 0) / 1e6)}M) · no se graba`); return; }
   if (c.puntos.length < 2 || !c.precioIni) { log(`🗑️ ${c.sym}: sin curva (${c.swaps} swaps, ${c.puntos.length} puntos) · ${motivo}`); return; }
   S.curvas++;
   const mc = c.precioIni * (c.supply || 1e9) * (S.solUsd || 0); const pts = c.puntos.map(q => `${Math.round(q.t)}:${f2(q.p)}`).join(",");
@@ -226,7 +254,7 @@ setInterval(() => { const ahora = Date.now();
 
 // ── la salud, cada 10 minutos ──
 setInterval(() => { const h = ((Date.now() - S.arranque) / 3600e3).toFixed(1); const subs = S.hel.reduce((s, H) => s + H.subs.size, 0);
-  log(`[SALUD] ${h}h · migraciones=${S.migs} (última hace ${S.ultimaMig ? Math.round((Date.now() - S.ultimaMig) / 60e3) + " min" : "—"}) · grabando=${S.camaras.size} · curvas=${S.curvas} · swaps=${S.swaps} · nacimientos=${S.nacHechos}/${S.nacHechos + S.nacFallos} · Helius ${S.hel.filter(H => H.ok).length}/${S.hel.length} conexiones, ${subs} suscripciones, ≈${(S.bytes / 1e6).toFixed(0)} MB · PumpPortal ${S.pp.ok ? "ok" : "CAÍDO"} · SOL $${S.solUsd.toFixed(0)} · errores ${S.errores}`); }, 10 * 60e3);
+  log(`[SALUD] ${h}h · migraciones=${S.migs} (última hace ${S.ultimaMig ? Math.round((Date.now() - S.ultimaMig) / 60e3) + " min" : "—"}) · grabando=${S.camaras.size} · curvas=${S.curvas} · swaps=${S.swaps} · nacimientos=${S.nacHechos}/${S.nacHechos + S.nacFallos} · Mayhem fuera=${S.mayhemFuera || 0} · Helius ${S.hel.filter(H => H.ok).length}/${S.hel.length} conexiones, ${subs} tokens suscritos, ≈${(S.bytes / 1e6).toFixed(0)} MB (${(S.bytes / 1e6 / Math.max(0.01, +h)).toFixed(0)} MB/h) · PumpPortal ${S.pp.ok ? "ok" : "CAÍDO"} · SOL $${S.solUsd.toFixed(0)} · errores ${S.errores}`); }, 10 * 60e3);
 
 // ── un HTTP mínimo para ver que vive ──
 http.createServer((req, res) => { if (req.url.startsWith("/ultimas")) { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(S.ultimas.map(u => ({ ...u, nac: u.nac ? { seg: u.nac.seg, compradores: u.nac.compradores, top5: u.nac.top5 } : null })))); return; }
