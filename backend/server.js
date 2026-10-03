@@ -152,12 +152,44 @@ async function migracion(m) {
 }
 
 // ── el nacimiento: lo que pasó en la curva de bonos ANTES de migrar (API de pump.fun) ──
-async function pumpApi(ruta) { const r = await fetch(`https://frontend-api-v3.pump.fun${ruta}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) }); if (!r.ok) throw new Error(`pump.fun ${r.status}`); return r.json(); }
+const CAB = { accept: "application/json", "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36", origin: "https://pump.fun", referer: "https://pump.fun/" };
+async function pumpApi(ruta) { const r = await fetch(`https://frontend-api-v3.pump.fun${ruta}`, { headers: CAB, signal: AbortSignal.timeout(8000) }); if (!r.ok) throw new Error(`pump.fun ${r.status}`); return r.json(); }
+let avisoPump = 0;
+// ── el nacimiento por Helius (cuando la API de pump.fun no contesta): símbolo (getAsset), tenedores y concentración (cuentas del token),
+//    y edad (la firma más antigua que menciona el mint). "compradores" = tenedores al migrar (los que compraron y aún tienen).
+const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+async function nacimientoHelius(c) {
+  const n = { seg: null, compradores: 0, compras: 0, ventas: 0, exentas: 0, top1: 0, top5: 0, top10: 0, mayorTxPct: 0, mayorTxDest: 1, prim3Pct: 0, creadorPct: 0, vendidoPct: 0, snipeSol: 0, tradesLeidos: 0, fuente: "helius" };
+  try { const a = await rpc("getAsset", { id: c.mint }); const sym = a?.content?.metadata?.symbol; if (sym) c.sym = String(sym).slice(0, 14); c.creador = a?.authorities?.[0]?.address || c.creador || null; } catch {}
+  try { const cuentas = await rpc("getProgramAccounts", [TOKEN_PROGRAM, { encoding: "base64", dataSlice: { offset: 32, length: 40 }, filters: [{ dataSize: 165 }, { memcmp: { offset: 0, bytes: c.mint } }] }], 15000);
+    const supply = c.supply || 1e9; const saldos = [];
+    for (const x of cuentas || []) { const b = Buffer.from(x.account.data[0], "base64"); const owner = bs58(b.subarray(0, 32)); const amt = Number(b.readBigUInt64LE(32)) / 1e6; if (amt > 0 && owner !== c.pool) saldos.push({ owner, amt }); }
+    saldos.sort((a, b) => b.amt - a.amt); const pct = (x) => f2(100 * x / supply);
+    n.compradores = saldos.length; n.top1 = pct(saldos[0]?.amt || 0); n.top5 = pct(saldos.slice(0, 5).reduce((s, v) => s + v.amt, 0)); n.top10 = pct(saldos.slice(0, 10).reduce((s, v) => s + v.amt, 0));
+    if (c.creador) { const cr = saldos.find(v => v.owner === c.creador); n.creadorPct = pct(cr ? cr.amt : 0); } } catch (e) { log(`⚠️ ${c.sym}: tenedores por Helius: ${e.message}`); }
+  try { let antes = undefined, viejo = null; for (let i = 0; i < 5; i++) { const sigs = await rpc("getSignaturesForAddress", [c.mint, { limit: 1000, before: antes, commitment: "confirmed" }]); if (!sigs || !sigs.length) break; viejo = sigs[sigs.length - 1]; if (sigs.length < 1000) break; antes = viejo.signature; }
+    if (viejo && viejo.blockTime) { n.seg = Math.max(0, Math.round(c.t0 / 1000 - viejo.blockTime)); c.creado = viejo.blockTime * 1000; } } catch {}
+  return n;
+}
+// base58 sin librerías (para los owners de las cuentas)
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function bs58(buf) { const d = [0]; for (const b of buf) { let c = b; for (let j = 0; j < d.length; j++) { c += d[j] << 8; d[j] = c % 58; c = (c / 58) | 0; } while (c > 0) { d.push(c % 58); c = (c / 58) | 0; } }
+  let s = ""; for (const b of buf) { if (b !== 0) break; s += "1"; } for (let j = d.length - 1; j >= 0; j--) s += B58[d[j]]; return s; }
+const PUMP_API = process.env.PUMP_API === "1";   // [3-oct] de serie, el nacimiento lo hace HELIUS; PUMP_API=1 añade lo de pump.fun (compras/ventas/revendido) si contesta
 async function nacimiento(c) {
-  const coin = await pumpApi(`/coins/${c.mint}`).catch(() => null);
+  if (!PUMP_API) {   // ── de serie: todo por Helius ──
+    c.nac = await nacimientoHelius(c); const n = c.nac;
+    c.nacTxt = [n.seg ?? "-", n.compradores, 0, n.top5, n.top1, n.mayorTxPct, 1, n.prim3Pct, n.creadorPct, n.vendidoPct, (c.creador || "-").slice(0, 10)].join("/"); S.nacHechos++;
+    log(`👶 NACIMIENTO ${c.sym}: ${n.seg != null ? (n.seg < 120 ? n.seg + " s" : Math.round(n.seg / 60) + " min") : "?"} hasta migrar · ${n.compradores} tenedores al migrar · los 5 mayores ${n.top5} % · el mayor ${n.top1} % · el creador ${n.creadorPct} %${c.mayhem ? " · ⚠️ MAYHEM" : ""}`); return; }
+  let fallo = null; const coin = await pumpApi(`/coins/${c.mint}`).catch(e => { fallo = e.message; return null; });
   if (coin) { if (coin.symbol) c.sym = String(coin.symbol).slice(0, 14); c.creador = coin.creator || null; c.creado = coin.created_timestamp ? +coin.created_timestamp : null; c.redes = { tg: !!coin.telegram, tw: !!coin.twitter, web: !!coin.website };
     if (!c.supply && coin.total_supply) c.supply = +coin.total_supply / 1e6; }
-  const trades = []; for (let off = 0; off < 4000; off += 200) { const L = await pumpApi(`/trades/all/${c.mint}?limit=200&offset=${off}&minimumSize=0`).catch(() => null); if (!Array.isArray(L) || !L.length) break; trades.push(...L); if (L.length < 200) break; }
+  const trades = []; if (coin) for (let off = 0; off < 4000; off += 200) { const L = await pumpApi(`/trades/all/${c.mint}?limit=200&offset=${off}&minimumSize=0`).catch(e => { fallo = e.message; return null; }); if (!Array.isArray(L) || !L.length) break; trades.push(...L); if (L.length < 200) break; }
+  if (!coin || !trades.length) {   // la API de pump.fun no contesta (o no da trades): lo mismo por Helius
+    if (avisoPump < 3) { avisoPump++; log(`ℹ️ la API de pump.fun no contestó para ${c.sym} (${fallo || "sin trades"}) → nacimiento por Helius (tenedores al migrar y edad del mint)`); }
+    c.nac = await nacimientoHelius(c); const n = c.nac;
+    c.nacTxt = [n.seg ?? "-", n.compradores, 0, n.top5, n.top1, n.mayorTxPct, 1, n.prim3Pct, n.creadorPct, n.vendidoPct, (c.creador || "-").slice(0, 10)].join("/"); S.nacHechos++;
+    log(`👶 NACIMIENTO ${c.sym} (por Helius): ${n.seg != null ? (n.seg < 120 ? n.seg + " s" : Math.round(n.seg / 60) + " min") : "?"} hasta migrar · ${n.compradores} tenedores · los 5 mayores ${n.top5} % · el mayor ${n.top1} % · el creador ${n.creadorPct} %${c.mayhem ? " · ⚠️ MAYHEM" : ""}`); return; }
   const antes = trades.filter(t => !t.timestamp || t.timestamp * 1000 <= c.t0 + 2000).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.slot || 0) - (b.slot || 0));
   const supply = c.supply || 1e9; const tok = (t) => (+t.token_amount || 0) / 1e6; const sol = (t) => (+t.sol_amount || 0) / 1e9;
   const compradores = new Set(), neto = new Map(); let compras = 0, ventas = 0, comprado = 0, vendido = 0, mayor = 0, solPrim3 = 0, tokPrim3 = 0;
@@ -201,7 +233,7 @@ http.createServer((req, res) => { if (req.url.startsWith("/ultimas")) { res.setH
   res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ horas: +((Date.now() - S.arranque) / 3600e3).toFixed(2), migraciones: S.migs, grabando: S.camaras.size, curvas: S.curvas, swaps: S.swaps, nacimientos: S.nacHechos, fallosNac: S.nacFallos, helius: S.hel.map(H => ({ ok: H.ok, subs: H.subs.size })), pumpportal: S.pp.ok, solUsd: S.solUsd, errores: S.errores, mb: +(S.bytes / 1e6).toFixed(1) })); }).listen(PORT, () => log(`🌐 escuchando en :${PORT}`));
 
 // ── arranque ──
-log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} min · latido ${LATIDO_S} s · muerto a los ${MUERTO_MIN} min · hasta ${WS_MAX} conexiones de Helius con ${MAX_SUBS_WS} suscripciones cada una`);
+log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} min · latido ${LATIDO_S} s · muerto a los ${MUERTO_MIN} min · hasta ${WS_MAX} conexiones de Helius con ${MAX_SUBS_WS} suscripciones cada una · nacimiento por ${PUMP_API ? "pump.fun (y Helius si falla)" : "HELIUS (tenedores al migrar, concentración y edad)"}`);
 await precioSol(); setInterval(precioSol, 5 * 60e3); log(`💱 SOL a $${S.solUsd.toFixed(2)}`);
 heliusNueva(); abrePumpPortal();
 process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) cierra(c, "apagado"); setTimeout(() => process.exit(0), 500); });
