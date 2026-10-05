@@ -1,4 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+//  EL SERVER DE SOLANA EN PAPEL · fase 2 de "Pons en Solana" · 5-oct-2026
+//  = el grabador (PumpPortal avisa, Helius lo hace todo) + EL MOTOR DEL SERVER DE PONS (el mismo del artefacto: motor.js)
+//    con ⭐⭐ (v3 a los 300 s al 60 % · roja 25 · 1 venta · 1ª v3 a los 10 min al 60 % · soporte 35 %) y el VETO DE BALLENAS
+//    (migra en ≤5 s con los 5 mayores ≥80 %). NO OPERA: lleva las cuentas en papel y en real estimado, igual que el artefacto.
+//  Variables nuevas: LOTE_SOL (0.1) · NAC_ESPERA_S (10: sin nacimiento a tiempo, no entra) · ESTRATEGIA (JSON de mandos; de serie ⭐⭐)
+//    · VETO_BALLENA (1) · ESTADO_FILE (/data/solana_papel.json)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+//  (lo de abajo es el grabador de siempre)
 //  EL GRABADOR DE SOLANA · fase 1 de "Pons en Solana" · 3-oct-2026
 //
 //  Qué hace: SOLO GRABA. No compra ni vende nada. Para cada token que migra de pump.fun a PumpSwap:
@@ -32,15 +40,32 @@ const PORT = +(process.env.PORT || 8080);
 const LATIDO_S = +(process.env.LATIDO_S || 15);
 const MUERTO_MIN = +(process.env.MUERTO_MIN || 10);
 const SOLO_LOG = process.env.SOLO_LOG === "1";
+const POLL_S = +(process.env.POLL_S || 3);           // [4-oct] cada cuántos segundos se leen los saldos de la piscina (como la cámara de Pons)
+const MODO_WS = process.env.MODO_WS !== "0";          // [5-oct] de serie el WebSocket swap a swap: el motor ve los MISMOS puntos que las curvas con que se simula (MODO_WS=0 = sondeo cada 3 s)
 const WSOL = "So11111111111111111111111111111111111111112";
 const RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_WS = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const PP_WS = PUMPPORTAL_API_KEY ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}` : "wss://pumpportal.fun/api/data";
 
 if (!HELIUS_API_KEY) { console.log("❌ falta HELIUS_API_KEY: sin ella no hay precios. Me paro."); process.exit(1); }
+// ═══ [5-oct] EL MOTOR (el del server de Pons, en motor.js: el mismo texto que corre el artefacto) ═══
+import fs from "fs"; import path from "path"; import { fileURLToPath } from "url";
+const DIR = path.dirname(fileURLToPath(import.meta.url));
+const W = new Function(fs.readFileSync(path.join(DIR, "motor.js"), "utf-8") + ";return {construyeMotor, netoReal};")();
+const ESTRELLA2 = { v3Corte2: 60, mv: 25, maxvend: 1, v3Seg: 600, v3Corte: 60, soporteSigue: 35 };
+let ESTRATEGIA = ESTRELLA2; try { if (process.env.ESTRATEGIA) ESTRATEGIA = JSON.parse(process.env.ESTRATEGIA); } catch (e) { console.log("⚠️ ESTRATEGIA no es un JSON válido: uso ⭐⭐"); }
+const MOTOR = W.construyeMotor({ cazDesde: 1e9, ...ESTRATEGIA });   // sin la bestia de dibujos (son rugs de Pons)
+if (!MOTOR) { console.log("❌ el motor no arranca. Me paro."); process.exit(1); }
+const LOTE_SOL = +(process.env.LOTE_SOL || 0.1), K = LOTE_SOL / 0.01;   // el motor cuenta en lotes de 0,01: se escala
+const NAC_ESPERA_S = +(process.env.NAC_ESPERA_S || 10), VETO_BALLENA = process.env.VETO_BALLENA !== "0";
+const ESTADO_FILE = process.env.ESTADO_FILE || (fs.existsSync("/data") ? "/data/solana_papel.json" : "/tmp/solana_papel.json");
+const P = { papel: 0, real: 0, cerradas: 0, ganadas: 0, abiertas: 0, entradas: 0, vetadas: 0, sinNac: 0, ultimas: [], desde: Date.now(), porMotivo: {}, maxExpuesto: 0 };
+try { const g = JSON.parse(fs.readFileSync(ESTADO_FILE, "utf-8")); Object.assign(P, g); } catch {}
+const guardaP = () => { try { fs.writeFileSync(ESTADO_FILE, JSON.stringify({ ...P, ultimas: P.ultimas.slice(0, 300) })); } catch (e) { } };
+setInterval(guardaP, 60e3);
 
 // ── el estado ──
-const S = { arranque: Date.now(), solUsd: 0, solUsdT: 0, migs: 0, ultimaMig: 0, curvas: 0, swaps: 0, bytes: 0, errores: 0,
+const S = { creadores: new Map(), arranque: Date.now(), solUsd: 0, solUsdT: 0, migs: 0, ultimaMig: 0, curvas: 0, swaps: 0, bytes: 0, errores: 0,
   camaras: new Map(),        // mint → la cámara
   vistas: new Set(),         // mints ya vistos (para no repetir)
   pp: { ws: null, ok: false, reconexiones: 0 }, hel: [], nacHechos: 0, nacFallos: 0, ultimas: [] };
@@ -57,7 +82,7 @@ async function precioSol() {
 }
 
 // ── RPC de Helius (sin librerías: JSON-RPC a pelo) ──
-async function rpc(method, params, ms = 8000) {
+async function rpc(method, params, ms = 8000) { S.llamadas = (S.llamadas || 0) + 1; S.porMetodo = S.porMetodo || {}; S.porMetodo[method] = (S.porMetodo[method] || 0) + 1;
   const r = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(ms) });
   const j = await r.json(); if (j.error) throw new Error(j.error.message || JSON.stringify(j.error)); return j.result;
 }
@@ -77,6 +102,9 @@ function vaultsDe(tx, mint, pool) { const post = tx?.meta?.postTokenBalances || 
   const pk = (i) => { const k = keys[i]; return typeof k === "string" ? k : (k?.pubkey || null); }; let base = null, quote = null;
   for (const b of post) { if (b.owner !== pool) continue; if (b.mint === mint) base = pk(b.accountIndex); else if (b.mint === WSOL) quote = pk(b.accountIndex); }
   return (base && quote) ? { base, quote } : null; }
+async function vaultsPorDueno(pool, mint) { const una = async (m) => { const r = await rpc("getTokenAccountsByOwner", [pool, { mint: m }, { encoding: "jsonParsed", commitment: "confirmed" }]);
+    let mejor = null; for (const x of r?.value || []) { const a = +(x.account?.data?.parsed?.info?.tokenAmount?.uiAmountString || 0); if (!mejor || a > mejor.a) mejor = { k: x.pubkey, a }; } return mejor ? mejor.k : null; };
+  const [base, quote] = await Promise.all([una(mint), una(WSOL)]); return (base && quote) ? { base, quote } : null; }
 // la transacción de la migración: la piscina y el precio inicial (con reintentos, porque PumpPortal avisa en cuanto la ve)
 async function leeMigracion(firma, mint) {
   for (let i = 0; i < 6; i++) {
@@ -147,7 +175,33 @@ function precioDesdeReservas(c) { if (c.fin || !(c.resBase > 0) || !(c.resQuote 
   punto(c, t, precio); }
 function punto(c, t, precio) { const p = (precio / c.precioIni - 1) * 100; const ult = c.puntos[c.puntos.length - 1];
   if (ult && t - ult.t < 1) { ult.p = p; return; }            // como mucho un punto por segundo
-  c.puntos.push({ t, p }); if (p > c.max.p) c.max = { t, p }; if (p < c.min.p) c.min = { t, p }; c.ultPrecio = precio; }
+  c.puntos.push({ t, p }); alMotor(c, c.puntos.length - 1); /* [5-oct] los anteriores ya no cambian: al motor */ if (p > c.max.p) c.max = { t, p }; if (p < c.min.p) c.min = { t, p }; c.ultPrecio = precio; }
+
+// el veto: la ballena (migra en ≤5 s con los 5 mayores ≥80 %) no se opera; el resto, al motor
+function decide(c) { if (c.fin || c.rec || c.veto) return; clearTimeout(c.timerNac); const n = c.nac || {};
+  if (VETO_BALLENA && n.seg != null && n.top5 != null && n.seg <= 5 && n.top5 >= 80) { c.veto = "ballena"; P.vetadas++; log(`🐋 ${c.sym}: ballena (${n.seg} s hasta migrar, los 5 mayores ${n.top5} %) · no se opera`); return; }
+  arrancaMotor(c); log(`🎛️ ${c.sym}: al motor (⭐⭐) · ${n.seg != null ? n.seg + " s hasta migrar" : "?"} · ${n.compradores ?? "?"} tenedores · los 5 mayores ${n.top5 ?? "?"} %`); }
+// ═══ [5-oct] EL MOTOR CON CADA TOKEN ═══
+// c.rec = el token para el motor (como en el server de Pons) · c.mi = cuántos puntos ha visto · se le dan los puntos ya definitivos
+function arrancaMotor(c) { if (c.rec || c.fin || c.veto) return;
+  c.rec = { poolId: c.mint, token: c.mint, symbol: c.sym, feePct: 0.25, precioIni: 1, supply: c.supply || 1e9, puntos: [], est: null, desliz: 0.58, gradMs: c.t0, dsV3: 0.58, v3: null };
+  c.mi = 0; P.entradas++; try { if (c.puntos.length) { c.rec.puntos.push({ t: 0, p: 0 }); MOTOR.estrategiaInit(c.rec, 1); c.mi = 1; } } catch (e) { log(`⚠️ motor (inicio) ${c.sym}: ${e.message}`); }
+  alMotor(c, c.puntos.length - 1); }
+function alMotor(c, hasta) { if (!c.rec || c.fin && hasta < c.puntos.length) { if (!c.rec) return; }
+  if (!c.mi && c.puntos.length) { c.rec.puntos.push({ t: 0, p: 0 }); try { MOTOR.estrategiaInit(c.rec, 1); } catch (e) {} c.mi = 1; }
+  for (; c.mi < hasta; c.mi++) { const q = c.puntos[c.mi]; const pr = +q.p.toFixed(2); c.rec.puntos.push({ t: q.t, p: pr });
+    try { MOTOR.estrategiaTick(c.rec, 1 + pr / 100, pr, q.t); } catch (e) { S.errores++; if (S.errores < 20) log(`⚠️ motor (tick) ${c.sym}: ${e.message}`); } }
+  cuentas(c); }
+// lo que ha cerrado el motor: papel (lo del motor) y real estimado (como el artefacto), en SOL
+function cuentas(c) { const L = MOTOR.sb.state.posiciones; let abiertas = 0, expuesto = 0;
+  for (const p of L) { if (p.estado === "ABIERTA") { abiertas++; expuesto += p.tamaño * K; continue; } if (p._contada || p.token !== c.mint && p.poolId !== c.mint && p.rec !== c.rec && !(p.poolId === undefined && p.token === undefined)) { if (p._contada) continue; }
+    if (p._contada) continue; const suyo = (p.poolId === c.mint || p.token === c.mint); if (!suyo) continue; p._contada = true;
+    const papel = (p.neto || 0) * K, real = W.netoReal({ fee: p.feePct, tam: p.tamaño, compras: p.compras || [], entrada: p.entrada, cierre: p.precioCierre }, { _P: c.puntos, _ds: 0.58 }) * K;
+    P.papel += papel; P.real += real; P.cerradas++; if (real > 0) P.ganadas++; P.porMotivo[p.motivo] = (P.porMotivo[p.motivo] || 0) + real;
+    const lotes = (p.compras || []).length || 1; c.papel = (c.papel || 0) + papel; c.real = (c.real || 0) + real; c.ops = (c.ops || 0) + 1;
+    log(`[SOLPOS] sym=${c.sym} mint=${c.mint} motivo=${p.motivo} lotes=${lotes} pnl=${(p.pnlPct ?? 0).toFixed(1)}% papel=${papel.toFixed(4)}SOL real=${real.toFixed(4)}SOL acum_real=${P.real.toFixed(3)}SOL`);
+    P.ultimas.unshift({ sym: c.sym, mint: c.mint, motivo: p.motivo, lotes, pnl: +(p.pnlPct ?? 0).toFixed(1), papel: +papel.toFixed(4), real: +real.toFixed(4), t: Date.now() }); if (P.ultimas.length > 300) P.ultimas.length = 300; }
+  P.abiertas = abiertas; if (expuesto > P.maxExpuesto) P.maxExpuesto = +expuesto.toFixed(3); P.expuesto = +expuesto.toFixed(3); }
 
 // ── PumpPortal: las migraciones ──
 function abrePumpPortal() {
@@ -167,13 +221,17 @@ async function migracion(m) {
   // 1) la piscina y el precio inicial, de la transacción de la migración
   if (c.firma) { try { const r = await leeMigracion(c.firma, mint); if (r) { c.pool = r.pool; c.precioIni = r.sol / r.tok; c.reservasIni = r; c.ultPrecio = c.precioIni; c.puntos.push({ t: 0, p: 0 }); } } catch (e) { log(`⚠️ ${c.sym}: no pude leer la migración (${e.message}); el precio inicial será el del 1er swap`); } }
   if (c.fin) return;
-  // 2) Helius: a grabar
-  c.hel = heliusConHueco(); suscribe(c.hel, c);
+  // 2) a grabar: las dos cuentas de la piscina (si no salieron de la transacción, se piden por el dueño)
+  if (c.pool && !c.vaults) { try { c.vaults = await vaultsPorDueno(c.pool, mint); } catch (e) { log(`⚠️ ${c.sym}: no encuentro las cuentas de la piscina (${e.message})`); } }
+  if (c.fin) return;
+  if (MODO_WS || !c.vaults) { c.hel = heliusConHueco(); suscribe(c.hel, c); S.porWs = (S.porWs || 0) + 1; } else S.porSondeo = (S.porSondeo || 0) + 1;
   c.timerFin = setTimeout(() => cierra(c, "fin de la cámara"), CAMARA_MIN * 60e3);
   log(`🐣 MIGRACIÓN ${c.sym} (${corto(mint)})${c.pool ? ` · piscina ${corto(c.pool)} · precio inicial ${c.precioIni.toExponential(3)} SOL` : " · piscina aún no (se verá en el 1er swap)"} · grabando ${CAMARA_MIN} min`);
   // 3) supply (¿Mayhem?) y el nacimiento, en paralelo
-  rpc("getTokenSupply", [mint]).then(s => { const n = +s?.value?.uiAmount; if (n > 0) { c.supply = n; c.mayhem = n > 1.5e9; if (c.mayhem && !GRABA_MAYHEM) { S.mayhemFuera = (S.mayhemFuera || 0) + 1; cierra(c, "Mayhem: no se graba"); } } }).catch(() => {});
-  nacimiento(c).catch(e => { S.nacFallos++; log(`⚠️ nacimiento de ${c.sym}: ${e.message}`); });
+  try { const sp = await rpc("getTokenSupply", [mint]); const n = +sp?.value?.uiAmount; if (n > 0) { c.supply = n; c.mayhem = n > 1.5e9; } } catch {}
+  if (c.mayhem && !GRABA_MAYHEM) { S.mayhemFuera = (S.mayhemFuera || 0) + 1; cierra(c, "Mayhem: no se graba"); return; }
+  c.timerNac = setTimeout(() => { if (!c.nac && !c.fin && !c.rec) { c.veto = "sin nacimiento"; P.sinNac++; log(`⏱️ ${c.sym}: el nacimiento no llegó en ${NAC_ESPERA_S} s · no se opera (se graba)`); } }, NAC_ESPERA_S * 1000);
+  nacimiento(c).then(() => decide(c)).catch(e => { S.nacFallos++; log(`⚠️ nacimiento de ${c.sym}: ${e.message}`); });
 }
 
 // ── el nacimiento: lo que pasó en la curva de bonos ANTES de migrar (API de pump.fun) ──
@@ -185,7 +243,14 @@ let avisoPump = 0;
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 async function nacimientoHelius(c) {
   const n = { seg: null, compradores: 0, compras: 0, ventas: 0, exentas: 0, top1: 0, top5: 0, top10: 0, mayorTxPct: 0, mayorTxDest: 1, prim3Pct: 0, creadorPct: 0, vendidoPct: 0, snipeSol: 0, tradesLeidos: 0, fuente: "helius" };
-  try { const a = await rpc("getAsset", { id: c.mint }); const sym = a?.content?.metadata?.symbol; if (sym) c.sym = String(sym).slice(0, 14); c.creador = a?.authorities?.[0]?.address || c.creador || null; } catch {}
+  try { const a = await rpc("getAsset", { id: c.mint }); const sym = a?.content?.metadata?.symbol; if (sym) c.sym = String(sym).slice(0, 14); } catch {}
+  try { let antes = undefined, viejo = null; for (let i = 0; i < 5; i++) { const sigs = await rpc("getSignaturesForAddress", [c.mint, { limit: 1000, before: antes, commitment: "confirmed" }]); if (!sigs || !sigs.length) break; viejo = sigs[sigs.length - 1]; if (sigs.length < 1000) break; antes = viejo.signature; }
+    if (viejo && viejo.blockTime) { n.seg = Math.max(0, Math.round(c.t0 / 1000 - viejo.blockTime)); c.creado = viejo.blockTime * 1000; }
+    if (viejo && viejo.signature) { const tx = await rpc("getTransaction", [viejo.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]);
+      const k0 = tx?.transaction?.message?.accountKeys?.[0]; const firmante = typeof k0 === "string" ? k0 : k0?.pubkey; if (firmante) c.creador = firmante; } } catch {}
+  // el creador repetido (en lo que lleva encendido el grabador)
+  if (c.creador) { const L = S.creadores.get(c.creador) || []; L.push(c.sym); S.creadores.set(c.creador, L); n.creadorTokens = L.length;
+    if (L.length >= 2) log(`🔁 CREADOR REPETIDO ${corto(c.creador)}: ${L.length} tokens (${L.slice(-6).join(", ")})`); }
   try { const supply = c.supply || 1e9; const saldos = []; let cursor = null;
     for (let pag = 0; pag < 5; pag++) { const r = await rpc("getTokenAccounts", { mint: c.mint, limit: 1000, cursor: cursor || undefined, options: { showZeroBalance: false } }, 15000);
       for (const x of r?.token_accounts || []) { const amt = Number(x.amount || 0) / 1e6; if (amt > 0 && x.owner !== c.pool) saldos.push({ owner: x.owner, amt }); }
@@ -194,8 +259,6 @@ async function nacimientoHelius(c) {
     saldos.sort((a, b) => b.amt - a.amt); const pct = (x) => f2(100 * x / supply);
     n.compradores = saldos.length; n.top1 = pct(saldos[0]?.amt || 0); n.top5 = pct(saldos.slice(0, 5).reduce((s, v) => s + v.amt, 0)); n.top10 = pct(saldos.slice(0, 10).reduce((s, v) => s + v.amt, 0));
     if (c.creador) { const cr = saldos.find(v => v.owner === c.creador); n.creadorPct = pct(cr ? cr.amt : 0); } } catch (e) { log(`⚠️ ${c.sym}: tenedores por Helius: ${e.message}`); }
-  try { let antes = undefined, viejo = null; for (let i = 0; i < 5; i++) { const sigs = await rpc("getSignaturesForAddress", [c.mint, { limit: 1000, before: antes, commitment: "confirmed" }]); if (!sigs || !sigs.length) break; viejo = sigs[sigs.length - 1]; if (sigs.length < 1000) break; antes = viejo.signature; }
-    if (viejo && viejo.blockTime) { n.seg = Math.max(0, Math.round(c.t0 / 1000 - viejo.blockTime)); c.creado = viejo.blockTime * 1000; } } catch {}
   return n;
 }
 // base58 sin librerías (para los owners de las cuentas)
@@ -206,8 +269,8 @@ const PUMP_API = process.env.PUMP_API === "1";   // [3-oct] de serie, el nacimie
 async function nacimiento(c) {
   if (!PUMP_API) {   // ── de serie: todo por Helius ──
     c.nac = await nacimientoHelius(c); const n = c.nac;
-    c.nacTxt = [n.seg ?? "-", n.compradores, 0, n.top5, n.top1, n.mayorTxPct, 1, n.prim3Pct, n.creadorPct, n.vendidoPct, (c.creador || "-").slice(0, 10)].join("/"); S.nacHechos++;
-    log(`👶 NACIMIENTO ${c.sym}: ${n.seg != null ? (n.seg < 120 ? n.seg + " s" : Math.round(n.seg / 60) + " min") : "?"} hasta migrar · ${n.compradores} tenedores al migrar · los 5 mayores ${n.top5} % · el mayor ${n.top1} % · el creador ${n.creadorPct} %${c.mayhem ? " · ⚠️ MAYHEM" : ""}`); return; }
+    c.nacTxt = [n.seg ?? "-", n.compradores, 0, n.top5, n.top1, n.mayorTxPct, 1, n.prim3Pct, n.creadorPct, n.vendidoPct, c.creador || "-", n.creadorTokens || 1].join("/"); S.nacHechos++;
+    log(`👶 NACIMIENTO ${c.sym}: ${n.seg != null ? (n.seg < 120 ? n.seg + " s" : Math.round(n.seg / 60) + " min") : "?"} hasta migrar · ${n.compradores} tenedores al migrar · los 5 mayores ${n.top5} % · el mayor ${n.top1} % · el creador ${corto(c.creador)} tiene ${n.creadorPct} %${(n.creadorTokens || 1) > 1 ? ` · 🔁 su token nº ${n.creadorTokens}` : ""}${c.mayhem ? " · ⚠️ MAYHEM" : ""}`); return; }
   let fallo = null; const coin = await pumpApi(`/coins/${c.mint}`).catch(e => { fallo = e.message; return null; });
   if (coin) { if (coin.symbol) c.sym = String(coin.symbol).slice(0, 14); c.creador = coin.creator || null; c.creado = coin.created_timestamp ? +coin.created_timestamp : null; c.redes = { tg: !!coin.telegram, tw: !!coin.twitter, web: !!coin.website };
     if (!c.supply && coin.total_supply) c.supply = +coin.total_supply / 1e6; }
@@ -234,17 +297,29 @@ async function nacimiento(c) {
 
 // ── el cierre de una cámara: la línea [SOLREC] ──
 function cierra(c, motivo) {
-  if (c.fin) return; c.fin = true; clearTimeout(c.timerFin); if (c.hel) desuscribe(c.hel, c); S.camaras.delete(c.mint);
+  if (c.fin) return;
+  if (c.rec) { alMotor(c, c.puntos.length); try { MOTOR.estrategiaFin(c.rec); } catch (e) { log(`⚠️ motor (fin) ${c.sym}: ${e.message}`); } cuentas(c);
+    MOTOR.sb.state.posiciones = MOTOR.sb.state.posiciones.filter(p => p.estado === "ABIERTA"); }   // lo cerrado ya está contado
+  clearTimeout(c.timerNac); c.fin = true; clearTimeout(c.timerFin); if (c.hel) desuscribe(c.hel, c); S.camaras.delete(c.mint);
   if (motivo.startsWith("Mayhem")) { if (!SOLO_LOG) log(`🚫 ${c.sym}: Mayhem (supply ${Math.round((c.supply || 0) / 1e6)}M) · no se graba`); return; }
   if (c.puntos.length < 2 || !c.precioIni) { log(`🗑️ ${c.sym}: sin curva (${c.swaps} swaps, ${c.puntos.length} puntos) · ${motivo}`); return; }
   S.curvas++;
   const mc = c.precioIni * (c.supply || 1e9) * (S.solUsd || 0); const pts = c.puntos.map(q => `${Math.round(q.t)}:${f2(q.p)}`).join(",");
   const m1 = c.min1; const conducta = `60:${m1.compradores.size}/${m1.vendedores.size}/${f2(m1.solIn)}/${f2(m1.solOut)}/${m1.swaps}`;
-  const linea = `[SOLREC] sym=${c.sym} mint=${c.mint} pool=${c.pool || "-"} firma=${c.firma || "-"} MC=$${(mc / 1000).toFixed(1)}K supply=${Math.round((c.supply || 1e9) / 1e6)}M MIN=${f2(c.min.p)}%@${Math.round(c.min.t)}s MAX=${f2(c.max.p)}%@${Math.round(c.max.t)}s par=SOL precioIni=${c.precioIni.toExponential(4)} ref=${c.ref} swaps=${c.swaps} puntos=${c.puntos.length} mayhem=${c.mayhem ? 1 : 0} conducta=${conducta} ${c.nacTxt ? `nac=${c.nacTxt} ` : ""}pts=${pts}`;
+  const linea = `[SOLREC] sym=${c.sym} mint=${c.mint} pool=${c.pool || "-"} firma=${c.firma || "-"} MC=$${(mc / 1000).toFixed(1)}K supply=${Math.round((c.supply || 1e9) / 1e6)}M MIN=${f2(c.min.p)}%@${Math.round(c.min.t)}s MAX=${f2(c.max.p)}%@${Math.round(c.max.t)}s par=SOL precioIni=${c.precioIni.toExponential(4)} ref=${c.ref} swaps=${c.swaps} puntos=${c.puntos.length} mayhem=${c.mayhem ? 1 : 0} veto=${c.veto ? c.veto.replace(" ", "_") : "-"} bot=${c.ops || 0}/${(c.papel || 0).toFixed(4)}/${(c.real || 0).toFixed(4)} conducta=${conducta} ${c.nacTxt ? `nac=${c.nacTxt} ` : ""}pts=${pts}`;
   log(linea);
   if (!SOLO_LOG) log(`📼 ${c.sym}: ${c.puntos.length} puntos en ${Math.round(c.puntos[c.puntos.length - 1].t / 60)} min · máx ${f1(c.max.p)} % a los ${Math.round(c.max.t)} s · mín ${f1(c.min.p)} % · ${c.swaps} swaps · ${motivo}`);
   S.ultimas.unshift({ sym: c.sym, mint: c.mint, max: f1(c.max.p), min: f1(c.min.p), puntos: c.puntos.length, swaps: c.swaps, nac: c.nac, t: Date.now() }); S.ultimas = S.ultimas.slice(0, 50);
 }
+
+// ── el sondeo: cada POLL_S s, los saldos de las cuentas de todas las piscinas vivas (getMultipleAccounts, de 100 en 100) ──
+let sondeando = false;
+setInterval(async () => { if (sondeando) return; sondeando = true;
+  try { const vivas = [...S.camaras.values()].filter(c => !c.fin && c.vaults && !c.hel); const cuentas = []; for (const c of vivas) cuentas.push([c, "base", c.vaults.base], [c, "quote", c.vaults.quote]);
+    for (let i = 0; i < cuentas.length; i += 100) { const lote = cuentas.slice(i, i + 100);
+      let r; try { r = await rpc("getMultipleAccounts", [lote.map(x => x[2]), { encoding: "jsonParsed", commitment: "processed" }], 6000); } catch (e) { S.errores++; continue; }
+      (r?.value || []).forEach((acc, j) => { const [c, cual] = lote[j]; const amt = +(acc?.data?.parsed?.info?.tokenAmount?.uiAmountString ?? NaN); if (!(amt >= 0)) return; if (cual === "base") c.resBase = amt; else c.resQuote = amt; });
+      for (const c of new Set(lote.map(x => x[0]))) precioDesdeReservas(c); } } finally { sondeando = false; } }, POLL_S * 1000);
 
 // ── el latido: un punto aunque no haya swaps, y cerrar a los muertos ──
 setInterval(() => { const ahora = Date.now();
@@ -254,14 +329,33 @@ setInterval(() => { const ahora = Date.now();
 
 // ── la salud, cada 10 minutos ──
 setInterval(() => { const h = ((Date.now() - S.arranque) / 3600e3).toFixed(1); const subs = S.hel.reduce((s, H) => s + H.subs.size, 0);
-  log(`[SALUD] ${h}h · migraciones=${S.migs} (última hace ${S.ultimaMig ? Math.round((Date.now() - S.ultimaMig) / 60e3) + " min" : "—"}) · grabando=${S.camaras.size} · curvas=${S.curvas} · swaps=${S.swaps} · nacimientos=${S.nacHechos}/${S.nacHechos + S.nacFallos} · Mayhem fuera=${S.mayhemFuera || 0} · Helius ${S.hel.filter(H => H.ok).length}/${S.hel.length} conexiones, ${subs} tokens suscritos, ≈${(S.bytes / 1e6).toFixed(0)} MB (${(S.bytes / 1e6 / Math.max(0.01, +h)).toFixed(0)} MB/h) · PumpPortal ${S.pp.ok ? "ok" : "CAÍDO"} · SOL $${S.solUsd.toFixed(0)} · errores ${S.errores}`); }, 10 * 60e3);
+  log(`[SALUD] ${h}h · migraciones=${S.migs} (última hace ${S.ultimaMig ? Math.round((Date.now() - S.ultimaMig) / 60e3) + " min" : "—"}) · grabando=${S.camaras.size} · curvas=${S.curvas} · swaps=${S.swaps} · nacimientos=${S.nacHechos}/${S.nacHechos + S.nacFallos} · 📊 PAPEL: entradas ${P.entradas} · vetadas ${P.vetadas} · sin nacimiento ${P.sinNac} · cerradas ${P.cerradas} (${P.ganadas} ganadas) · abiertas ${P.abiertas} (${(P.expuesto || 0).toFixed(2)} SOL; máx ${P.maxExpuesto} SOL) · papel ${P.papel >= 0 ? "+" : ""}${P.papel.toFixed(3)} SOL · REAL ${P.real >= 0 ? "+" : ""}${P.real.toFixed(3)} SOL (${(P.real * S.solUsd >= 0 ? "+" : "−")}$${Math.abs(P.real * S.solUsd).toFixed(0)}) · Mayhem fuera=${S.mayhemFuera || 0} · creadores repetidos=${[...S.creadores.values()].filter(L => L.length >= 2).length} · por sondeo ${S.porSondeo || 0} / por WebSocket ${S.porWs || 0} · Helius: ${S.llamadas || 0} llamadas (${Math.round((S.llamadas || 0) / Math.max(0.01, +h) / 60)}/min; ${Object.entries(S.porMetodo || {}).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, v]) => k + " " + v).join(", ")}) · WS ${S.hel.filter(H => H.ok).length}/${S.hel.length} con ${subs} tokens, ≈${(S.bytes / 1e6).toFixed(0)} MB · PumpPortal ${S.pp.ok ? "ok" : "CAÍDO"} · SOL $${S.solUsd.toFixed(0)} · errores ${S.errores}`); }, 10 * 60e3);
 
 // ── un HTTP mínimo para ver que vive ──
-http.createServer((req, res) => { if (req.url.startsWith("/ultimas")) { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(S.ultimas.map(u => ({ ...u, nac: u.nac ? { seg: u.nac.seg, compradores: u.nac.compradores, top5: u.nac.top5 } : null })))); return; }
-  res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ horas: +((Date.now() - S.arranque) / 3600e3).toFixed(2), migraciones: S.migs, grabando: S.camaras.size, curvas: S.curvas, swaps: S.swaps, nacimientos: S.nacHechos, fallosNac: S.nacFallos, helius: S.hel.map(H => ({ ok: H.ok, subs: H.subs.size })), pumpportal: S.pp.ok, solUsd: S.solUsd, errores: S.errores, mb: +(S.bytes / 1e6).toFixed(1) })); }).listen(PORT, () => log(`🌐 escuchando en :${PORT}`));
+http.createServer((req, res) => {
+  const estado = () => ({ horas: +((Date.now() - S.arranque) / 3600e3).toFixed(2), migraciones: S.migs, grabando: S.camaras.size, curvas: S.curvas, nacimientos: S.nacHechos, fallosNac: S.nacFallos, solUsd: S.solUsd, errores: S.errores,
+    papel: { estrategia: ESTRATEGIA, lote: LOTE_SOL, entradas: P.entradas, vetadas: P.vetadas, sinNac: P.sinNac, cerradas: P.cerradas, ganadas: P.ganadas, abiertas: P.abiertas, expuesto: P.expuesto || 0, maxExpuesto: P.maxExpuesto, papelSOL: +P.papel.toFixed(4), realSOL: +P.real.toFixed(4), porMotivo: P.porMotivo, desde: P.desde } });
+  if (req.url.startsWith("/estado")) { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(estado())); return; }
+  if (req.url.startsWith("/ultimas")) { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(P.ultimas.slice(0, 100))); return; }
+  // el panel (se refresca solo cada 15 s)
+  const e = estado(), u = S.solUsd || 0, d = (x) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(3) + " SOL" + (u ? ` <small>(${x >= 0 ? "+" : "−"}$${Math.abs(x * u).toFixed(0)})</small>` : "");
+  const filas = P.ultimas.slice(0, 40).map(o => `<tr><td>${new Date(o.t).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid" })}</td><td><a href="https://dexscreener.com/solana/${o.mint}" target="_blank">${o.sym}</a></td><td>${o.motivo}</td><td>${o.lotes}</td><td>${o.pnl}%</td><td class="${o.real >= 0 ? "v" : "r"}">${o.real >= 0 ? "+" : ""}${o.real.toFixed(4)}</td></tr>`).join("");
+  res.setHeader("content-type", "text/html; charset=utf-8");
+  res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="15"><title>🟣 Solana · papel</title>
+<style>body{font:15px -apple-system,system-ui,sans-serif;margin:0;padding:12px;background:#f7f6f2;color:#1d1d1b}@media (prefers-color-scheme:dark){body{background:#161615;color:#ecebe6}.c{background:#1f1f1d!important;border-color:#34332f!important}}
+.c{background:#fff;border:1px solid #e6e3da;border-radius:14px;padding:12px;margin:10px 0}.k{display:grid;grid-template-columns:1fr 1fr;gap:8px}.k div{padding:6px 0}.k b{display:block;font-size:20px}.v{color:#1f7a4b}.r{color:#b3322e}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:4px;border-bottom:1px solid #e6e3da;text-align:right}td:nth-child(2),td:nth-child(3),th:nth-child(2),th:nth-child(3){text-align:left}small{color:#888}</style></head><body>
+<h2 style="margin:4px 0">🟣 Solana · en PAPEL</h2><div><small>motor de Pons · ${JSON.stringify(ESTRATEGIA) === JSON.stringify(ESTRELLA2) ? "⭐⭐" : "estrategia propia"} · veto de ballenas ${VETO_BALLENA ? "sí" : "no"} · lote ${LOTE_SOL} SOL · lleva ${e.horas} h · no opera: son cuentas</small></div>
+<div class="c k"><div>REAL estimado<b class="${P.real >= 0 ? "v" : "r"}">${d(P.real)}</b></div><div>papel<b>${d(P.papel)}</b></div>
+<div>operaciones<b>${P.cerradas}</b><small>${P.ganadas} ganadas (${P.cerradas ? Math.round(100 * P.ganadas / P.cerradas) : 0} %)</small></div><div>abiertas ahora<b>${P.abiertas}</b><small>${(P.expuesto || 0).toFixed(2)} SOL · máx ${P.maxExpuesto} SOL</small></div>
+<div>tokens al motor<b>${P.entradas}</b></div><div>vetados<b>${P.vetadas}</b><small>🐋 ballenas · ${P.sinNac} sin nacimiento</small></div></div>
+<div class="c"><b>Las últimas</b> <small>(real estimado, SOL)</small><div style="overflow-x:auto"><table><tr><th>hora</th><th>token</th><th>salida</th><th>lotes</th><th>%</th><th>real</th></tr>${filas || "<tr><td colspan=6>aún ninguna</td></tr>"}</table></div></div>
+<div class="c"><small>grabador: ${S.migs} migraciones · grabando ${S.camaras.size} · ${S.curvas} curvas · nacimientos ${S.nacHechos}/${S.nacHechos + S.nacFallos} · SOL $${u.toFixed(0)} · errores ${S.errores} · <a href="/estado">/estado</a> · <a href="/ultimas">/ultimas</a></small></div></body></html>`);
+}).listen(PORT, () => log(`🌐 panel en :${PORT} (/ , /estado , /ultimas)`));
 
 // ── arranque ──
-log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} min · latido ${LATIDO_S} s · muerto a los ${MUERTO_MIN} min · hasta ${WS_MAX} conexiones de Helius con ${MAX_SUBS_WS} suscripciones cada una · nacimiento por ${PUMP_API ? "pump.fun (y Helius si falla)" : "HELIUS (tenedores al migrar, concentración y edad)"}`);
+log(`🟣 SOLANA EN PAPEL · motor de Pons con ${JSON.stringify(ESTRATEGIA) === JSON.stringify(ESTRELLA2) ? "⭐⭐" : "ESTRATEGIA " + JSON.stringify(ESTRATEGIA)} · veto de ballenas ${VETO_BALLENA ? "sí" : "NO"} · lote ${LOTE_SOL} SOL · espera del nacimiento ${NAC_ESPERA_S} s · cuentas en ${ESTADO_FILE}${P.cerradas ? ` (sigue: ${P.cerradas} cerradas, real ${P.real.toFixed(3)} SOL)` : ""}`);
+log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} min · latido ${LATIDO_S} s · muerto a los ${MUERTO_MIN} min · hasta ${WS_MAX} conexiones de Helius con ${MAX_SUBS_WS} suscripciones cada una · nacimiento por ${PUMP_API ? "pump.fun (y Helius si falla)" : "HELIUS (tenedores al migrar, concentración y edad)"} · precio ${MODO_WS ? "por WebSocket, swap a swap" : `leyendo la piscina cada ${POLL_S} s (getMultipleAccounts)`}`);
 await precioSol(); setInterval(precioSol, 5 * 60e3); log(`💱 SOL a $${S.solUsd.toFixed(2)}`);
-heliusNueva(); abrePumpPortal();
-process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) cierra(c, "apagado"); setTimeout(() => process.exit(0), 500); });
+if (MODO_WS) heliusNueva(); abrePumpPortal();
+process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) cierra(c, "apagado"); guardaP(); setTimeout(() => process.exit(0), 500); });
