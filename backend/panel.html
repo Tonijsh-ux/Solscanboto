@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Solana · panel</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap">
+<style>
+:root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);
+  --fondo: #F4F2EE; --carta: #FFFFFF; --texto: #17171B; --gris: #57555E; --linea: #ECE9E3; --borde: #D6D3CC; --verde: #0F7A5C; --rojo: #B4471F; --azul: #2E5BD8; --gris2: #A8A5AE;
+  --aviso-f: #FFF1D6; --aviso-t: #7A4A00; --ok-f: #E4F3EE; --ok-t: #0B5A44; --mal-f: #FBE9E2; --mal-t: #8A2F12; --azul-f: #E7EEFC; --azul-t: #1E3F99; --boton: #17171B; --boton-t: #FFFFFF; --mapa-si: #2E9C7A; --mapa-no: #E3E0D9; }
+html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --fondo: #121214; --carta: #1C1C20; --texto: #ECEBE6; --gris: #A7A5AE; --linea: #2A2A2F; --borde: #3A3A40; --verde: #4CC38A; --rojo: #FF8A6B; --azul: #8FB3FF; --gris2: #6B6973;
+  --aviso-f: #3A2E14; --aviso-t: #FFD38A; --ok-f: #16312A; --ok-t: #7FE3B8; --mal-f: #3A211A; --mal-t: #FFB59E; --azul-f: #1C2742; --azul-t: #AFC6FF; --boton: #ECEBE6; --boton-t: #121214; --mapa-si: #2E9C7A; --mapa-no: #2E2E33; } }
+:root[data-theme="dark"] { --fondo: #121214; --carta: #1C1C20; --texto: #ECEBE6; --gris: #A7A5AE; --linea: #2A2A2F; --borde: #3A3A40; --verde: #4CC38A; --rojo: #FF8A6B; --azul: #8FB3FF; --gris2: #6B6973;
+  --aviso-f: #3A2E14; --aviso-t: #FFD38A; --ok-f: #16312A; --ok-t: #7FE3B8; --mal-f: #3A211A; --mal-t: #FFB59E; --azul-f: #1C2742; --azul-t: #AFC6FF; --boton: #ECEBE6; --boton-t: #121214; --mapa-si: #2E9C7A; --mapa-no: #2E2E33; }
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--fondo); color: var(--texto); font-family: 'DM Sans', system-ui, -apple-system, sans-serif; }
+.m { font-family: 'DM Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+.pagina { max-width: 560px; margin: 0 auto; padding: 16px 12px 40px; display: flex; flex-direction: column; gap: 12px; }
+.cab { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.marca { font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+.gr { color: var(--gris); font-size: 13px; }
+.chip { font-size: 12px; font-weight: 700; padding: 6px 10px; border-radius: 999px; white-space: nowrap; }
+.chip.papel { background: var(--aviso-f); color: var(--aviso-t); } .chip.armado { background: var(--ok-f); color: var(--ok-t); } .chip.desarmado { background: var(--mal-f); color: var(--mal-t); }
+.aviso { border-radius: 14px; padding: 12px 14px; background: var(--mal-f); color: var(--mal-t); font-size: 14px; font-weight: 600; }
+.card { background: var(--carta); border-radius: 18px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.tt { font-weight: 700; font-size: 15px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.big { font-size: 40px; letter-spacing: -.02em; }
+.pos { color: var(--verde); } .neg { color: var(--rojo); }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.kpi { background: var(--carta); border-radius: 14px; padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
+.kpi b { font-weight: 500; font-size: 16px; } .kpi span { font-size: 11px; color: var(--gris); }
+.fila { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; } .fila span:first-child { color: var(--gris); }
+.barrita { height: 8px; border-radius: 99px; background: var(--linea); overflow: hidden; } .barrita i { display: block; height: 100%; background: var(--verde); border-radius: 99px; }
+.ordenes { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.ordenes input { min-height: 44px; flex: 1 1 140px; border-radius: 12px; border: 1px solid var(--borde); background: var(--carta); color: var(--texto); font: inherit; padding: 0 12px; }
+button { font: inherit; cursor: pointer; }
+.b1 { min-height: 44px; border-radius: 12px; border: 0; background: var(--boton); color: var(--boton-t); font-weight: 700; padding: 0 16px; }
+.b2 { min-height: 44px; border-radius: 12px; border: 1px solid var(--borde); background: transparent; color: var(--texto); font-weight: 700; padding: 0 16px; }
+button:disabled { opacity: .45; cursor: default; }
+.msg { font-size: 13px; color: var(--gris); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; } td, th { padding: 8px 4px; font-size: 13px; text-align: right; border-top: 1px solid var(--linea); white-space: nowrap; } th { font-size: 11px; color: var(--gris); font-weight: 500; border-top: 0; } td:first-child, th:first-child { text-align: left; }
+.filtros { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.filtros button { flex: none; min-height: 40px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--borde); background: var(--carta); color: var(--texto); font-size: 13px; font-weight: 600; }
+.filtros button[aria-pressed="true"] { background: var(--boton); border-color: var(--boton); color: var(--boton-t); }
+.orden { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--gris); flex-wrap: wrap; } .orden select { min-height: 40px; border-radius: 10px; border: 1px solid var(--borde); background: var(--carta); color: var(--texto); font: inherit; padding: 0 10px; }
+.orden label.chk { display: flex; align-items: center; gap: 6px; }
+details { border-top: 1px solid var(--linea); } details:first-of-type { border-top: 0; }
+summary { list-style: none; cursor: pointer; padding: 12px 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; min-height: 44px; }
+summary::-webkit-details-marker { display: none; }
+.nom { font-weight: 700; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .res { font-size: 15px; text-align: right; }
+.lin { grid-column: span 2; font-size: 12.5px; color: var(--gris); display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { font-size: 11.5px; padding: 3px 8px; border-radius: 999px; background: var(--linea); color: var(--texto); }
+.tag.e { background: var(--azul-f); color: var(--azul-t); } .tag.s { background: var(--mal-f); color: var(--mal-t); } .tag.d { background: var(--ok-f); color: var(--ok-t); }
+.det { padding: 0 0 14px; display: flex; flex-direction: column; gap: 10px; }
+.det dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 13px; } .det dt { color: var(--gris); } .det dd { margin: 0; text-align: right; }
+.enl { display: flex; gap: 8px; flex-wrap: wrap; } .enl a { display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px; border-radius: 12px; background: var(--boton); color: var(--boton-t); text-decoration: none; font-weight: 700; font-size: 13px; } .enl a.sec { background: transparent; color: var(--texto); border: 1px solid var(--borde); }
+.nota { font-size: 12px; color: var(--gris); margin: 0; }
+.mapa { display: grid; grid-template-columns: 52px repeat(24, 1fr); gap: 2px; font-size: 10px; align-items: center; }
+.mapa i { display: block; height: 18px; border-radius: 3px; } .mapa .si { background: var(--mapa-si); } .mapa .no { background: var(--mapa-no); } .mapa .ahora { outline: 2px solid var(--texto); outline-offset: 0; }
+.mapa .hh { text-align: center; color: var(--gris); font-size: 9px; }
+svg { display: block; max-width: 100%; height: auto; }
+.pie { text-align: center; font-size: 12px; color: var(--gris); }
+</style>
+</head>
+<body>
+<main class="pagina">
+<div class="cab"><div><div class="marca">Solana</div><div class="gr" id="sub">cargando…</div></div><span class="chip papel" id="chip">…</span></div>
+<div class="aviso" id="aviso" hidden></div>
+
+<section class="card" aria-labelledby="t-real">
+<div class="tt"><span id="t-real">Real estimado</span><span class="gr" id="desde"></span></div>
+<div class="big m" id="real">—</div>
+<div class="gr" id="real2"></div>
+<div id="grafico"></div>
+</section>
+
+<div class="kpis">
+<div class="kpi"><b class="m" id="k-ops">—</b><span>operaciones</span></div>
+<div class="kpi"><b class="m" id="k-gan">—</b><span>ganadas</span></div>
+<div class="kpi"><b class="m" id="k-vet">—</b><span>vetadas</span></div>
+<div class="kpi"><b class="m" id="k-err">—</b><span>errores</span></div>
+</div>
+
+<section class="card" aria-labelledby="t-cartera">
+<div class="tt"><span id="t-cartera">Cartera</span><span class="gr" id="cartera-estado"></span></div>
+<div class="fila"><span>Dentro ahora</span><span class="m" id="dentro">—</span></div>
+<div class="barrita"><i id="barra" style="width:0%"></i></div>
+<div class="fila"><span>Real de hoy (cartera)</span><span class="m" id="hoy">—</span></div>
+<div class="fila"><span>Tope de pérdida del día</span><span class="m" id="tope">—</span></div>
+<div class="ordenes">
+<label for="clave" class="gr" style="flex-basis:100%">Clave del panel</label>
+<input id="clave" type="password" autocomplete="current-password" placeholder="clave">
+<button type="button" class="b1" id="b-armar">Armar</button>
+<button type="button" class="b2" id="b-desarmar">Desarmar</button>
+</div>
+<p class="msg" id="msg"></p>
+</section>
+
+<section class="card" aria-labelledby="t-abiertas">
+<div class="tt"><span id="t-abiertas">Posiciones abiertas</span><span class="gr" id="n-abiertas"></span></div>
+<div class="scroll"><table><thead><tr><th>token</th><th>regla</th><th>lotes</th><th>va</th><th>min</th></tr></thead><tbody id="abiertas"></tbody></table></div>
+</section>
+
+<section class="card" aria-labelledby="t-tokens">
+<div class="tt"><span id="t-tokens">Tokens</span><span class="gr" id="cuenta"></span></div>
+<div class="filtros" role="group" aria-label="Filtrar los tokens">
+<button type="button" data-f="todas" aria-pressed="true">Todas</button>
+<button type="button" data-f="entro" aria-pressed="false">Entró</button>
+<button type="button" data-f="ganada" aria-pressed="false">Ganadas</button>
+<button type="button" data-f="perdida" aria-pressed="false">Perdidas</button>
+<button type="button" data-f="abierta" aria-pressed="false">Abiertas</button>
+<button type="button" data-f="veto" aria-pressed="false">No entró</button>
+<button type="button" data-f="escapo" aria-pressed="false">Se nos escaparon</button>
+</div>
+<div class="orden"><label for="orden">Ordenar por</label>
+<select id="orden"><option value="hora">más recientes</option><option value="res">mejor resultado</option><option value="peor">peor resultado</option><option value="despues">lo que subió después</option></select>
+<label for="ventana">De</label><select id="ventana"><option value="6">las últimas 6 h</option><option value="24" selected>las últimas 24 h</option><option value="36">todo</option></select></div>
+<p class="nota">«Se nos escaparon»: los que vendimos y luego doblaron (pasando de +100 %), o no compramos y llegaron a +300 %.</p>
+<div id="lista"></div>
+</section>
+
+<section class="card" aria-labelledby="t-mapa">
+<div class="tt"><span id="t-mapa">El plan: dónde entra</span><span class="gr" id="mapa-hora"></span></div>
+<div class="mapa" id="mapa"></div>
+<p class="nota">Verde: entra · gris: no entra · recuadrada: la hora de ahora (España).</p>
+</section>
+
+<section class="card" aria-labelledby="t-salud">
+<div class="tt"><span id="t-salud">Cómo va el server</span><span class="gr" id="salud-act"></span></div>
+<div id="salud"></div>
+</section>
+<p class="pie">Se actualiza solo cada 15 s · <a href="/viejo">panel sencillo</a> · <a href="/datos">datos</a></p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const sol = (x, d = 3) => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(d).replace('.', ',');
+const pct = (x) => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(Math.abs(x) >= 100 ? 0 : 1).replace('.', ',') + ' %';
+const hora = (t) => t ? new Date(t).toLocaleTimeString('es-ES', { timeZone: 'Europe/Madrid', hour: '2-digit', minute: '2-digit' }) : '—';
+const fecha = (t) => new Date(t).toLocaleString('es-ES', { timeZone: 'Europe/Madrid', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+let D = null, TOK = [], filtro = 'todas'; const abiertos = new Set(), curvas = new Map();
+
+async function carga() {
+  try {
+    const [d, t, m] = await Promise.all([fetch('/datos').then(r => r.json()), fetch('/tokens').then(r => r.json()), fetch('/mapa').then(r => r.json())]);
+    D = d; TOK = Array.isArray(t) ? t : []; pintaTodo(); pintaMapa(m);
+  } catch (e) { $('sub').textContent = 'sin conexión con el server: reintento en 15 s'; }
+}
+
+function pintaTodo() {
+  const d = D, r = d.real || {}, p = d.papel || {}, u = d.solUsd || 0;
+  $('sub').textContent = (d.plan ? d.plan.nombre + ' · ' + d.plan.reglas + ' reglas' : 'sin plan') + ' · ' + hora(d.ahora);
+  const chip = $('chip'); if (!r.listo) { chip.className = 'chip papel'; chip.textContent = 'EN PAPEL'; } else if (r.armado) { chip.className = 'chip armado'; chip.textContent = r.simulado ? 'ARMADO (SIMULADO)' : 'ARMADO'; } else { chip.className = 'chip desarmado'; chip.textContent = 'DESARMADO'; }
+  const avisos = []; if (r.listo && !r.armado && r.motivo && !/arranca|a mano/.test(r.motivo)) avisos.push('Se ha desarmado solo: ' + r.motivo);
+  if ((r.pendientes || []).length) avisos.push('Ventas pendientes: ' + r.pendientes.map(x => x.sym).join(', '));
+  if ((r.huerfanos || []).length) avisos.push('Tokens en la cartera sin operación: ' + r.huerfanos.map(x => x.sym).join(', '));
+  $('aviso').hidden = !avisos.length; $('aviso').textContent = avisos.join(' · ');
+  $('desde').textContent = 'desde ' + fecha(p.desde) + ' · lote ' + String(d.lote).replace('.', ',');
+  $('real').textContent = sol(p.real || 0) + ' SOL'; $('real').className = 'big m ' + ((p.real || 0) >= 0 ? 'pos' : 'neg');
+  $('real2').textContent = (u ? '≈ ' + ((p.real || 0) >= 0 ? '+' : '−') + Math.abs((p.real || 0) * u).toFixed(0) + ' $ · ' : '') + 'papel ' + sol(p.papel || 0, 2) + ' SOL (no te fíes del papel: cuenta comprar al precio de la migración)';
+  $('grafico').innerHTML = grafico(d.serie || []);
+  $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; $('k-vet').textContent = p.vetadas ?? 0; $('k-err').textContent = (d.salud || {}).errores ?? 0;
+  const top = r.topes || {}; const maxE = top.MAX_EXPUESTO || 1; $('dentro').textContent = (p.expuesto || 0).toFixed(2).replace('.', ',') + ' / ' + String(maxE).replace('.', ',') + ' SOL';
+  $('barra').style.width = Math.min(100, 100 * (p.expuesto || 0) / maxE).toFixed(0) + '%';
+  $('hoy').textContent = r.listo ? sol((r.hoy || {}).real || 0, 4) + ' SOL' : 'sin cartera'; $('tope').textContent = top.PERDIDA_DIA ? '−' + String(top.PERDIDA_DIA).replace('.', ',') + ' SOL · se desarma solo' : '—';
+  $('cartera-estado').textContent = !r.listo ? 'sin clave de cartera: solo papel' : (r.saldo != null ? 'saldo ' + (+r.saldo).toFixed(3).replace('.', ',') + ' SOL' : '');
+  $('b-armar').disabled = !r.listo || r.armado; $('b-desarmar').disabled = !r.listo || !r.armado;
+  const ab = TOK.filter(x => x.abierta); $('n-abiertas').textContent = ab.length + ' · ' + (p.expuesto || 0).toFixed(2).replace('.', ',') + ' SOL';
+  $('abiertas').innerHTML = ab.length ? ab.map(x => `<tr><td>${esc(x.sym)}</td><td class="m">${x.regla ?? '—'}</td><td class="m">${x.abierta.lotes}</td><td class="m ${x.abierta.va >= 0 ? 'pos' : 'neg'}">${pct(x.abierta.va)}</td><td class="m">${x.abierta.entraT ? Math.max(0, Math.round((d.ahora - x.abierta.entraT) / 60000)) : '—'}</td></tr>`).join('') : '<tr><td colspan="5" class="gr">Ninguna ahora mismo</td></tr>';
+  pintaTokens(); pintaSalud();
+}
+
+function grafico(serie) {
+  if (serie.length < 2) return '<p class="nota">El gráfico aparece en cuanto haya dos operaciones cerradas.</p>';
+  let acc = 0; const pts = serie.map(([t, r]) => [t, acc += r]); const t0 = pts[0][0], t1 = pts[pts.length - 1][0] || t0 + 1; const ys = pts.map(p => p[1]).concat([0]);
+  const lo = Math.min(...ys), hi = Math.max(...ys), W = 360, H = 90, y = (v) => H - 6 - (v - lo) / ((hi - lo) || 1) * (H - 12), x = (t) => (t - t0) / ((t1 - t0) || 1) * W;
+  const fin = pts[pts.length - 1][1];
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Real acumulado"><line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--linea)" stroke-dasharray="4 4"></line><polyline fill="none" stroke="${fin >= 0 ? 'var(--verde)' : 'var(--rojo)'}" stroke-width="2.5" points="${pts.map(p => x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1)).join(' ')}"></polyline></svg><div class="gr">${hora(t0)} → ${hora(t1)}</div>`;
+}
+
+function claseDe(x) {
+  if (x.veto) return 'veto'; if (x.abierta) return 'abierta'; if (!x.ops.length) return 'sin';
+  return x.ops.reduce((s, o) => s + o.real, 0) > 0 ? 'ganada' : 'perdida';
+}
+function escapo(x) {
+  if (x.veto) return x.max && x.max.p >= 300;   // los que no compramos y llegaron a +300 %
+  if (!x.ops.length || !x.despues) return false; const ult = x.ops[x.ops.length - 1];
+  return x.despues.p >= 100 && (1 + x.despues.p / 100) / (1 + ult.salePct / 100) >= 2;   // los que vendimos y luego doblaron (y pasaron de +100 %)
+}
+function pasa(x) {
+  const c = claseDe(x); if (filtro === 'todas') return c !== 'sin'; if (filtro === 'entro') return c === 'ganada' || c === 'perdida' || c === 'abierta';
+  if (filtro === 'escapo') return escapo(x); return c === filtro;
+}
+function pintaTokens() {
+  const ven = +$('ventana').value, lim = (D ? D.ahora : Date.now()) - ven * 3.6e6, ord = $('orden').value;
+  const base = TOK.filter(x => x.t0 >= lim && claseDe(x) !== 'sin'); const v = base.filter(pasa);
+  const res = (x) => x.ops.reduce((s, o) => s + o.real, 0);
+  v.sort((a, b) => ord === 'res' ? res(b) - res(a) : ord === 'peor' ? res(a) - res(b) : ord === 'despues' ? ((b.despues || b.max || { p: -1e9 }).p - (a.despues || a.max || { p: -1e9 }).p) : b.t0 - a.t0);
+  $('cuenta').textContent = v.length + ' de ' + base.length;
+  $('lista').innerHTML = v.length ? v.slice(0, 150).map(fila).join('') : '<p class="nota" style="padding:12px 0">Ningún token con este filtro.</p>';
+  for (const det of $('lista').querySelectorAll('details')) det.addEventListener('toggle', () => { const m = det.dataset.m; if (det.open) { abiertos.add(m); dibujaCurva(det); } else abiertos.delete(m); });
+  for (const det of $('lista').querySelectorAll('details[open]')) dibujaCurva(det);
+}
+function fila(x) {
+  const c = claseDe(x), tags = []; let resTxt = '', resCl = '';
+  if (c === 'veto') { tags.push(`<span class="tag">no entró · ${esc(x.veto)}</span>`); resTxt = 'no entró'; resCl = 'gr'; }
+  for (const o of x.ops) { tags.push(`<span class="tag e">entró ${hora(o.entraT)} · ${pct(o.entraPct ?? 0)}</span>`, `<span class="tag s">salió ${hora(o.saleT)} · ${pct(o.salePct)} · ${esc(o.motivo)}</span>`); }
+  if (x.abierta) { tags.push(`<span class="tag e">entró ${hora(x.abierta.entraT)} · ${x.abierta.lotes} lotes</span>`, `<span class="tag">sigue dentro · va ${pct(x.abierta.va)}</span>`); resTxt = pct(x.abierta.va); resCl = x.abierta.va >= 0 ? 'pos' : 'neg'; }
+  if (c === 'ganada' || c === 'perdida') { const r = x.ops.reduce((s, o) => s + o.real, 0); resTxt = sol(r, 3) + ' SOL'; resCl = r >= 0 ? 'pos' : 'neg'; }
+  const desp = x.veto ? x.max : x.despues; if (desp && !x.abierta) tags.push(`<span class="tag d">después: ${pct(desp.p)} a los ${Math.round(desp.t / 60)} min${x.fin != null ? ' · ' + (x.grabando ? 'va ' : 'acabó ') + pct(x.fin) : ''}</span>`);
+  const n = esc(x.sym), m = esc(x.mint);
+  return `<details data-m="${m}"${abiertos.has(x.mint) ? ' open' : ''}><summary><span class="nom">${n}</span><span class="res m ${resCl}">${resTxt}</span><span class="lin">${tags.join('')}</span></summary>
+<div class="det"><div class="curva" data-m="${m}"><p class="nota">Cargando la curva…</p></div>
+<dl><dt>Migró</dt><dd class="m">${hora(x.t0)}${x.seg != null ? ' · ' + (x.seg >= 60 ? Math.round(x.seg / 60) + ' min' : x.seg + ' s') + ' en migrar' : ''}</dd>
+<dt>Tenedores · 5 mayores</dt><dd class="m">${x.ten ?? '?'} · ${x.top5 != null ? Math.round(x.top5) + ' %' : '?'}</dd>
+<dt>Regla</dt><dd>${x.regla ? x.regla + ' · ' : ''}${esc(x.nota || '')}</dd>
+<dt>Lo mejor de la grabación</dt><dd class="m">${x.max ? pct(x.max.p) + ' a los ' + Math.round(x.max.t / 60) + ' min' : '—'}</dd>
+<dt>${x.grabando ? 'Va ahora' : 'Al final'}</dt><dd class="m">${x.fin != null ? pct(x.fin) : '—'}${x.grabando ? ' · grabando' : ''}</dd></dl>
+<div class="enl"><a href="https://pump.fun/coin/${m}" target="_blank" rel="noopener">Abrir en pump.fun ↗</a><a class="sec" href="https://dexscreener.com/solana/${m}" target="_blank" rel="noopener">dexscreener ↗</a></div></div></details>`;
+}
+async function dibujaCurva(det) {
+  const m = det.dataset.m, caja = det.querySelector('.curva'); if (!caja) return;
+  try { let c = curvas.get(m); if (!c || Date.now() - c.cargada > 20000) { c = await fetch('/curva?mint=' + encodeURIComponent(m)).then(r => r.json()); c.cargada = Date.now(); curvas.set(m, c); }
+    const P = c.puntos || []; if (P.length < 2) { caja.innerHTML = '<p class="nota">Aún no hay curva.</p>'; return; }
+    const W = 360, H = 120, ts = P.map(p => p[0]), vs = P.map(p => Math.log10(1 + Math.max(-99, p[1]) / 100));
+    const t1 = Math.max(...ts) || 1, lo = Math.min(...vs, 0), hi = Math.max(...vs, 0), x = (t) => t / t1 * W, y = (v) => H - 14 - (v - lo) / ((hi - lo) || 1) * (H - 24);
+    const marca = (tAbs, col, txt) => { if (!tAbs) return ''; const t = (tAbs - c.t0) / 1000; let k = 0; while (k < P.length - 1 && P[k][0] < t) k++; return `<circle cx="${x(P[k][0]).toFixed(1)}" cy="${y(vs[k]).toFixed(1)}" r="5" fill="${col}"><title>${txt}</title></circle>`; };
+    const ops = c.ops || []; caja.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="La curva del token, con la entrada y la salida"><line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--linea)" stroke-dasharray="4 4"></line><polyline fill="none" stroke="var(--texto)" stroke-width="1.6" points="${P.map((p, i) => x(p[0]).toFixed(1) + ',' + y(vs[i]).toFixed(1)).join(' ')}"></polyline>${ops.map(o => marca(o.entraT, 'var(--azul)', 'entra') + marca(o.saleT, 'var(--rojo)', 'sale')).join('')}</svg><p class="nota">Escala logarítmica · azul: entra · rojo: sale · ${Math.round(t1 / 60)} min grabados</p>`;
+  } catch (e) { caja.innerHTML = '<p class="nota">No se pudo cargar la curva.</p>'; }
+}
+function pintaMapa(m) {
+  if (!m || !m.grupos) return; $('mapa-hora').textContent = 'ahora: ' + m.hora + ' h';
+  let h = '<span></span>' + [...Array(24).keys()].map(k => `<span class="hh">${k % 6 === 0 ? k : ''}</span>`).join('');
+  for (const g of m.grupos) h += `<span>${esc(g.n)}</span>` + g.horas.map((v, k) => `<i class="${v ? 'si' : 'no'}${k === m.hora ? ' ahora' : ''}" title="${esc(g.n)} tenedores · ${k} h: ${v ? 'entra' : 'no entra'}"></i>`).join('');
+  $('mapa').innerHTML = h;
+}
+function pintaSalud() {
+  const s = D.salud || {}, tot = (s.heliusPrimero || 0) + (s.pumpportalPrimero || 0);
+  $('salud-act').textContent = 'grabando ' + (s.grabando ?? 0);
+  $('salud').innerHTML = [['Migraciones', s.migraciones ?? 0], ['Helius llega primero', tot ? Math.round(100 * s.heliusPrimero / tot) + ' %' + (s.adelantoMs != null ? ' · ' + s.adelantoMs + ' ms antes' : '') : '—'], ['Nacimientos a tiempo', (s.nacimientos ?? 0) + ' / ' + ((s.nacimientos ?? 0) + (s.nacFallos ?? 0))], ['Curvas grabadas', s.curvas ?? 0], ['Errores', s.errores ?? 0]]
+    .map(([k, v]) => `<div class="fila"><span>${k}</span><span class="m">${v}</span></div>`).join('');
+}
+async function orden(ruta) {
+  const clave = $('clave').value.trim(); if (!clave) { $('msg').textContent = 'Pon la clave del panel.'; return; }
+  if (ruta === '/armar' && !confirm('¿Armar el bot? Empezará a operar con dinero de verdad.')) return;
+  try { const r = await fetch(ruta, { method: 'POST', headers: { 'x-panel': '1', 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ clave }) }).then(r => r.json()); $('msg').textContent = r.msg; carga(); }
+  catch (e) { $('msg').textContent = 'No se pudo enviar la orden.'; }
+}
+$('b-armar').addEventListener('click', () => orden('/armar')); $('b-desarmar').addEventListener('click', () => orden('/desarmar'));
+for (const b of document.querySelectorAll('.filtros button')) b.addEventListener('click', () => { filtro = b.dataset.f; for (const x of document.querySelectorAll('.filtros button')) x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); pintaTokens(); });
+$('orden').addEventListener('change', pintaTokens); $('ventana').addEventListener('change', pintaTokens);
+carga(); setInterval(carga, 15000);
+</script>
+</body>
+</html>
