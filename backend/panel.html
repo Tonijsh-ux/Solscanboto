@@ -73,7 +73,7 @@ svg { display: block; max-width: 100%; height: auto; }
 <div class="aviso" id="aviso" hidden></div>
 
 <section class="card" aria-labelledby="t-real">
-<div class="tt"><span id="t-real">Real estimado</span><span class="gr" id="desde"></span></div>
+<div class="tt"><span id="t-real">De verdad (estimado con los costes reales)</span><span class="gr" id="desde"></span></div>
 <div class="big m" id="real">—</div>
 <div class="gr" id="real2"></div>
 <div id="grafico"></div>
@@ -84,7 +84,7 @@ svg { display: block; max-width: 100%; height: auto; }
 <div class="kpis">
 <div class="kpi"><b class="m" id="k-ops">—</b><span>operaciones</span></div>
 <div class="kpi"><b class="m" id="k-gan">—</b><span>ganadas</span></div>
-<div class="kpi"><b class="m" id="k-vet">—</b><span>vetadas</span></div>
+<div class="kpi"><b class="m" id="k-vet">—</b><span id="k-vet2">vetadas</span></div>
 <div class="kpi"><b class="m" id="k-err">—</b><span>errores</span></div>
 </div>
 
@@ -164,10 +164,10 @@ function pintaTodo() {
   if ((r.huerfanos || []).length) avisos.push('Tokens en la cartera sin operación: ' + r.huerfanos.map(x => x.sym).join(', '));
   $('aviso').hidden = !avisos.length; $('aviso').textContent = avisos.join(' · ');
   $('desde').textContent = 'desde ' + fecha(p.desde) + ' · lote ' + String(d.lote).replace('.', ',');
-  $('real').textContent = sol(p.real || 0) + ' SOL'; $('real').className = 'big m ' + ((p.real || 0) >= 0 ? 'pos' : 'neg');
-  $('real2').textContent = (u ? '≈ ' + ((p.real || 0) >= 0 ? '+' : '−') + Math.abs((p.real || 0) * u).toFixed(0) + ' $ · ' : '') + 'papel ' + sol(p.papel || 0, 2) + ' SOL (no te fíes del papel: cuenta comprar al precio de la migración)';
+  const vv = p.verdad != null ? p.verdad : (p.real || 0); $('real').textContent = sol(vv) + ' SOL'; $('real').className = 'big m ' + (vv >= 0 ? 'pos' : 'neg');
+  $('real2').textContent = (u ? '≈ ' + (vv >= 0 ? '+' : '−') + Math.abs(vv * u).toFixed(0) + ' $ · ' : '') + 'de verdad: comisión de PumpSwap, precio real, 1 s tarde y prioridad · antes se estimaba ' + sol(p.real || 0, 2) + ' · papel ' + sol(p.papel || 0, 2) + ' SOL';
   $('grafico').innerHTML = grafico(d.serie || []);
-  $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; $('k-vet').textContent = p.vetadas ?? 0; $('k-err').textContent = (d.salud || {}).errores ?? 0;
+  $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; $('k-vet').textContent = p.vetadas ?? 0; { const pv = p.porVeto || {}, sg = (d.salud || {}).sinGrabar || {}, nsg = (sg.ballena || 0) + (sg.bundle || 0); $('k-vet2').textContent = (pv.ballena || pv.bundle || pv.cae) ? `vetadas · 🐋 ${pv.ballena || 0} ballenas · 📦 ${pv.bundle || 0} bundles${nsg ? ` · ${nsg} sin grabar` : ''}${pv.cae ? ` · 📉 ${pv.cae} ya caían` : ''}` : 'vetadas'; } $('k-err').textContent = (d.salud || {}).errores ?? 0;
   const top = r.topes || {}; const maxE = top.MAX_EXPUESTO || 1; $('dentro').textContent = (p.expuesto || 0).toFixed(2).replace('.', ',') + ' / ' + String(maxE).replace('.', ',') + ' SOL';
   $('barra').style.width = Math.min(100, 100 * (p.expuesto || 0) / maxE).toFixed(0) + '%';
   $('hoy').textContent = r.listo ? sol((r.hoy || {}).real || 0, 4) + ' SOL' : 'sin cartera'; $('tope').textContent = top.PERDIDA_DIA ? '−' + String(top.PERDIDA_DIA).replace('.', ',') + ' SOL · se desarma solo' : '—';
@@ -250,8 +250,13 @@ function pintaMapa(m) {
 function pintaSalud() {
   const s = D.salud || {}, tot = (s.heliusPrimero || 0) + (s.pumpportalPrimero || 0);
   $('salud-act').textContent = 'grabando ' + (s.grabando ?? 0);
-  $('salud').innerHTML = [['Migraciones', s.migraciones ?? 0], ['Helius llega primero', tot ? Math.round(100 * s.heliusPrimero / tot) + ' %' + (s.adelantoMs != null ? ' · ' + s.adelantoMs + ' ms antes' : '') : '—'], ['Nacimientos a tiempo', (s.nacimientos ?? 0) + ' / ' + ((s.nacimientos ?? 0) + (s.nacFallos ?? 0))], ['Curvas grabadas', s.curvas ?? 0], ['Errores', s.errores ?? 0]]
-    .map(([k, v]) => `<div class="fila"><span>${k}</span><span class="m">${v}</span></div>`).join('');
+  const r = s.rescate || null, cr = s.creditos || null, kM = (x) => x == null ? '—' : x >= 1e6 ? (x / 1e6).toFixed(1).replace('.', ',') + ' M' : Math.round(x / 1e3) + ' k';
+  const filas = [['Migraciones', s.migraciones ?? 0], ['Helius llega primero', tot ? Math.round(100 * s.heliusPrimero / tot) + ' %' + (s.adelantoMs != null ? ' · ' + s.adelantoMs + ' ms antes' : '') : '—'], ['Nacimientos a tiempo', (s.nacimientos ?? 0) + ' / ' + ((s.nacimientos ?? 0) + (s.nacFallos ?? 0))], ['Curvas grabadas', s.curvas ?? 0], ['Errores', s.errores ?? 0]];
+  // [12-oct] el rescate dentro del server y lo que se gasta en Helius
+  if (r) filas.push(['Rescate de hoy', !r.activo ? 'apagado' : `${(r.hoy && r.hoy.fichas) || 0} fichas · ${kM((r.hoy && r.hoy.creditos) || 0)} de ${kM(r.topeDia)} créditos` + (r.pausa ? ' · ⏸️ ' + r.pausa.motivo : '')],
+    ['Cola del rescate', r.activo ? `${r.cola} tokens${r.enCurso ? ' · ' + r.enCurso + ' en marcha' : ''}` : '—'], ['En el disco del server', `${((r.disco && r.disco.usadoMB) || 0).toLocaleString('es-ES')} MB${r.disco && r.disco.libreMB != null ? ' · libres ' + r.disco.libreMB.toLocaleString('es-ES') + ' MB' : ''}${r.volatil ? ' · ⚠️ sin volumen' : ''}`]);
+  if (cr) filas.push(['Gasto de Helius (estimado)', `${kM(cr.wsDia + cr.rpcDia)}/día el server + ${kM(cr.rescateDia)}/día el rescate ≈ ${kM(cr.mes)} al mes`]);
+  $('salud').innerHTML = filas.map(([k, v]) => `<div class="fila"><span>${k}</span><span class="m">${v}</span></div>`).join('');
 }
 async function orden(ruta) {
   const cero = ruta === '/papel-a-cero', caja = cero ? $('msg-cero') : $('msg'), campo = cero ? $('clave-cero') : $('clave');

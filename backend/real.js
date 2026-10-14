@@ -50,7 +50,7 @@ const marcaRuta = (ruta, ms, ok) => { const r = RUTA_STATS[ruta] = RUTA_STATS[ru
 let web3 = null, bs58 = null, wallet = null, conn = null, log = console.log, papelDe = () => null, cola = [], girando = false, fallosSeguidos = 0;
 const fechaEsp = () => new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 const s4 = (x) => (x >= 0 ? "+" : "") + (+x).toFixed(4);
-const guarda = () => { try { fs.writeFileSync(FILE, JSON.stringify({ tokens: R.tokens, totales: R.totales, dia: R.dia, cuadres: R.cuadres.slice(0, 200), huerfanos: R.huerfanos })); } catch {} };
+const guarda = () => { try { const tmp = FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ tokens: R.tokens, totales: R.totales, dia: R.dia, cuadres: R.cuadres.slice(0, 200), huerfanos: R.huerfanos })); fs.renameSync(tmp, FILE); } catch {} };   // [12-oct] primero a .tmp y luego se renombra: con el disco lleno no se queda a medias
 setInterval(guarda, 60e3);
 
 // ── el arranque: la cartera (si hay clave) y lo guardado ──
@@ -61,7 +61,7 @@ export async function init(opts = {}) {
   const clave = (E.SOLANA_PRIVATE_KEY || E.WALLET_PRIVATE_KEY || "").trim();
   if (!clave) { log(`🔒 sin SOLANA_PRIVATE_KEY: el server solo hace papel (no puede armarse)`); return; }
   try { web3 = await import("@solana/web3.js"); bs58 = (await import("bs58")).default; try { spl = await import("@solana/spl-token"); } catch { log("ℹ️ sin @solana/spl-token: no se cerrarán las cuentas vacías (se pierde ~0,002 SOL de alquiler por token)"); }
-    let bytes; try { bytes = bs58.decode(clave); } catch { bytes = Uint8Array.from(JSON.parse(clave)); }   // base58 o el array [12,34,…]
+    let bytes; try { bytes = bs58.decode(clave); } catch { try { bytes = Uint8Array.from(JSON.parse(clave)); } catch { throw new Error("SOLANA_PRIVATE_KEY no tiene un formato válido (base58 o el array [12,34,…])"); } }   // base58 o el array [12,34,…] · [12-oct] el error no repite ni un trozo de la clave
     wallet = web3.Keypair.fromSecretKey(bytes); conn = new web3.Connection(RPC, "confirmed"); R.pub = wallet.publicKey.toString(); R.listo = true;
     if (RUTAS.includes("directo")) { try { pss = await import("@pump-fun/pump-swap-sdk"); BN = (await import("bn.js")).default; sdkOnline = new pss.OnlinePumpAmmSdk(conn); log(`⚡ ruta directa a PumpSwap lista (SDK de pump.fun) · envío ${SENDER === "no" ? "por el RPC" : "por Helius Sender (" + SENDER + ", propina " + PROPINA + " SOL)"} · prioridad ${PRIO_NIVEL} (tope ${PRIO_MAX} SOL)`); }
       catch (e) { pss = null; log(`⚠️ sin el SDK de pump.fun (${e.message.slice(0, 80)}): se usará Jupiter`); } }
