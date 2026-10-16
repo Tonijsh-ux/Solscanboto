@@ -22,6 +22,10 @@
 //   · RESCATE_PISCINA (operados|motor|todos|no; operados) · RESCATE_PISCINA_MIN (10: minutos de piscina de los no operados) · RESCATE_EXTRAS (1)
 //   · RESCATE_ROTOS (1) · RESCATE_ESPERA_S (90) · RESCATE_HILOS (1) · RESCATE_RPS (4) · RESCATE_TOPE_TOKEN (20000) · RESCATE_MAX_GB (3)
 //   · RESCATE_COLA_DIAS (7) · RESCATE_MEM_MB (768) · RESCATE_DIR (/data/rescate) · REGISTRO (1) · REGISTRO_DIAS (120) · RESCATE_CLAVE
+//   · RESCATE_ATRASADOS (la lista; de serie rescate_atrasados.json junto al server) · RESCATE_ATRASADOS_FRAC (0,6)
+//  [16-oct] LOS ATRASADOS (Tony: «sí, solo los que no son ballenas»): los tokens grabados antes de que hubiera rescate en el server (10-14 oct)
+//  sin curva de bonos, y los que no tienen creador, sin las ballenas que el server no opera. Entran en la cola UNA vez (estado.json guarda la
+//  versión de la lista), con la prioridad más baja y como mucho RESCATE_ATRASADOS_FRAC del presupuesto del día (el resto, para los nuevos).
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 import fs from "fs"; import path from "path"; import zlib from "zlib"; import { Worker } from "worker_threads"; import { pipeline } from "stream/promises"; import { fileURLToPath } from "url";
 
@@ -47,6 +51,7 @@ export function crea(op = {}) {
   const EXTRAS = txt("RESCATE_EXTRAS", "1") !== "0", ROTOS = txt("RESCATE_ROTOS", "1") !== "0", PISCINA_MIN = num("RESCATE_PISCINA_MIN", 10);
   const ESPERA_S = num("RESCATE_ESPERA_S", 90), HILOS = Math.max(1, num("RESCATE_HILOS", 1)), RPS = num("RESCATE_RPS", 4);
   const MAX_GB = num("RESCATE_MAX_GB", 3), COLA_DIAS = num("RESCATE_COLA_DIAS", 7), REG_DIAS = num("REGISTRO_DIAS", 120), MEM_MB = num("RESCATE_MEM_MB", 768);
+  const F_ATR = op.atrasados || E_.RESCATE_ATRASADOS || path.join(AQUI, "rescate_atrasados.json"), FRAC_ATR = Math.min(1, Math.max(0, num("RESCATE_ATRASADOS_FRAC", 0.6)));
   const CLAVE_R = (E_.RESCATE_CLAVE || "").trim(); const CLAVE = /^(no|0|abierto)$/i.test(CLAVE_R) ? "" : (CLAVE_R || (E_.PANEL_CLAVE || "").trim());
   for (const c of [...CARPETAS, "parcial"]) fs.mkdirSync(path.join(DIR, c), { recursive: true });
   const VOLATIL = !DIR.startsWith("/data") && !E_.RESCATE_DIR && !op.dir;
@@ -125,10 +130,12 @@ export function crea(op = {}) {
   // lo que gasta al día el server en vivo (WebSocket + llamadas), medido; con menos de 2 h encendido, lo último que se midió (o 230.000)
   const vivo = () => { try { const v = op.gastoVivoDia && op.gastoVivoDia(); if (v && v.horas >= 2 && v.dia > 0) { if (Math.abs((E.vivoDia || 0) - v.dia) > 2000) { E.vivoDia = Math.round(v.dia); sucioE = true; } return v.dia; } } catch {} return E.vivoDia || 230000; };
   const presupuestoHoy = () => Math.max(0, Math.min(TOPE_DIA, Math.round(TOPE_MES / 30.4 - vivo())));
-  let guardando = false;
+  let guardando = false, ultGuardaC = 0;
   const guarda = (sync = false) => {   // el estado (pequeño) y la cola (con los trabajos en marcha dentro, por si el server se cae a medias)
     try { const dd = Object.keys(E.dias).sort(); for (const d of dd.slice(0, Math.max(0, dd.length - 90))) delete E.dias[d]; const tmp = F_EST + ".tmp"; fs.writeFileSync(tmp, JSON.stringify(E)); fs.renameSync(tmp, F_EST); sucioE = false; } catch {}
     if (!sucioC && !sync) return; if (guardando && !sync) return;
+    if (!sync && cola.length > 500 && Date.now() - ultGuardaC < 60000) return;   // [16-oct] con la cola grande (los atrasados), la cola al disco como mucho cada minuto
+    ultGuardaC = Date.now();
     const todo = [...cola, ...[...enCurso.values()].map(x => ({ ...x.j, fases: x.fases, listo: Math.min(x.j.listo || 0, Date.now()) }))]; sucioC = false;
     const txt = JSON.stringify(todo), tc = F_COLA + ".tmp";
     if (sync) { try { fs.writeFileSync(tc, txt); fs.renameSync(tc, F_COLA); } catch {} return; }
@@ -140,8 +147,9 @@ export function crea(op = {}) {
     const curva = F.curva ? (t.txsCurva != null && !t.txsCurvaTope ? Math.ceil(t.txsCurva / 100) * 10 + 10 : t.txsCurvaTope ? 800 : 160) : 0;
     const sw = t.durPiscina && t.swapsVentana != null ? t.swapsVentana : (t.swaps || 0);
     let piscina = F.piscina ? Math.ceil(2.1 * sw / 100) * 10 + 20 : 0; if (F.piscina && t.roto) piscina = Math.max(piscina, 600);   // Helius ve ~2× los swaps que cuenta el server
-    const extras = F.extras ? (t.asset ? 4 : 14) : 0;
-    return { total: curva + piscina + extras + 1, curva, piscina, extras };
+    const extras = F.extras ? (t.asset || t.sinAsset ? 4 : 14) : 0;
+    const creador = F.creador && !t.creador ? 10 : 0;   // [16-oct] la 1ª transacción del mint
+    return { total: curva + piscina + extras + creador + 1, curva, piscina, extras, creador };
   }
   const mete = (t, fases, prio) => {
     // se espera a que la cadena lo dé por definitivo (~15 s) con margen; si la cámara se cortó, a que pase su hora entera
@@ -170,6 +178,8 @@ export function crea(op = {}) {
     for (let i = 0; i < cola.length; i++) { const j = cola[i]; if (j.listo > ahora) continue;
       if (j.fases.piscina && !j.fases.curva && conCurva.has(j.mint)) continue;
       const e = estima(j); const tope = Math.min(TOPE_TOKEN, queda);
+      // [16-oct] los atrasados (prioridad 3): como mucho RESCATE_ATRASADOS_FRAC del presupuesto del día; lo demás se queda para los tokens nuevos
+      if (j.prio >= 3 && gastoHoy() + reservado + e.total > pres * FRAC_ATR) continue;
       const ultimo = ahora - (j.enc || ahora) > Math.max(1, COLA_DIAS - 1) * 864e5;   // el último día que le queda en la cola: lo que haya se guarda, aunque no esté entero
       if (e.total <= queda) { cola.splice(i, 1); sucioC = true; return { j, fases: j.fases, tope, topeMax: ultimo }; }
       // no cabe entero: lo demás ya, y la piscina espera su turno (mañana, si hoy no llega)
@@ -214,6 +224,7 @@ export function crea(op = {}) {
     if (f) { h.fichas++; E.total.fichas++; const fs_ = f.fases || {};
       if (/^(ok|cortada|ya estaba)/.test(fs_.curva || "")) h.curva++; if (/^(ok|cortada|ya estaba|vacía)/.test(fs_.piscina || "")) h.piscina++; if (fs_.extras === "ok") h.extras++;
       const fc = f.curva || {}, fp = f.piscina || {};
+      if (j && j.t && j.t.grupo === "atrasado") { E.atrasadosHechos = (E.atrasadosHechos || 0) + 1; sucioE = true; }
       if (f.curva || f.piscina || f.extras) {
         log(`[SOLFICHA] sym=${String(f.sym || "?").replace(/\s+/g, "_")} mint=${f.mint} grupo=${f.grupo} creditos=${m.creditos} curva=${fs_.curva || "-"} piscina=${fs_.piscina || "-"} extras=${fs_.extras || "-"} · ${fc.tx != null ? `curva de bonos ${fc.tx} tx, ${fc.compradores} compradores, bundle ${fc.bundle_slot0_pct ?? 0} %, top5 ${fc.top5_pct ?? "?"} %, creador conserva ${fc.creador_conserva_pct ?? "?"} %` : "sin curva de bonos"} · ${fp.swaps != null ? `piscina ${fp.swaps} swaps, ${fp.carteras} carteras` : "sin piscina"} json=${JSON.stringify(f)}`);
         try { const rel = `fichas/${dia()}.jsonl`; fs.appendFileSync(path.join(DIR, rel), JSON.stringify({ hecho: new Date().toISOString(), t: j ? { ...j.t, asset: undefined } : { mint: m.mint }, ficha: f }) + "\n"); apuntaFichero(rel); } catch {} }
@@ -226,12 +237,12 @@ export function crea(op = {}) {
     if (pausa) { const horas = m.corte === "clave" ? 6 : 1; E.pausaHasta = Date.now() + horas * 3600e3; E.pausaMotivo = m.corte === "clave" ? "Helius no acepta la clave" : m.corte === "disco" ? "el disco del server está lleno" : "Helius dice que no quedan créditos"; sucioE = true;
       log(`⏸️ rescate: ${E.pausaMotivo} → lo paro ${horas} h (la grabación y el bot siguen igual)`); }
     if (j && x) { const re = {}; let porError = false;
-      for (const k of ["curva", "piscina", "extras"]) { if (!x.fases[k]) continue; const st = (f && f.fases && f.fases[k]) || ""; if (FIN.test(st)) continue;
+      for (const k of ["curva", "piscina", "extras", "creador"]) { if (!x.fases[k]) continue; const st = (f && f.fases && f.fases[k]) || ""; if (FIN.test(st)) continue;
         if (st !== "sin presupuesto") porError = true; re[k] = true; }
       if (Object.keys(re).length) { const intentos = (j.intentos || 0) + (porError && !pausa ? 1 : 0);
         if (intentos >= 3) pendiente({ mint: j.mint, sym: j.sym, fases: re, grupo: j.t.grupo, t: { ...j.t, asset: undefined }, porque: "falló 3 veces: " + JSON.stringify(f && f.fases || m.error || "") });
         else { const listo = pausa ? Math.max(E.pausaHasta || 0, Date.now() + 3600e3) : porError ? Date.now() + 30 * 60e3 : Date.parse(dia(Date.now() + 864e5) + "T00:05:00Z");
-          cola.push({ ...j, id: ++nId, fases: { curva: !!re.curva, piscina: !!re.piscina, extras: !!re.extras }, listo, intentos }); } } }
+          cola.push({ ...j, id: ++nId, fases: { curva: !!re.curva, piscina: !!re.piscina, extras: !!re.extras, ...(re.creador ? { creador: true } : {}) }, listo, intentos }); } } }
     despacha();
   }
   let avisoDisco = 0;
@@ -266,15 +277,31 @@ export function crea(op = {}) {
   function resumen() { const h = E.dias[dia()] || {}; const D = disco(); let sinBajar = 0, bSinBajar = 0; for (const [rel, v] of IDX) if (/^(curva|swaps|rotos|extras)\//.test(rel) && !bajado(rel)) { sinBajar++; bSinBajar += v[0]; }
     return { activo: ON, registro: REG_ON, dir: DIR, volatil: VOLATIL, conClave: !!CLAVE, alcance: { curva: A_CURVA, piscina: A_PISCINA, piscinaMinNoOperados: PISCINA_MIN, extras: EXTRAS, rotos: ROTOS }, topeDia: presupuestoHoy(), topeDiaFijo: TOPE_DIA, topeMes: TOPE_MES, vivoDia: Math.round(vivo()),
       hoy: { dia: dia(), ...h }, total: E.total, cola: cola.length, colaListos: cola.filter(j => j.listo <= Date.now()).length, enCurso: enCurso.size, trabajador: W ? (wListo ? "listo" : "arrancando") : "parado", caidas,
-      pausa: pausado() ? { hasta: E.pausaHasta, motivo: E.pausaMotivo } : null, disco: { usadoMB: Math.round(usado() / 1e6), libreMB: D.libre != null ? Math.round(D.libre / 1e6) : null, ficheros: IDX.size, sinBajar, sinBajarMB: Math.round(bSinBajar / 1e6), topeGB: MAX_GB }, lineasRegistro: REG.lineas, fallosRegistro: REG.fallos,
+      pausa: pausado() ? { hasta: E.pausaHasta, motivo: E.pausaMotivo } : null, atrasados: E.atrasadosTotal ? { version: E.atrasados, total: E.atrasadosTotal, hechos: E.atrasadosHechos || 0, enCola: cola.filter(j => j.t && j.t.grupo === "atrasado").length, frac: FRAC_ATR } : null, disco: { usadoMB: Math.round(usado() / 1e6), libreMB: D.libre != null ? Math.round(D.libre / 1e6) : null, ficheros: IDX.size, sinBajar, sinBajarMB: Math.round(bSinBajar / 1e6), topeGB: MAX_GB }, lineasRegistro: REG.lineas, fallosRegistro: REG.fallos,
       ultimos7: Object.entries(E.dias).sort().slice(-7).map(([d, x]) => ({ dia: d, creditos: x.creditos, fichas: x.fichas, curva: x.curva, piscina: x.piscina })) }; }
+  const atrasadosTxt = () => E.atrasadosTotal ? ` · atrasados ${fmt(E.atrasadosHechos || 0)} de ${fmt(E.atrasadosTotal)} (en la cola ${fmt(cola.filter(j => j.t && j.t.grupo === "atrasado").length)})` : "";
   function saludTxt() { if (!ON) return `🧾 rescate apagado${REG_ON ? " · registro en el disco sí" : ""}`; const h = E.dias[dia()] || {};
-    return `🧾 rescate: hoy ${h.fichas || 0} fichas (curva ${h.curva || 0} · piscina ${h.piscina || 0}) · ${fmt(h.creditos || 0)} de ${fmt(presupuestoHoy())} créditos (lo que sobra de ${fmt(TOPE_MES)} al mes con el server gastando ≈${fmt(vivo())}/día) · cola ${cola.length}${enCurso.size ? ` (${enCurso.size} en marcha)` : ""} · ${(usado() / 1e9).toFixed(2)} GB${pausado() ? ` · ⏸️ PAUSADO: ${E.pausaMotivo}` : ""}${VOLATIL ? " · ⚠️ sin volumen /data: se pierde al reiniciar" : ""}`; }
+    return `🧾 rescate: hoy ${h.fichas || 0} fichas (curva ${h.curva || 0} · piscina ${h.piscina || 0}) · ${fmt(h.creditos || 0)} de ${fmt(presupuestoHoy())} créditos (lo que sobra de ${fmt(TOPE_MES)} al mes con el server gastando ≈${fmt(vivo())}/día) · cola ${cola.length}${enCurso.size ? ` (${enCurso.size} en marcha)` : ""}${atrasadosTxt()} · ${(usado() / 1e9).toFixed(2)} GB${pausado() ? ` · ⏸️ PAUSADO: ${E.pausaMotivo}` : ""}${VOLATIL ? " · ⚠️ sin volumen /data: se pierde al reiniciar" : ""}`; }
   const arranqueTxt = () => !ON ? `🧾 RESCATE apagado (RESCATE=0 o sin clave de Helius)${REG_ON ? ` · el registro sí se guarda en ${DIR}/registro` : ""}`
     : `🧾 RESCATE dentro del server: curva de bonos y extras de ${A_CURVA === "todos" ? "todos" : A_CURVA} · piscina con cartera de ${A_PISCINA === "operados" ? "los operados (entera)" : A_PISCINA === "todos" ? `los operados (entera) y del resto los primeros ${PISCINA_MIN} min` : A_PISCINA}${ROTOS ? " · las cámaras cortadas se rehacen" : ""} · con lo que sobre de ${fmt(TOPE_MES)} créditos al mes para todo el server (hoy ≈${fmt(presupuestoHoy())}; tope ${fmt(TOPE_DIA)}/día) · ${HILOS} a la vez, ${RPS} llamadas/s · en ${DIR}${VOLATIL ? " (⚠️ NO es un volumen: se borra al reiniciar)" : ""} · cola ${cola.length} · registro ${REG_ON ? "en el disco" : "no"} · rutas /rescate ${CLAVE ? "con la clave del panel" : "SIN clave"}`;
 
+  // [16-oct] los atrasados: a la cola una sola vez por versión de la lista (estado.json guarda cuál se metió)
+  function cargaAtrasados() {
+    if (!ON || !fs.existsSync(F_ATR)) return;
+    let A; try { A = JSON.parse(fs.readFileSync(F_ATR, "utf-8")); } catch (e) { log(`⚠️ rescate: la lista de atrasados no se puede leer (${e.message})`); return; }
+    if (!A || !A.version || !Array.isArray(A.tokens) || A.version === E.atrasados) return;
+    let n = 0, nc = 0;
+    for (const x of A.tokens) { if (!x || !x.mint) continue; const soloCreador = x.fases === "creador";
+      const t = { mint: x.mint, sym: x.sym || x.mint.slice(0, 6), t0: +x.t0 || 0, t0Aprox: true, firma: x.firma || null, pool: x.pool || null, seg: x.seg ?? null, creador: x.creador || null,
+        txsCurva: x.txsCurva ?? null, txsCurvaTope: !!x.txsCurvaTope, supply: +x.supply || 1e9, precioIni: x.precioIni ?? null, sinAsset: !!x.sinAsset, grupo: "atrasado", dur: 0, swaps: 0 };
+      mete(t, soloCreador ? { curva: false, piscina: false, extras: true, creador: true } : { curva: true, piscina: false, extras: true }, 3); n++; if (soloCreador) nc++; }
+    E.atrasados = A.version; E.atrasadosTotal = (E.atrasadosTotal || 0) + n; sucioE = true; sucioC = true; guarda(true);
+    log(`🧾 rescate: ${fmt(n)} tokens atrasados a la cola (lista ${A.version}: curva de bonos ${fmt(n - nc)}, solo el creador ${fmt(nc)}); como mucho el ${Math.round(FRAC_ATR * 100)} % de los créditos de cada día, lo demás para los nuevos`);
+  }
+
   // ── arranque ──
   indexa();
+  try { cargaAtrasados(); } catch (e) { log(`⚠️ rescate: atrasados (${e && e.message})`); }
   const comprimeViejos = () => { const hoy = dia(); for (const rel of [...IDX.keys()]) { const m = rel.match(/^(registro|fichas)\/(\d{4}-\d{2}-\d{2})(\.log|\.jsonl)$/); if (m && m[2] < hoy && !(m[1] === "registro" && m[2] === REG.dia && REG.buf.length)) comprime(m[2], m[1], m[3]).catch(() => {}); } };
   const seguro = (fn) => () => { try { fn(); } catch (e) { try { log(`⚠️ rescate: ${e && e.message}`); } catch {} } };
   seguro(comprimeViejos)(); seguro(limpiaDisco)();

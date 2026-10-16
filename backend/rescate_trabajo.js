@@ -122,6 +122,17 @@ async function migracionDe(job, t) {
   if (t.firma) { try { const tx = await rpc(job, "getTransaction", [t.firma, { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 0 }], "extras", () => 1); if (tx && tx.blockTime) return { bt: tx.blockTime, slot: tx.slot, deFirma: true }; } catch (e) { if (e instanceof Corte) throw e; } }
   return { bt: Math.round(t.t0 / 1000), slot: null, deFirma: false };
 }
+// [16-oct] lo que tardó el aviso: solo si nuestro t0 es el de verdad (en los atrasados es aproximado: va al minuto)
+const latencia = (t, mig) => (mig && mig.deFirma && !t.t0Aprox && t.t0 > 0 ? t.t0 - mig.bt * 1000 : null);
+// ── E · [16-oct] el creador de los que el server no supo quién creó: quien firma la 1ª transacción del mint (la que lo crea; lo mismo que hace
+//    el server al nacer el token, pero aquí con una sola llamada: el historial del mint en orden, 1 transacción, 10 créditos) ──
+async function faseCreador(job, t, mig) {
+  if (t.creador) return { estado: "ya estaba", creador: t.creador };
+  const hasta = mig && mig.bt ? Math.ceil(mig.bt + 2) : Math.ceil(Date.now() / 1000);
+  const r = await rpc(job, "getTransactionsForAddress", [t.mint, { transactionDetails: "full", encoding: "jsonParsed", maxSupportedTransactionVersion: 1, limit: 1, sortOrder: "asc", commitment: "finalized", filters: { status: "succeeded", blockTime: { lte: hasta } } }], "creador", costeHist);
+  const tx = r?.data?.[0]; const w = tx ? firmante(tx) : null;
+  return { estado: w ? "ok" : "vacía", creador: w || null, creacionBt: tx?.blockTime ?? null };
+}
 // ── A · la curva de bonos ──
 async function faseCurva(job, t, mig) {
   const r = rel("curva", t.mint);
@@ -165,11 +176,13 @@ async function faseSwaps(job, t, mig, carpeta) {
 // ── D · extras (el creador, los metadatos) ──
 async function faseExtras(job, t, mig) {
   const o = { mint: t.mint, sym: t.sym };
-  if (mig.deFirma) { o.migSlot = mig.slot; o.migBlockTime = mig.bt; o.latenciaDeteccionMs = t.t0 - mig.bt * 1000; }
+  if (mig.deFirma) { o.migSlot = mig.slot; o.migBlockTime = mig.bt; o.latenciaDeteccionMs = latencia(t, mig); }
   if (t.asset) Object.assign(o, t.asset, { assetDelServer: true });   // el server ya lo pidió al nacer el token: gratis
+  else if (t.sinAsset) {   // [16-oct] los atrasados que solo necesitan el creador: el nombre y los enlaces ya los tenemos (rescate del PC); si el server ya tenía sus extras, se conservan
+    o.sinAsset = true; try { const ant = JSON.parse(fs.readFileSync(path.join(DIR, rel("extras", t.mint, ".json")), "utf-8")); for (const k of ["nombre", "uri", "links", "descripcion", "mutable", "autoridades", "assetDelServer"]) if (ant[k] !== undefined) o[k] = ant[k]; } catch {} }
   else { try { const a = await rpc(job, "getAsset", { id: t.mint }, "extras", () => 10); o.nombre = a?.content?.metadata?.name; o.uri = a?.content?.json_uri; o.links = a?.content?.links || null; o.descripcion = (a?.content?.metadata?.description || "").slice(0, 300); o.mutable = a?.mutable; o.autoridades = (a?.authorities || []).map(x => x.address); } catch (e) { if (e instanceof Corte) throw e; o.errAsset = e.message; } }
   if (t.creador) { try { let n = 0, viejo = null, antes = undefined; for (let i = 0; i < 3; i++) { const sigs = await rpc(job, "getSignaturesForAddress", [t.creador, { limit: 1000, before: antes, commitment: "confirmed" }], "extras", () => 1); if (!sigs || !sigs.length) break; n += sigs.length; viejo = sigs[sigs.length - 1]; if (sigs.length < 1000) break; antes = viejo.signature; }
-    o.creador = t.creador; o.creadorTx = n + (n >= 3000 ? "+" : ""); o.creadorDesde = viejo ? viejo.blockTime : null; } catch (e) { if (e instanceof Corte) throw e; o.errCreador = e.message; } }
+    o.creador = t.creador; o.creadorDe = t.creadorDe || "server"; o.creadorTx = n + (n >= 3000 ? "+" : ""); o.creadorDesde = viejo ? viejo.blockTime : null; } catch (e) { if (e instanceof Corte) throw e; o.errCreador = e.message; } }
   o.creditos = job.porFase.extras || 0;
   escribe(job, rel("extras", t.mint, ".json"), JSON.stringify(o));
   return { estado: "ok", o };
@@ -253,15 +266,18 @@ async function trabaja(m) {
   try {
     mig = await migracionDe(job, t);
     if (F.curva) { try { const r = await faseCurva(job, t, mig); estado.curva = r.estado; C = r.c; } catch (e) { if (e instanceof Corte) throw e; estado.curva = "error: " + String(e.message).slice(0, 140); } }
+    // si la curva ya estaba bajada (de antes de un reinicio) y ahora solo toca la piscina, se lee para saber quién compró en la curva
+    if (!C && F.piscina && !F.curva) { const c = lee(rel("curva", t.mint)); if (c && !c.vacio) C = c; }
+    // [16-oct] el creador que el server no supo: quien firma la 1ª transacción de la curva de bonos (la que crea el mint), o la fase del creador
+    if (!t.creador && C && Array.isArray(C.rows) && C.rows.length && C.rows[0].w) { t.creador = C.rows[0].w; t.creadorDe = "curva"; }
+    if (F.creador) { try { const r = await faseCreador(job, t, mig); estado.creador = r.estado; if (r.creador && !t.creador) { t.creador = r.creador; t.creadorDe = "1ª transacción"; } } catch (e) { if (e instanceof Corte) throw e; estado.creador = "error: " + String(e.message).slice(0, 140); } }
     if (F.piscina) { try { const r = await faseSwaps(job, t, mig, t.roto ? "rotos" : "swaps"); estado.piscina = r.estado; Pz = r.p; } catch (e) { if (e instanceof Corte) throw e; estado.piscina = "error: " + String(e.message).slice(0, 140); } }
     if (F.extras) { try { const r = await faseExtras(job, t, mig); estado.extras = r.estado; X = r.o; } catch (e) { if (e instanceof Corte) throw e; estado.extras = "error: " + String(e.message).slice(0, 140); } }
   } catch (e) { corte = e.tipo || "error"; estado.corte = String(e.message).slice(0, 200); }
-  // si la curva ya estaba bajada (de antes de un reinicio) y ahora solo toca la piscina, se lee para saber quién compró en la curva
-  if (!C && F.piscina && !F.curva) { const c = lee(rel("curva", t.mint)); if (c && !c.vacio) C = c; }
   let curvaW = null; if (C && Array.isArray(C.rows) && C.rows.length) { curvaW = new Set(C.rows.filter(r => r.lado === 1).map(r => r.w)); curvaW.bundle = new Set(C.rows.filter(r => r.lado === 1 && r.slot === C.rows[0].slot).map(r => r.w)); }
   let fc = null, fp = null; try { fc = C ? rasgosCurva(C, t, mig) : null; } catch (e) { estado.rasgos_curva = "error: " + e.message; } try { fp = Pz ? rasgosPiscina(Pz, t, curvaW, mig) : null; } catch (e) { estado.rasgos_piscina = "error: " + e.message; }
-  const fx = X ? { nombre: X.nombre ?? null, links: X.links ? Object.keys(X.links).join("|") : null, descripcion_len: (X.descripcion || "").length, mutable: X.mutable ?? null, creador: X.creador || null, creador_tx: X.creadorTx ?? null, creador_desde_utc: X.creadorDesde ? new Date(X.creadorDesde * 1000).toISOString() : null, autoridades_n: Array.isArray(X.autoridades) ? X.autoridades.length : null } : null;
-  const ficha = { v: 1, mint: t.mint, sym: t.sym, grupo: t.grupo, roto: t.roto ? 1 : 0, mig: mig ? { bt: mig.bt, slot: mig.slot, deFirma: mig.deFirma } : null, latencia_ms: mig && mig.deFirma ? t.t0 - mig.bt * 1000 : null,
+  const fx = X ? { nombre: X.nombre ?? null, links: X.links ? Object.keys(X.links).join("|") : null, descripcion_len: (X.descripcion || "").length, mutable: X.mutable ?? null, creador: X.creador || null, creador_de: X.creadorDe ?? null, creador_tx: X.creadorTx ?? null, creador_desde_utc: X.creadorDesde ? new Date(X.creadorDesde * 1000).toISOString() : null, autoridades_n: Array.isArray(X.autoridades) ? X.autoridades.length : null } : null;
+  const ficha = { v: 1, mint: t.mint, sym: t.sym, grupo: t.grupo, roto: t.roto ? 1 : 0, mig: mig ? { bt: mig.bt, slot: mig.slot, deFirma: mig.deFirma } : null, latencia_ms: latencia(t, mig),
     fases: estado, creditos: job.creditos, porFase: job.porFase, curva: fc, piscina: fp, extras: fx };
   manda({ tipo: "hecho", id: job.id, mint: t.mint, ficha, creditos: job.creditos, porFase: job.porFase, ficheros: job.ficheros, corte, errores: job.errores });
 }
