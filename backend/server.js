@@ -19,6 +19,7 @@
 //    con ≤ LOTE2_SWAPS swaps, un 2º lote de LOTE2_SOL SOL (de serie apagado: 0) que sale al ×LOTE2_OBJ o a los LOTE2_RELOJ s, contado con la piscina
 //    de verdad como el banco de «Todas» ([SOLLOTE2], «2º lote» en [SALUD]). En la página (Helius, 4-17 oct): 136 ops, +284 SOL con 9, 11 días de 12.
 //    El motor y el 1er lote no cambian; se apunta también lo que habría hecho el 1er lote saliendo con el 2º (verdad1con2=).
+//  [18-oct] + MIRA_CARTERA=<dirección> (mira_cartera.js): al arrancar lee sus últimas MIRA_N transacciones por Helius y dice de dónde le llegan los tokens ([CARTERA]).
 //  [18-oct] + LA MUESTRA DE CURVAS (curvas.js): 1 de cada 6 tokens que crea pump.fun (PumpPortal subscribeNewToken) y a las 24 h si migraron y hasta dónde
 //    se llenó la curva (coins-v2, ath_market_cap): la parte que migra desde cada nivel de llenado, lo que falta para saber si compensa comprar en la curva
 //    (CURVAS_MUESTRA=0 apaga; CURVAS_UNO_DE; GET /curvas).
@@ -88,7 +89,7 @@ const PP_WS = PUMPPORTAL_API_KEY ? `wss://pumpportal.fun/api/data?api-key=${PUMP
 
 if (!HELIUS_API_KEY) { console.log("❌ falta HELIUS_API_KEY: sin ella no hay precios. Me paro."); process.exit(1); }
 // ═══ [5-oct] EL MOTOR (el del server de Pons, en motor.js: el mismo texto que corre el artefacto) ═══
-import fs from "fs"; import path from "path"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js"; import * as CURVASM from "./curvas.js";
+import fs from "fs"; import path from "path"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js"; import * as CURVASM from "./curvas.js"; import * as MIRA from "./mira_cartera.js";
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 // ═══ [12-oct] EL RESCATE DENTRO DEL SERVER y EL REGISTRO EN EL DISCO (rescate.js): todo lo que sale por consola se guarda también en el volumen ═══
 let RESC; try { RESC = RESCATE.crea({ log: (m) => console.log(m), gastoVivoDia: () => vivoDia() }); }   // el rescate usa lo que sobre del presupuesto de Helius
@@ -728,5 +729,7 @@ await REAL.init({ log, papelDe });
 await precioSol(); setInterval(precioSol, 5 * 60e3); log(`💱 SOL a $${S.solUsd.toFixed(2)}`);
 try { CURVAS = CURVASM.crea({ log, pumpApi, solUsd: () => S.solUsd, clave: REAL.CLAVE || "" }); } catch (e) { log(`⚠️ la muestra de curvas no arranca (${e && e.message}): el server sigue sin ella`); }   // [18-oct]
 log(CURVAS.arranqueTxt());
+if ((process.env.MIRA_CARTERA || "").trim()) { const A = process.env.MIRA_CARTERA.trim(); log(`🔎 MIRA_CARTERA: a los 45 s leo las últimas ${+(process.env.MIRA_N || 300)} transacciones de ${A} (Helius, ~${Math.ceil(+(process.env.MIRA_N || 300) / 100) * 10} créditos) → líneas [CARTERA]`);   // [18-oct] de dónde le llegan los tokens a una cartera (una vez por arranque)
+  setTimeout(() => MIRA.mira(A, { rpc, log, n: Math.min(1000, +(process.env.MIRA_N || 300)) }).catch(e => log(`⚠️ MIRA_CARTERA: ${e && e.message}`)), 45e3); }
 if (MODO_WS) heliusNueva(); abrePumpPortal();
 process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { RESC.cierra(); } catch (e) {} try { CURVAS.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen
