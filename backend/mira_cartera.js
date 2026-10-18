@@ -33,7 +33,9 @@ export function lee(tx, A) {
     const otros = [...delta].filter(([k, d]) => k.endsWith("|" + x.mint) && !k.startsWith(A + "|") && Math.sign(d) === -Math.sign(x.d)).map(([k, d]) => ({ owner: k.split("|")[0], d })).sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
     const paga = (solA + wsolA) < -0.0005, cobra = (solA + wsolA) > 0.0005;
     const que = x.d > 0 ? (paga ? "COMPRA" : "ENTRA") : (cobra ? "VENDE" : "SALE");
-    out.toks.push({ mint: x.mint, d: x.d, que, otro: otros[0]?.owner || null, otros: otros.length });
+    // el SOL que tiene la cuenta del otro lado tras el swap (si es la curva de pump.fun, su llenado: 85 SOL = migra)
+    let solOtro = null; if (otros[0]) { const io = keys.findIndex(k => k.pubkey === otros[0].owner); if (io >= 0 && m.postBalances) solOtro = +(m.postBalances[io] / 1e9).toFixed(3); }
+    out.toks.push({ mint: x.mint, d: x.d, que, otro: otros[0]?.owner || null, otros: otros.length, solOtro });
   }
   return out;
 }
@@ -90,4 +92,43 @@ export async function miraVarias(lista, { rpc, log, n = 100 }) {
     await new Promise(r => setTimeout(r, 700));
   }
   log(`[CARTERA62] fin: ${lista.length} carteras`);
+}
+
+// ── [18-oct] LOS BOTS DE LA CURVA, CON TODO LO QUE COMPRAN (MIRA_BOTS=a,b,c): de cada uno, sus transacciones de una ventana ya resuelta (de hace
+//    MIRA_BOTS_DESDE_H (30) a hace MIRA_BOTS_HASTA_H (24) horas, hasta MIRA_BOTS_TX (2000) tx = 200 créditos) y, por token: lo que paga al comprar en la
+//    curva (y el llenado de la curva en ese momento: el SOL del PDA de la curva tras la compra), lo que saca vendiendo (en la curva o en la piscina) y si
+//    el token MIGRÓ (está en la lista de vistas del server, o lo vendió por PumpSwap). Sale la tasa de migración real de sus compras por tramo de llenado
+//    y su cuenta de verdad (con los tokens de las curvas muertas a cero). Líneas [BOT]; detalle en /data/bot_<dir>.json. ──
+export async function miraBots(lista, { rpc, log, n = 2000, vistas = new Set(), desdeH = 30, hastaH = 24, dir = "/data" }) {
+  const PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+  for (const A of lista) {
+    const t0 = Date.now(); let token = null; const txs = []; const gte = Math.floor(Date.now() / 1000 - desdeH * 3600), lte = Math.floor(Date.now() / 1000 - hastaH * 3600);
+    try {
+      while (txs.length < n) {
+        const opts = { transactionDetails: "full", encoding: "jsonParsed", maxSupportedTransactionVersion: 1, limit: Math.min(100, n - txs.length), sortOrder: "asc", commitment: "finalized", filters: { status: "succeeded", blockTime: { gte, lte } } };
+        if (token) opts.paginationToken = token;
+        const r = await rpc("getTransactionsForAddress", [A, opts], 30000); const data = r?.data || []; txs.push(...data); token = r?.paginationToken; if (!token || !data.length) break;
+      }
+    } catch (e) { log(`[BOT] ${A}: Helius: ${String(e && e.message || e).slice(0, 100)} · leídas ${txs.length}`); if (!txs.length) continue; }
+    const L = txs.map(tx => { try { return lee(tx, A); } catch (e) { return null; } }).filter(Boolean);
+    const T = new Map();   // mint → {c, v, tok, llen, t1, curva, pool, nc, nv}
+    for (const x of L) for (const t of x.toks) {
+      if (t.mint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" || t.mint === "So11111111111111111111111111111111111111112") continue;
+      const o = T.get(t.mint) || { c: 0, v: 0, tok: 0, llen: null, t1: null, curva: 0, pool: 0, nc: 0, nv: 0 }; const enCurva = x.progs.includes("pump.fun (curva)"), enPool = x.progs.includes("PumpSwap");
+      if (t.que === "COMPRA") { o.c += -x.sol; o.nc++; if (o.t1 == null) { o.t1 = x.t; if (enCurva && t.solOtro != null) o.llen = Math.min(1.2, t.solOtro / 85); } }
+      else if (t.que === "VENDE") { o.v += x.sol; o.nv++; if (enPool) o.pool++; }
+      if (enCurva) o.curva++; o.tok += t.d; T.set(t.mint, o);
+    }
+    const toks = [...T].filter(([m, o]) => o.nc > 0); let nMig = 0; const tramos = [[0, .3, "0-30 %"], [.3, .5, "30-50 %"], [.5, .7, "50-70 %"], [.7, .9, "70-90 %"], [.9, 2, "≥ 90 %"]]; const R = {}; for (const [, , nom] of tramos) R[nom] = { n: 0, mig: 0, c: 0, v: 0, cMig: 0, vMig: 0 }; const sinLlen = { n: 0, mig: 0, c: 0, v: 0 };
+    let cTot = 0, vTot = 0, cMig = 0, vMig = 0, quedan = 0;
+    for (const [m, o] of toks) {
+      const mig = vistas.has(m) || o.pool > 0; if (mig) nMig++; cTot += o.c; vTot += o.v; if (mig) { cMig += o.c; vMig += o.v; } if (o.tok > 1 && !mig) quedan++;
+      const tr = o.llen == null ? null : tramos.find(([a, b]) => o.llen >= a && o.llen < b); const g = tr ? R[tr[2]] : sinLlen; g.n++; g.c += o.c; g.v += o.v; if (mig) { g.mig++; if (tr) { g.cMig += o.c; g.vMig += o.v; } }
+    }
+    const min = L.length ? (Math.max(...L.map(x => x.t)) - Math.min(...L.map(x => x.t))) / 60 : 0;
+    log(`[BOT] ${A} · ventana de hace ${desdeH} h a hace ${hastaH} h: ${L.length} tx (${min.toFixed(0)} min, ${(L.length / Math.max(min, 1)).toFixed(1)}/min) · ${Math.round((Date.now() - t0) / 1000)} s · compra en ${toks.length} tokens · MIGRARON ${nMig} (${toks.length ? Math.round(100 * nMig / toks.length) : 0} %) · paga ${cTot.toFixed(1)} SOL, saca ${vTot.toFixed(1)} → ${(vTot - cTot) >= 0 ? "+" : ""}${(vTot - cTot).toFixed(1)} SOL (con lo que queda en curvas muertas a cero; se queda con tokens en ${quedan}) · en los que migran paga ${cMig.toFixed(1)} saca ${vMig.toFixed(1)} (×${cMig ? (vMig / cMig).toFixed(2) : "—"}) · en los que no: paga ${(cTot - cMig).toFixed(1)} saca ${(vTot - vMig).toFixed(1)}`);
+    log(`[BOT] ${A} · por llenado de la curva al comprar: ` + tramos.map(([, , nom]) => { const g = R[nom]; return `${nom}: ${g.n} tokens, migran ${g.n ? Math.round(100 * g.mig / g.n) : 0} %, paga ${g.c.toFixed(1)} saca ${g.v.toFixed(1)}`; }).join(" · ") + ` · sin llenado (no fue en la curva): ${sinLlen.n} tokens, migran ${sinLlen.n ? Math.round(100 * sinLlen.mig / sinLlen.n) : 0} %`);
+    try { const f = `${fs.existsSync(dir) ? dir : "/tmp"}/bot_${A.slice(0, 8)}.json`; fs.writeFileSync(f, JSON.stringify({ A, desdeH, hastaH, tx: L.length, tokens: Object.fromEntries([...T].map(([m, o]) => [m, { ...o, mig: vistas.has(m) || o.pool > 0 }])) })); } catch (e) {}
+  }
+  log(`[BOT] fin: ${lista.length} bots`);
 }
