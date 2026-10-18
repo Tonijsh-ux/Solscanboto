@@ -19,6 +19,8 @@
 //    con ≤ LOTE2_SWAPS swaps, un 2º lote de LOTE2_SOL SOL (de serie apagado: 0) que sale al ×LOTE2_OBJ o a los LOTE2_RELOJ s, contado con la piscina
 //    de verdad como el banco de «Todas» ([SOLLOTE2], «2º lote» en [SALUD]). En la página (Helius, 4-17 oct): 136 ops, +284 SOL con 9, 11 días de 12.
 //    El motor y el 1er lote no cambian; se apunta también lo que habría hecho el 1er lote saliendo con el 2º (verdad1con2=).
+//  [18-oct] + LA MUESTRA DE CURVAS (curvas.js): cada 10 min los 50 tokens más nuevos de pump.fun y a las 24 h si migraron y hasta dónde se llenó la curva
+//    (ath_market_cap): la parte que migra desde cada nivel de llenado, lo que falta para saber si compensa comprar en la curva (CURVAS_MUESTRA=0 apaga; /curvas).
 //  [12-oct, noche] + EL RESCATE DENTRO DEL SERVER (rescate.js + rescate_trabajo.js): al cerrar cada cámara baja de Helius la curva de bonos,
 //    los swaps de la piscina con cartera, la migración exacta y los extras (con presupuesto de créditos por día) → ficheros en el volumen
 //    y una línea [SOLFICHA] con los rasgos; y TODO el registro se guarda también en el volumen, un fichero por día (no más huecos).
@@ -85,7 +87,7 @@ const PP_WS = PUMPPORTAL_API_KEY ? `wss://pumpportal.fun/api/data?api-key=${PUMP
 
 if (!HELIUS_API_KEY) { console.log("❌ falta HELIUS_API_KEY: sin ella no hay precios. Me paro."); process.exit(1); }
 // ═══ [5-oct] EL MOTOR (el del server de Pons, en motor.js: el mismo texto que corre el artefacto) ═══
-import fs from "fs"; import path from "path"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js";
+import fs from "fs"; import path from "path"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js"; import * as CURVASM from "./curvas.js";
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 // ═══ [12-oct] EL RESCATE DENTRO DEL SERVER y EL REGISTRO EN EL DISCO (rescate.js): todo lo que sale por consola se guarda también en el volumen ═══
 let RESC; try { RESC = RESCATE.crea({ log: (m) => console.log(m), gastoVivoDia: () => vivoDia() }); }   // el rescate usa lo que sobre del presupuesto de Helius
@@ -526,6 +528,7 @@ async function migracion(m) {
 const CAB = { accept: "application/json", "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36", origin: "https://pump.fun", referer: "https://pump.fun/" };
 async function pumpApi(ruta) { const r = await fetch(`https://frontend-api-v3.pump.fun${ruta}`, { headers: CAB, signal: AbortSignal.timeout(8000) }); if (!r.ok) throw new Error(`pump.fun ${r.status}`); return r.json(); }
 let avisoPump = 0;
+let CURVAS = CURVASM.nulo();   // [18-oct] la muestra de curvas de pump.fun (curvas.js): cuántas de las que llegan a X % migran; se crea en el arranque
 // ── el nacimiento por Helius (cuando la API de pump.fun no contesta): símbolo (getAsset), tenedores y concentración (cuentas del token),
 //    y edad (la firma más antigua que menciona el mint). "compradores" = tenedores al migrar (los que compraron y aún tienen).
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -655,7 +658,8 @@ function estado() { return { arranque: S.arranque, migraciones: S.migs, grabando
   plan: PLAN ? PLAN.nombre : null, papel: { desde: P.desde, real: P.real, verdad: P.verdad || 0, papel: P.papel, cerradas: P.cerradas, ganadas: P.ganadas, abiertas: P.abiertas, expuesto: P.expuesto || 0, entradas: P.entradas, vetadas: P.vetadas } }; }
 const atiende = async (req, res) => {
   if (req.url.startsWith("/favicon")) { res.statusCode = 204; res.end(); return; }
-  if (req.method === "GET" && req.url.startsWith("/rescate") && await RESC.atiende(req, res)) return;   // [12-oct] lo del rescate y el registro, para bajarlo al PC
+  if (req.method === "GET" && req.url.startsWith("/rescate") && await RESC.atiende(req, res)) return;
+  if (req.method === "GET" && req.url.startsWith("/curvas") && await CURVAS.atiende(req, res)) return;   // [18-oct] la muestra de curvas (JSON; /curvas/todo el fichero entero)   // [12-oct] lo del rescate y el registro, para bajarlo al PC
   if (req.method === "POST") { let cuerpo = ""; for await (const ch of req) { cuerpo += ch; if (cuerpo.length > 2000) break; } const q = new URLSearchParams(cuerpo); const u = req.url.split("?")[0];
     const ok = REAL.CLAVE && q.get("clave") === REAL.CLAVE; let msg = !REAL.CLAVE ? "Falta la variable PANEL_CLAVE en Railway: ponle la clave que quieras y vuelve a probar" : "Clave incorrecta: tiene que ser la misma que la variable PANEL_CLAVE de Railway";
     if (ok && u === "/papel-a-cero") { P.anterior = { plan: P.plan, desde: P.desde, hasta: Date.now(), cerradas: P.cerradas, real: P.real, verdad: P.verdad || 0, papel: P.papel };   // [8-oct] poner a cero las cuentas en papel desde el panel (lo de antes queda en P.anterior)
@@ -720,5 +724,7 @@ log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} m
 log(RESC.arranqueTxt());
 await REAL.init({ log, papelDe });
 await precioSol(); setInterval(precioSol, 5 * 60e3); log(`💱 SOL a $${S.solUsd.toFixed(2)}`);
+try { CURVAS = CURVASM.crea({ log, pumpApi, solUsd: () => S.solUsd, clave: REAL.CLAVE || "" }); } catch (e) { log(`⚠️ la muestra de curvas no arranca (${e && e.message}): el server sigue sin ella`); }   // [18-oct]
+log(CURVAS.arranqueTxt());
 if (MODO_WS) heliusNueva(); abrePumpPortal();
-process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { RESC.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen
+process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { RESC.cierra(); } catch (e) {} try { CURVAS.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen
