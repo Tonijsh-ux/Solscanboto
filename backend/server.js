@@ -731,5 +731,7 @@ try { CURVAS = CURVASM.crea({ log, pumpApi, solUsd: () => S.solUsd, clave: REAL.
 log(CURVAS.arranqueTxt());
 if ((process.env.MIRA_CARTERA || "").trim()) { const A = process.env.MIRA_CARTERA.trim(); log(`🔎 MIRA_CARTERA: a los 45 s leo las últimas ${+(process.env.MIRA_N || 300)} transacciones de ${A} (Helius, ~${Math.ceil(+(process.env.MIRA_N || 300) / 100) * 10} créditos) → líneas [CARTERA]`);   // [18-oct] de dónde le llegan los tokens a una cartera (una vez por arranque)
   setTimeout(() => MIRA.mira(A, { rpc, log, n: Math.min(1000, +(process.env.MIRA_N || 300)) }).catch(e => log(`⚠️ MIRA_CARTERA: ${e && e.message}`)), 45e3); }
+if ((process.env.MIRA_CARTERAS || "").trim()) { const L = process.env.MIRA_CARTERAS.split(/[,\s]+/).map(x => x.trim()).filter(Boolean); log(`🔎 MIRA_CARTERAS: a los 60 s miro ${L.length} carteras (${+(process.env.MIRA_N2 || 100)} tx cada una, ~${L.length * 10} créditos) → líneas [CARTERA62]`);   // [18-oct] el repaso de las 62 «bots»: ¿bot de verdad o app que firma por otros?
+  setTimeout(() => MIRA.miraVarias(L, { rpc, log, n: +(process.env.MIRA_N2 || 100) }).catch(e => log(`⚠️ MIRA_CARTERAS: ${e && e.message}`)), 60e3); }
 if (MODO_WS) heliusNueva(); abrePumpPortal();
 process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { RESC.cierra(); } catch (e) {} try { CURVAS.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen
