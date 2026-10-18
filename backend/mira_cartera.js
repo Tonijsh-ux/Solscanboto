@@ -21,9 +21,13 @@ export function lee(tx, A) {
   const delta = new Map(); for (const k of new Set([...pre.keys(), ...post.keys()])) { const d = (post.get(k) || 0) - (pre.get(k) || 0); if (Math.abs(d) > 1e-9) delta.set(k, d); }
   const mios = [...delta].filter(([k]) => k.startsWith(A + "|")).map(([k, d]) => ({ mint: k.split("|")[1], d }));
   const wsolA = mios.find(x => x.mint === WSOL)?.d || 0; const toks = mios.filter(x => x.mint !== WSOL);
-  const progs = new Set(); for (const ins of msg.instructions || []) if (ins.programId) progs.add(PROGRAMAS[ins.programId] || corto(ins.programId));
-  for (const inner of m.innerInstructions || []) for (const ins of inner.instructions || []) if (ins.programId) progs.add(PROGRAMAS[ins.programId] || corto(ins.programId));
-  const out = { sig: tx.transaction?.signatures?.[0] || tx.signature, t: tx.blockTime, firma: firmantes.includes(A) ? "ella" : corto(firmantes[0]), progs: [...progs].filter(p => p !== "ComputeBudget" && p !== "System" && p !== "ATA"), sol: +(solA + wsolA).toFixed(4), toks: [] };
+  const progs = new Set(); const memos = []; const MEMO = /^Memo/;
+  const mira = (ins) => { if (!ins.programId) return; const nom = PROGRAMAS[ins.programId] || corto(ins.programId); progs.add(nom); if ((ins.program === "spl-memo" || /^Memo/.test(ins.programId)) && ins.parsed) memos.push(String(typeof ins.parsed === "string" ? ins.parsed : JSON.stringify(ins.parsed)).slice(0, 80)); };
+  for (const ins of msg.instructions || []) mira(ins);
+  for (const inner of m.innerInstructions || []) for (const ins of inner.instructions || []) mira(ins);
+  // todos los cambios de tokens de la transacción (para los ejemplos): owner|mint → delta
+  const todos = [...delta].map(([k, d]) => `${corto(k.split("|")[0])}|${corto(k.split("|")[1])}:${d > 0 ? "+" : ""}${Math.abs(d) >= 1000 ? d.toFixed(0) : d.toFixed(3)}`);
+  const out = { sig: tx.transaction?.signatures?.[0] || tx.signature, t: tx.blockTime, firma: firmantes.includes(A) ? "ella" : corto(firmantes[0]), firmantes: firmantes.length, progs: [...progs].filter(p => p !== "ComputeBudget" && p !== "System" && p !== "ATA"), memos, todos, sol: +(solA + wsolA).toFixed(4), toks: [] };
   for (const x of toks) {
     // el otro lado: cuentas del mismo mint que cambian al revés
     const otros = [...delta].filter(([k, d]) => k.endsWith("|" + x.mint) && !k.startsWith(A + "|") && Math.sign(d) === -Math.sign(x.d)).map(([k, d]) => ({ owner: k.split("|")[0], d })).sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
@@ -51,12 +55,14 @@ export async function mira(A, { rpc, log, n = 300, dir = "/data" }) {
   log(`[CARTERA] ${A} · ${L.length} transacciones leídas (${desde} → ${hasta}Z) · ${Math.round((Date.now() - t0) / 1000)} s · movimientos de tokens: ${tipos.map(([k, v]) => `${k} ${v}`).join(" · ") || "ninguno"} · sin tokens ${sinTok} · firma ella misma ${L.filter(x => x.firma === "ella").length}, firma otro ${L.filter(x => x.firma !== "ella").length}`);
   log(`[CARTERA] programas: ${cuenta(L.flatMap(x => x.progs)).slice(0, 8).map(([k, v]) => `${k} ${v}`).join(" · ")}`);
   if (entran.length) {
-    log(`[CARTERA] le ENTRAN tokens ${entran.length} veces, de ${deQuien.length} carteras distintas; las que más: ${deQuien.slice(0, 8).map(([k, v]) => `${k} ×${v} (${mintsDe.get(k)?.size || 0} mints; firma ${cuenta(entran.filter(t => t.otro === k).map(t => t.firma))[0]?.[0]})`).join(" · ")}`);
+    log(`[CARTERA] le ENTRAN tokens ${entran.length} veces, de ${deQuien.length} carteras distintas; las que más: ${deQuien.slice(0, 8).map(([k, v]) => `${k} ×${v} (${mintsDe.get(k === "?" ? null : k)?.size || 0} mints; firma ${cuenta(entran.filter(t => (t.otro || "?") === k).map(t => t.firma))[0]?.[0]})`).join(" · ")} · mints que entran: ${cuenta(entran.map(t => corto(t.mint))).slice(0, 5).map(([k, v]) => `${k} ×${v}`).join(" · ")}`);
     const ej = entran.slice(0, 5).map(t => `${corto(t.mint)} ${t.d.toFixed(0)} tokens de ${t.otro || "?"} vía ${t.progs.join("+") || "transferencia"}`); log(`[CARTERA] ejemplos de entradas: ${ej.join(" | ")}`);
   }
   const vende = L.flatMap(x => x.toks.filter(t => t.que === "VENDE").map(t => ({ ...t, sol: x.sol, progs: x.progs })));
   if (vende.length) log(`[CARTERA] VENDE ${vende.length} veces · SOL que cobra: mediana ${vende.map(v => v.sol).sort((a, b) => a - b)[Math.floor(vende.length / 2)].toFixed(3)}, total ${vende.reduce((s, v) => s + v.sol, 0).toFixed(1)} · por: ${cuenta(vende.flatMap(v => v.progs)).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(" · ")}`);
   const sale = L.flatMap(x => x.toks.filter(t => t.que === "SALE")); if (sale.length) log(`[CARTERA] SALEN tokens ${sale.length} veces hacia ${cuenta(sale.map(t => t.otro || "?")).slice(0, 5).map(([k, v]) => `${k} ×${v}`).join(" · ")}`);
   const solNeto = L.reduce((s, x) => s + x.sol, 0); log(`[CARTERA] SOL neto en estas ${L.length} transacciones: ${solNeto >= 0 ? "+" : ""}${solNeto.toFixed(2)}`);
+  const memos = cuenta(L.flatMap(x => x.memos)); if (memos.length) log(`[CARTERA] memos (${L.filter(x => x.memos.length).length} transacciones con memo): ${memos.slice(0, 6).map(([k, v]) => `«${k}» ×${v}`).join(" · ")}`);
+  for (const que of ["ENTRA", "COMPRA", "VENDE", "SALE"]) for (const x of L.filter(x => x.toks.some(t => t.que === que)).slice(0, 2)) log(`[CARTERA] ejemplo ${que}: ${x.sig} · firma ${x.firma} (${x.firmantes}) · SOL ${x.sol >= 0 ? "+" : ""}${x.sol} · ${x.progs.join("+")}${x.memos.length ? ` · memo «${x.memos[0]}»` : ""} · cambios: ${x.todos.slice(0, 8).join(" ")}`);
   try { const f = `${fs.existsSync(dir) ? dir : "/tmp"}/cartera_${A.slice(0, 8)}.json`; fs.writeFileSync(f, JSON.stringify({ A, leidas: L.length, desde, hasta, L })); log(`[CARTERA] detalle en ${f}`); } catch (e) {}
 }
