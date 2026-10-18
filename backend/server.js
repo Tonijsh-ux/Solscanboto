@@ -19,8 +19,9 @@
 //    con ≤ LOTE2_SWAPS swaps, un 2º lote de LOTE2_SOL SOL (de serie apagado: 0) que sale al ×LOTE2_OBJ o a los LOTE2_RELOJ s, contado con la piscina
 //    de verdad como el banco de «Todas» ([SOLLOTE2], «2º lote» en [SALUD]). En la página (Helius, 4-17 oct): 136 ops, +284 SOL con 9, 11 días de 12.
 //    El motor y el 1er lote no cambian; se apunta también lo que habría hecho el 1er lote saliendo con el 2º (verdad1con2=).
-//  [18-oct] + LA MUESTRA DE CURVAS (curvas.js): cada 10 min los 50 tokens más nuevos de pump.fun y a las 24 h si migraron y hasta dónde se llenó la curva
-//    (ath_market_cap): la parte que migra desde cada nivel de llenado, lo que falta para saber si compensa comprar en la curva (CURVAS_MUESTRA=0 apaga; /curvas).
+//  [18-oct] + LA MUESTRA DE CURVAS (curvas.js): 1 de cada 6 tokens que crea pump.fun (PumpPortal subscribeNewToken) y a las 24 h si migraron y hasta dónde
+//    se llenó la curva (coins-v2, ath_market_cap): la parte que migra desde cada nivel de llenado, lo que falta para saber si compensa comprar en la curva
+//    (CURVAS_MUESTRA=0 apaga; CURVAS_UNO_DE; GET /curvas).
 //  [12-oct, noche] + EL RESCATE DENTRO DEL SERVER (rescate.js + rescate_trabajo.js): al cerrar cada cámara baja de Helius la curva de bonos,
 //    los swaps de la piscina con cartera, la migración exacta y los extras (con presupuesto de créditos por día) → ficheros en el volumen
 //    y una línea [SOLFICHA] con los rasgos; y TODO el registro se guarda también en el volumen, un fichero por día (no más huecos).
@@ -469,8 +470,9 @@ function cuentas(c) { const L = (c.motor || MOTOR).sb.state.posiciones; let abie
 // ── PumpPortal: las migraciones ──
 function abrePumpPortal() {
   const ws = new WebSocket(PP_WS); S.pp.ws = ws;
-  ws.on("open", () => { S.pp.ok = true; ws.send(JSON.stringify({ method: "subscribeMigration" })); log(`🔌 PumpPortal: escuchando las migraciones${PUMPPORTAL_API_KEY ? " (con clave)" : " (sin clave)"}`); });
-  ws.on("message", (raw) => { let m; try { m = JSON.parse(raw); } catch { return; } if (m && m.mint && (m.txType === "migrate" || m.txType === "migration" || m.signature) && apuntaLlegada(m.mint, "pumpportal")) migracion({ ...m, fuente: "pumpportal" }).catch(e => { S.errores++; log(`⚠️ migración ${corto(m.mint)}: ${e.message}`); }); });
+  ws.on("open", () => { S.pp.ok = true; ws.send(JSON.stringify({ method: "subscribeMigration" })); if (CURVAS.activo) ws.send(JSON.stringify({ method: "subscribeNewToken" })); log(`🔌 PumpPortal: escuchando las migraciones${CURVAS.activo ? " y los tokens nuevos (para la muestra de curvas)" : ""}${PUMPPORTAL_API_KEY ? " (con clave)" : " (sin clave)"}`); });
+  ws.on("message", (raw) => { let m; try { m = JSON.parse(raw); } catch { return; } if (m && m.txType === "create") { CURVAS.nueva(m); return; }   // [18-oct] un token nuevo en pump.fun: a la muestra de curvas, no es una migración
+    if (m && m.mint && (m.txType === "migrate" || m.txType === "migration" || m.signature) && apuntaLlegada(m.mint, "pumpportal")) migracion({ ...m, fuente: "pumpportal" }).catch(e => { S.errores++; log(`⚠️ migración ${corto(m.mint)}: ${e.message}`); }); });
   ws.on("close", () => { S.pp.ok = false; S.pp.reconexiones++; setTimeout(abrePumpPortal, Math.min(30000, 2000 * S.pp.reconexiones)); });
   ws.on("error", (e) => { S.errores++; log(`⚠️ PumpPortal: ${e.message}`); });
 }
