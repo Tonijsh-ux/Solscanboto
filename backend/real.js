@@ -26,6 +26,8 @@
 //   · El CUADRE escala lo REAL al lote de papel (×LOTE_SOL/REAL_LOTE_SOL) para que las dos cuentas se puedan comparar.
 //   · prepara(): el server la llama al ver cada migración; refresca la prioridad y el blockhash si están viejos (2 llamadas a Helius por
 //     migración, no un sondeo continuo), para que la orden de los 4 s no gaste tiempo en eso.
+//   · [18-oct, noche] SOLANA_PRIVATE_KEY en cualquier formato de cartera (base58 de 64 bytes o semilla de 32, array [..], hex) y SOLANA_DIRECCION
+//     (la dirección PÚBLICA, opcional): si está y la clave no es de esa dirección, la cartera no se carga (la clave de Ethereum de MetaMask, otra cuenta…).
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 import fs from "fs";
 const E = process.env;
@@ -72,6 +74,20 @@ const espera = (ms) => new Promise(r => setTimeout(r, ms));
 const guarda = () => { try { const tmp = FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ tokens: R.tokens, totales: R.totales, dia: R.dia, cuadres: R.cuadres.slice(0, 200), huerfanos: R.huerfanos }, (k, v) => typeof v === "bigint" ? v.toString() : v)); fs.renameSync(tmp, FILE); } catch {} };   // [12-oct] primero a .tmp y luego se renombra: con el disco lleno no se queda a medias
 setInterval(guarda, 60e3);
 
+// ── [18-oct, noche] la clave privada en cualquiera de los formatos de las carteras (Tony: «¿cómo saco la clave de Solana de MetaMask?»):
+//   base58 (Phantom, Solflare, MetaMask: los 64 bytes; o la semilla de 32) · el array [12,34,…] (solana-keygen: 64; o 32) · hex (64 o 128 caracteres, con o sin 0x).
+//   Se quitan espacios, saltos de línea y comillas que se cuelan al copiar. Los errores NUNCA repiten nada de la clave (solo el formato y el tamaño).
+function leeClave(txt) {
+  if (/^\s*(?:[a-z]+\s+){11,23}[a-z]+\s*$/.test(String(txt))) throw new Error("SOLANA_PRIVATE_KEY parece la FRASE DE RECUPERACIÓN (12-24 palabras): no la pongas nunca en Railway; bórrala de ahí y pon la clave privada de la cuenta");
+  const s = String(txt).replace(/\s+/g, "").replace(/^["'`]+|["'`]+$/g, ""); const hex = s.replace(/^0x/i, ""); let bytes = null, formato = null;
+  if (/^[0-9a-fA-F]+$/.test(hex) && (hex.length === 64 || hex.length === 128)) { bytes = Uint8Array.from(Buffer.from(hex, "hex")); formato = "hex"; }
+  else if (s.startsWith("[")) { try { const a = JSON.parse(s); if (Array.isArray(a) && a.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) { bytes = Uint8Array.from(a); formato = "array"; } } catch {} }
+  else { try { bytes = bs58.decode(s); formato = "base58"; } catch {} }
+  if (!bytes) throw new Error(`SOLANA_PRIVATE_KEY no tiene un formato que reconozca (${s.length} caracteres): tiene que ser base58 como la de Phantom/MetaMask, el array [12,34,…] o hex`);
+  if (bytes.length === 64) { let kp; try { kp = web3.Keypair.fromSecretKey(bytes); } catch { throw new Error(`SOLANA_PRIVATE_KEY (${formato}, 64 bytes) no es una clave de Solana válida: sus dos mitades no casan`); } return { kp, formato: `${formato}, 64 bytes` }; }
+  if (bytes.length === 32) return { kp: web3.Keypair.fromSeed(bytes), formato: `${formato}, semilla de 32 bytes` };
+  throw new Error(`SOLANA_PRIVATE_KEY (${formato}) tiene ${bytes.length} bytes: una clave de Solana tiene 64 (o 32 si es la semilla)`); }
+
 // ── el arranque: la cartera (si hay clave) y lo guardado ──
 export async function init(opts = {}) {
   log = opts.log || log; papelDe = opts.papelDe || papelDe;
@@ -81,11 +97,15 @@ export async function init(opts = {}) {
   const clave = (E.SOLANA_PRIVATE_KEY || E.WALLET_PRIVATE_KEY || "").trim();
   if (!clave) { log(`🔒 sin SOLANA_PRIVATE_KEY: el server solo hace papel (no puede armarse)`); return; }
   try { web3 = await import("@solana/web3.js"); bs58 = (await import("bs58")).default; try { spl = await import("@solana/spl-token"); } catch { log("ℹ️ sin @solana/spl-token: no se cerrarán las cuentas vacías (se pierde ~0,002 SOL de alquiler por token)"); }
-    let bytes; try { bytes = bs58.decode(clave); } catch { try { bytes = Uint8Array.from(JSON.parse(clave)); } catch { throw new Error("SOLANA_PRIVATE_KEY no tiene un formato válido (base58 o el array [12,34,…])"); } }   // base58 o el array [12,34,…] · [12-oct] el error no repite ni un trozo de la clave
-    wallet = web3.Keypair.fromSecretKey(bytes); conn = new web3.Connection(RPC, "confirmed"); R.pub = wallet.publicKey.toString(); R.listo = true;
+    const { kp, formato } = leeClave(clave); const pub = kp.publicKey.toString(); const corta = (d) => `${d.slice(0, 4)}…${d.slice(-4)}`;
+    // [18-oct, noche] SOLANA_DIRECCION (la dirección PÚBLICA, opcional): si está y la clave no es de esa dirección, no se carga (p. ej. si se copió la clave de Ethereum de MetaMask)
+    const DIR = (E.SOLANA_DIRECCION || "").trim();
+    if (DIR && pub !== DIR) throw new Error(`la clave no es de la dirección de SOLANA_DIRECCION (${corta(DIR)}): sale ${corta(pub)} · ¿se copió la clave de Ethereum o la de otra cuenta?`);
+    wallet = kp; conn = new web3.Connection(RPC, "confirmed"); R.pub = pub; R.listo = true;
+    log(`🔑 clave leída (${formato}) · dirección ${corta(pub)}${DIR ? " · coincide con SOLANA_DIRECCION ✅" : " · comprueba que es tu dirección de Solana (si no, se copió otra clave)"}`);
     if (RUTAS.includes("directo")) { try { pss = await import("@pump-fun/pump-swap-sdk"); BN = (await import("bn.js")).default; sdkOnline = new pss.OnlinePumpAmmSdk(conn); log(`⚡ ruta directa a PumpSwap lista (SDK de pump.fun) · envío ${SENDER === "no" ? "por el RPC" : "por Helius Sender (" + SENDER + ", propina " + PROPINA + " SOL)"} · prioridad ${PRIO_NIVEL} (tope ${PRIO_MAX} SOL)`); }
       catch (e) { pss = null; log(`⚠️ sin el SDK de pump.fun (${e.message.slice(0, 80)}): se usará Jupiter`); } }
-    await saldo(true); log(`🔑 cartera ${R.pub.slice(0, 4)}…${R.pub.slice(-4)} · saldo ${R.saldo?.toFixed(4)} SOL · lote REAL ${LOTE} SOL${LOTE !== LOTE_PAPEL ? ` (SOMBRA del papel, que va con ${LOTE_PAPEL})` : ""} · DESARMADO (se arma desde el panel)`);
+    await saldo(true); log(`🔑 cartera ${R.pub.slice(0, 4)}…${R.pub.slice(-4)} · saldo ${R.saldo != null ? R.saldo.toFixed(4) : "? (no pude leerlo)"} SOL · lote REAL ${LOTE} SOL${LOTE !== LOTE_PAPEL ? ` (SOMBRA del papel, que va con ${LOTE_PAPEL})` : ""} · DESARMADO (se arma desde el panel)`);
     buscaHuerfanos().catch(() => {}); setInterval(() => buscaHuerfanos().catch(() => {}), 10 * 60e3);
   } catch (e) { log(`❌ la cartera no carga (${e.message}): el server solo hace papel`); }
 }
