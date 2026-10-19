@@ -116,6 +116,9 @@ export async function init(opts = {}) {
 }
 async function saldo(forzar) { if (SIMULADO) return R.saldo; if (!conn) return null; if (!forzar && Date.now() - R.saldoT < 60e3 && R.saldo != null) return R.saldo;
   try { R.saldo = (await conn.getBalance(wallet.publicKey, "confirmed")) / 1e9; R.saldoT = Date.now(); } catch {} return R.saldo; }
+// [19-oct] el saldo del panel y de [SALUD] era el leído ANTES de la última compra (solo se leía para comprar): tras vender, el panel decía 5,057 con la
+//   cartera en 5,126 (Tony). Ahora se vuelve a leer 1 s después de cada compra y de cada venta (1 llamada getBalance, sin esperar a nada)
+function refrescaSaldo() { if (SIMULADO || !conn) return; setTimeout(() => { saldo(true).catch(() => {}); }, 1000); }
 async function saldoToken(mint) { if (SIMULADO) return R.tokens[mint]?.simTok || 0n;
   const r = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new web3.PublicKey(mint) }, "confirmed"); let s = 0n;
   for (const a of r.value || []) s += BigInt(a.account.data.parsed.info.tokenAmount.amount || "0"); return s; }
@@ -249,7 +252,7 @@ async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) re
         if (dentro + LOTE > MAX_EXPUESTO) { log(`⛔ ${rec.symbol}: no compro, habría ${(dentro + LOTE).toFixed(2)} SOL dentro (máx ${MAX_EXPUESTO})`); continue; }
         const sal = await saldo(); if (sal != null && sal < LOTE + RESERVA) { log(`⛔ ${rec.symbol}: no compro, el saldo (${sal.toFixed(3)} SOL) no deja la reserva de ${RESERVA} SOL`); continue; }
         try { const r = await compra(rec, o.datos); fallosSeguidos = 0; R.totales.compras++; R.ultima = `compra ${rec.symbol} ${r.coste.toFixed(4)} SOL`;
-          log(`🟢 COMPRA REAL ${rec.symbol} · ${LOTE} SOL · coste real ${r.coste.toFixed(4)} SOL · ${r.ruta || "sim"}${r.ms != null ? " " + r.ms + " ms" : ""} · ${r.sig}`); latencia(o, "compra", true, r); }
+          log(`🟢 COMPRA REAL ${rec.symbol} · ${LOTE} SOL · coste real ${r.coste.toFixed(4)} SOL · ${r.ruta || "sim"}${r.ms != null ? " " + r.ms + " ms" : ""} · ${r.sig}`); latencia(o, "compra", true, r); refrescaSaldo(); }
         catch (e) { R.totales.fallos++; fallosSeguidos++; log(`❌ compra real de ${rec.symbol} no salió: ${(e.message || String(e)).slice(0, 140)}${e.colgada ? " (sin confirmar: se mirará el saldo al vender)" : ""}`); latencia(o, "compra", false, null, { err: e.message || String(e), colgada: !!e.colgada, ctx: e.ctx });
           if (e.colgada) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; t.abierto = true; t.solIn += LOTE; }
           if (fallosSeguidos >= FALLOS_SEGUIDOS) desarma(`${fallosSeguidos} compras fallidas seguidas`); }
@@ -262,7 +265,7 @@ async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) re
         t.solOut += hecho.recibido; t.ventas++; t.abierto = false; R.totales.ventas++; R.ultima = `venta ${rec.symbol} ${hecho.recibido.toFixed(4)} SOL`;
         latencia(o, "venta", true, hecho, { tol: hecho.tol, intento: i });   // [19-oct] antes de cerrar la cuenta (si no, el «total» de la venta llevaba también esa otra transacción)
         const alquiler = await cierraCuenta(rec.token); t.solOut += alquiler;
-        log(`🔴 VENTA REAL ${rec.symbol} · todo · recibido ${hecho.recibido.toFixed(4)} SOL${alquiler > 0 ? ` (+${alquiler.toFixed(4)} del alquiler de la cuenta)` : ""} · ${hecho.ruta || "sim"}${hecho.ms != null ? " " + hecho.ms + " ms" : ""} · ${hecho.sig}`); cierraCuadre(rec); } } }
+        log(`🔴 VENTA REAL ${rec.symbol} · todo · recibido ${hecho.recibido.toFixed(4)} SOL${alquiler > 0 ? ` (+${alquiler.toFixed(4)} del alquiler de la cuenta)` : ""} · ${hecho.ruta || "sim"}${hecho.ms != null ? " " + hecho.ms + " ms" : ""} · ${hecho.sig}`); cierraCuadre(rec); refrescaSaldo(); } } }
   finally { q.girando = false; if (!q.items.length) COLAS.delete(token); else gira(token); } }
 function pendiente(rec, e) { R.totales.fallos++; const p = R.pendientes[rec.token] = R.pendientes[rec.token] || { sym: rec.symbol, ronda: 0 }; p.error = (e && e.message || String(e)).slice(0, 140);
   if (p.ronda >= REINTENTOS_S.length) { delete R.pendientes[rec.token]; R.huerfanos[rec.token] = { sym: rec.symbol, motivo: "la venta no sale: véndela desde el panel" }; log(`❌ ${rec.symbol}: la venta no sale ni reintentando · queda en huérfanos (véndela desde el panel) · ${p.error}`); return; }
