@@ -31,6 +31,9 @@
 //  [18-oct, noche] + EL 3er LOTE AL MOMENTUM, EN PAPEL (bloque LOTE3 tras lote2Valora): en [10-120] s, cuando el SOL neto que el server ve entrar en los
 //    últimos 10 s llega a un umbral (varios a la vez: LOTE3_UMBRALES 12,16,20, cada uno su cuenta), un lote de LOTE3_SOL (de serie 0) que sale al ×1,5 o a
 //    los 270 s ([SOLLOTE3], «3er lote» en [SALUD]). En la página (Helius, carteras normales, ≥ 20 SOL): 334 ops +19,4 SOL con 0,5, 11 días de 14.
+//  [19-oct] + LÍNEAS LARGAS EN TROZOS ([PARTE …]: Railway corta a 81.920 caracteres; mete_registro_solana.py las junta) y, una vez, las que ya cortó, desde el
+//    registro del disco · APAGADO DE VERDAD (railway.toml: node server.js + 20 s de drainingSeconds; antes cada despliegue perdía las cámaras abiertas)
+//    · la sombra real vende al arrancar lo que quedó dentro de antes del reinicio.
 //  [12-oct, noche] + EL RESCATE DENTRO DEL SERVER (rescate.js + rescate_trabajo.js): al cerrar cada cámara baja de Helius la curva de bonos,
 //    los swaps de la piscina con cartera, la migración exacta y los extras (con presupuesto de créditos por día) → ficheros en el volumen
 //    y una línea [SOLFICHA] con los rasgos; y TODO el registro se guarda también en el volumen, un fichero por día (no más huecos).
@@ -97,13 +100,22 @@ const PP_WS = PUMPPORTAL_API_KEY ? `wss://pumpportal.fun/api/data?api-key=${PUMP
 
 if (!HELIUS_API_KEY) { console.log("❌ falta HELIUS_API_KEY: sin ella no hay precios. Me paro."); process.exit(1); }
 // ═══ [5-oct] EL MOTOR (el del server de Pons, en motor.js: el mismo texto que corre el artefacto) ═══
-import fs from "fs"; import path from "path"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js"; import * as CURVASM from "./curvas.js"; import * as MIRA from "./mira_cartera.js";
+import fs from "fs"; import path from "path"; import zlib from "zlib"; import readline from "readline"; import { fileURLToPath } from "url"; import * as REAL from "./real.js"; import * as RESCATE from "./rescate.js"; import * as CURVASM from "./curvas.js"; import * as MIRA from "./mira_cartera.js";
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 // ═══ [12-oct] EL RESCATE DENTRO DEL SERVER y EL REGISTRO EN EL DISCO (rescate.js): todo lo que sale por consola se guarda también en el volumen ═══
 let RESC; try { RESC = RESCATE.crea({ log: (m) => console.log(m), gastoVivoDia: () => vivoDia() }); }   // el rescate usa lo que sobre del presupuesto de Helius
 catch (e) { console.log(`⚠️ el rescate no arranca (${e && e.message}): el server sigue sin él`); RESC = RESCATE.nulo(); }   // pase lo que pase con el disco, el server arranca
-{ const orig = { log: console.log.bind(console), error: console.error.bind(console), warn: console.warn.bind(console) };
-  for (const k of ["log", "error", "warn"]) console[k] = (...a) => { orig[k](...a); try { RESC.linea(a.map(x => typeof x === "string" ? x : x instanceof Error ? (x.stack || x.message) : (() => { try { return JSON.stringify(x); } catch { return String(x); } })()).join(" ")); } catch {} }; }
+// [19-oct] Railway CORTA cada línea a 81.920 caracteres: las [SOLREC] de los tokens más movidos perdían pts= (va al final) y no entraban en los datos.
+//   Ahora una línea de más de LINEA_MAX caracteres sale por la consola en trozos «[PARTE <id> i/n de <ETIQUETA>( ts=<hora original>)] …» y
+//   herramientas/mete_registro_solana.py los vuelve a juntar. En el disco del server (el registro de rescate.js) la línea sigue entera.
+const LINEA_MAX = Math.max(200, +(process.env.LINEA_MAX || 75000)); let PARTE_N = 0;
+function consolaPartes(escribe, txt, ts) { const et = (String(txt).match(/^\s*\[([A-Za-z0-9_]+)\]/) || [])[1] || "LINEA"; const id = Date.now().toString(36) + (PARTE_N++ % 1296).toString(36).padStart(2, "0");
+  const T = []; for (let i = 0; i < txt.length;) { let j = Math.min(txt.length, i + LINEA_MAX); if (j < txt.length) { const cc = txt.charCodeAt(j - 1); if (cc >= 0xD800 && cc <= 0xDBFF) j--; } T.push(txt.slice(i, j)); i = j; }   // sin partir un emoji por la mitad
+  for (let i = 0; i < T.length; i++) escribe(`[PARTE ${id} ${i + 1}/${T.length} de ${et}${ts ? " ts=" + ts : ""}] ${T[i]}`); return T.length; }
+const ORIG = { log: console.log.bind(console), error: console.error.bind(console), warn: console.warn.bind(console) };
+{ const orig = ORIG;
+  for (const k of ["log", "error", "warn"]) console[k] = (...a) => { let txt = null; try { txt = a.map(x => typeof x === "string" ? x : x instanceof Error ? (x.stack || x.message) : (() => { try { return JSON.stringify(x); } catch { return String(x); } })()).join(" "); } catch {}
+    if (txt != null && txt.length > LINEA_MAX) consolaPartes(orig[k], txt); else orig[k](...a); try { if (txt != null) RESC.linea(txt); } catch {} }; }
 const W = new Function(fs.readFileSync(path.join(DIR, "motor.js"), "utf-8") + ";return {construyeMotor, netoReal};")();
 const ESTRELLA2 = { v3Corte2: 60, mv: 25, maxvend: 1, v3Seg: 600, v3Corte: 60, soporteSigue: 35 };
 let ESTRATEGIA = ESTRELLA2; try { if (process.env.ESTRATEGIA) ESTRATEGIA = JSON.parse(process.env.ESTRATEGIA); } catch (e) { console.log("⚠️ ESTRATEGIA no es un JSON válido: uso ⭐⭐"); }
@@ -763,6 +775,21 @@ log(`🟣 SOLANA EN PAPEL · ${PLAN ? "PLAN «" + PLAN.nombre + "»: " + PLAN.re
 log(`🟣 GRABADOR DE SOLANA · solo graba (no opera) · cámara ${CAMARA_MIN} min · latido ${LATIDO_S} s · muerto a los ${MUERTO_MIN} min · hasta ${WS_MAX} conexiones de Helius con ${MAX_SUBS_WS} suscripciones cada una · nacimiento por ${PUMP_API ? "pump.fun (y Helius si falla)" : "HELIUS (tenedores al migrar, concentración y edad)"} · precio ${MODO_WS ? "por WebSocket, swap a swap" : `leyendo la piscina cada ${POLL_S} s (getMultipleAccounts)`}`);
 log(RESC.arranqueTxt());
 await REAL.init({ log, papelDe });
+// [19-oct] UNA VEZ: las líneas que Railway cortó (más de 81.920 caracteres: [SOLREC] de los tokens más movidos) se vuelven a sacar por la consola, en
+//   trozos [PARTE … ts=<hora original>], leyéndolas del registro del disco (rescate/registro/AAAA-MM-DD.log[.gz]). Se hace una vez (marca
+//   rescate/reemitidas_v1.txt) desde el 1-oct; REEMITE_DESDE=AAAA-MM-DD lo repite desde ese día. Solo consola: el disco no se toca.
+async function reemiteLargas() {
+  const base = process.env.RESCATE_DIR || path.join(fs.existsSync("/data") ? "/data" : "/tmp", "rescate"); const dir = path.join(base, "registro"), marca = path.join(base, "reemitidas_v1.txt");
+  const pedido = String(process.env.REEMITE_DESDE || "").trim(); if (!pedido && fs.existsSync(marca)) return; const d0 = /^\d{4}-\d{2}-\d{2}$/.test(pedido) ? pedido : "2026-10-01"; const CORTE = 81900;
+  let L = []; try { L = fs.readdirSync(dir).filter(f => /^\d{4}-\d{2}-\d{2}\.log(\.gz)?$/.test(f) && f.slice(0, 10) >= d0).sort(); } catch { return; }
+  let n = 0, trozos = 0, leidas = 0;
+  for (const f of L) { try { const st = fs.createReadStream(path.join(dir, f)); const ent = f.endsWith(".gz") ? st.pipe(zlib.createGunzip()) : st; const rl = readline.createInterface({ input: ent, crlfDelay: Infinity });
+      for await (const l of rl) { leidas++; if (l.length < CORTE) continue; let x; try { x = JSON.parse(l); } catch { continue; } const m = x && x.message; if (typeof m !== "string" || m.length < CORTE) continue;
+        trozos += consolaPartes(ORIG.log, m, x.timestamp); n++; await new Promise(r => setTimeout(r, 150)); } }
+    catch (e) { log(`⚠️ re-emitir ${f}: ${(e && e.message || "").slice(0, 80)}`); } }
+  try { fs.writeFileSync(marca, `${new Date().toISOString()} · ${n} líneas desde ${d0}\n`); } catch {}
+  log(`[REEMITE] ${n} líneas largas (las que Railway cortó) vueltas a sacar en ${trozos} trozos desde ${d0} · ${L.length} días del registro, ${leidas} líneas leídas`); }
+setTimeout(() => reemiteLargas().catch(e => log(`⚠️ re-emitir: ${e && e.message}`)), +(process.env.REEMITE_ESPERA_S || 90) * 1000);
 await precioSol(); setInterval(precioSol, 5 * 60e3); log(`💱 SOL a $${S.solUsd.toFixed(2)}`);
 try { CURVAS = CURVASM.crea({ log, pumpApi, solUsd: () => S.solUsd, clave: REAL.CLAVE || "" }); } catch (e) { log(`⚠️ la muestra de curvas no arranca (${e && e.message}): el server sigue sin ella`); }   // [18-oct]
 log(CURVAS.arranqueTxt());
@@ -773,4 +800,12 @@ if ((process.env.MIRA_CARTERAS || "").trim()) { const L = process.env.MIRA_CARTE
 if ((process.env.MIRA_BOTS || "").trim()) { const L = process.env.MIRA_BOTS.split(/[,\s]+/).map(x => x.trim()).filter(Boolean); const nB = +(process.env.MIRA_BOTS_TX || 2000); log(`🔎 MIRA_BOTS: a los 90 s leo lo que compraron ${L.length} bots de la curva hace ${+(process.env.MIRA_BOTS_DESDE_H || 30)}-${+(process.env.MIRA_BOTS_HASTA_H || 24)} h (hasta ${nB} tx cada uno, ~${Math.ceil(nB / 100) * 10 * L.length} créditos) → líneas [BOT]`);   // [18-oct] ¿qué parte de lo que compran migra?
   setTimeout(() => MIRA.miraBots(L, { rpc, log, n: nB, vistas: S.vistas, desdeH: +(process.env.MIRA_BOTS_DESDE_H || 30), hastaH: +(process.env.MIRA_BOTS_HASTA_H || 24) }).catch(e => log(`⚠️ MIRA_BOTS: ${e && e.message}`)), 90e3); }
 if (MODO_WS) heliusNueva(); abrePumpPortal();
-process.on("SIGTERM", () => { for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { RESC.cierra(); } catch (e) {} try { CURVAS.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen
+// [19-oct] APAGAR DE VERDAD: con «npm start» la señal no le llegaba al server y Railway lo mataba sin esperar (0 s): cada despliegue o cambio de
+//   variable perdía TODAS las cámaras abiertas (sin [SOLREC], sin rescate, sin cuentas: 37 tokens el 18-oct). Ahora railway.toml arranca con
+//   «node server.js» y da 20 s (drainingSeconds): se cierran las cámaras (y sus lotes de papel), se guarda todo y, si hay órdenes reales en marcha
+//   (ventas del cierre), se esperan hasta 15 s.
+let APAGANDO = false;
+process.on("SIGTERM", () => { if (APAGANDO) return; APAGANDO = true; const n = S.camaras.size;
+  for (const c of [...S.camaras.values()]) { try { cierra(c, "apagado"); } catch (e) {} } try { guardaP(); } catch (e) {} try { CURVAS.cierra(); } catch (e) {}
+  log(`🛑 apagando (SIGTERM): ${n} cámaras cerradas y guardadas${REAL.ocupado() ? " · espero a las órdenes reales en marcha (máx 15 s)" : ""}`);
+  const hasta = Date.now() + 15000; const sal = () => { if (!REAL.ocupado() || Date.now() > hasta) { try { RESC.cierra(); } catch (e) {} setTimeout(() => process.exit(0), 300); } else setTimeout(sal, 250); }; setTimeout(sal, 500); });   // [12-oct] la cola del rescate se guarda: al volver, los cortados se rehacen

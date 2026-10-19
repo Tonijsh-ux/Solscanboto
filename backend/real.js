@@ -26,6 +26,8 @@
 //   · El CUADRE escala lo REAL al lote de papel (×LOTE_SOL/REAL_LOTE_SOL) para que las dos cuentas se puedan comparar.
 //   · prepara(): el server la llama al ver cada migración; refresca la prioridad y el blockhash si están viejos (2 llamadas a Helius por
 //     migración, no un sondeo continuo), para que la orden de los 4 s no gaste tiempo en eso.
+//   · [19-oct] lo que quedó dentro de antes de un reinicio se vende al arrancar (a los REAL_VENDE_ARRANQUE_S, 20 s; con la piscina guardada en la compra)
+//     y ocupado() para que el server espere a las órdenes en marcha al apagarse.
 //   · [18-oct, noche] SOLANA_PRIVATE_KEY en cualquier formato de cartera (base58 de 64 bytes o semilla de 32, array [..], hex) y SOLANA_DIRECCION
 //     (la dirección PÚBLICA, opcional): si está y la clave no es de esa dirección, la cartera no se carga (la clave de Ethereum de MetaMask, otra cuenta…).
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -93,7 +95,8 @@ export async function init(opts = {}) {
   log = opts.log || log; papelDe = opts.papelDe || papelDe;
   try { const g = JSON.parse(fs.readFileSync(FILE, "utf-8")); Object.assign(R.tokens, g.tokens || {}); Object.assign(R.totales, g.totales || {}); R.dia = g.dia || R.dia; R.cuadres = g.cuadres || []; R.huerfanos = g.huerfanos || {}; } catch {}
   for (const t of Object.values(R.tokens)) if (t.simTok != null) t.simTok = BigInt(t.simTok);   // (lo guardado en simulado vuelve como texto)
-  if (SIMULADO) { R.listo = true; R.pub = "SIMULADO"; R.saldo = 10; log(`🧪 ÓRDENES REALES EN MODO SIMULADO (REAL_SIMULADO=1): no se toca la cadena · lote REAL ${LOTE} SOL (papel ${LOTE_PAPEL})`); return; }
+  const ARRANQUE_S = +(E.REAL_VENDE_ARRANQUE_S || 20);
+  if (SIMULADO) { R.listo = true; R.pub = "SIMULADO"; R.saldo = 10; log(`🧪 ÓRDENES REALES EN MODO SIMULADO (REAL_SIMULADO=1): no se toca la cadena · lote REAL ${LOTE} SOL (papel ${LOTE_PAPEL})`); setTimeout(vendeLoDeAntes, ARRANQUE_S * 1000); return; }
   const clave = (E.SOLANA_PRIVATE_KEY || E.WALLET_PRIVATE_KEY || "").trim();
   if (!clave) { log(`🔒 sin SOLANA_PRIVATE_KEY: el server solo hace papel (no puede armarse)`); return; }
   try { web3 = await import("@solana/web3.js"); bs58 = (await import("bs58")).default; try { spl = await import("@solana/spl-token"); } catch { log("ℹ️ sin @solana/spl-token: no se cerrarán las cuentas vacías (se pierde ~0,002 SOL de alquiler por token)"); }
@@ -106,7 +109,7 @@ export async function init(opts = {}) {
     if (RUTAS.includes("directo")) { try { pss = await import("@pump-fun/pump-swap-sdk"); BN = (await import("bn.js")).default; sdkOnline = new pss.OnlinePumpAmmSdk(conn); log(`⚡ ruta directa a PumpSwap lista (SDK de pump.fun) · envío ${SENDER === "no" ? "por el RPC" : "por Helius Sender (" + SENDER + ", propina " + PROPINA + " SOL)"} · prioridad ${PRIO_NIVEL} (tope ${PRIO_MAX} SOL)`); }
       catch (e) { pss = null; log(`⚠️ sin el SDK de pump.fun (${e.message.slice(0, 80)}): se usará Jupiter`); } }
     await saldo(true); log(`🔑 cartera ${R.pub.slice(0, 4)}…${R.pub.slice(-4)} · saldo ${R.saldo != null ? R.saldo.toFixed(4) : "? (no pude leerlo)"} SOL · lote REAL ${LOTE} SOL${LOTE !== LOTE_PAPEL ? ` (SOMBRA del papel, que va con ${LOTE_PAPEL})` : ""} · DESARMADO (se arma desde el panel)`);
-    buscaHuerfanos().catch(() => {}); setInterval(() => buscaHuerfanos().catch(() => {}), 10 * 60e3);
+    setTimeout(vendeLoDeAntes, ARRANQUE_S * 1000); buscaHuerfanos().catch(() => {}); setInterval(() => buscaHuerfanos().catch(() => {}), 10 * 60e3);
   } catch (e) { log(`❌ la cartera no carga (${e.message}): el server solo hace papel`); }
 }
 async function saldo(forzar) { if (SIMULADO) return R.saldo; if (!conn) return null; if (!forzar && Date.now() - R.saldoT < 60e3 && R.saldo != null) return R.saldo;
@@ -189,7 +192,7 @@ async function detalleTx(sig, mint) { for (let i = 0; i < 6; i++) { try { const 
 const precioDe = (rec) => { const P = rec.puntos || []; const q = P[P.length - 1]; return q ? 1 + q.p / 100 : 1; };   // el precio relativo del último punto (1 = el de migrar)
 const ultimoT = (rec) => { const P = rec.puntos || []; return P.length ? P[P.length - 1].t : null; };
 
-async function compra(rec) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; const ctx = nuevoCtx();
+async function compra(rec) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; const ctx = nuevoCtx(); if (rec.pool) t.pool = rec.pool;
   if (SIMULADO) { const pr = precioDe(rec) * 1.01; const tok = BigInt(Math.floor(LOTE * 0.99 / pr * 1e6)); t.simTok = (t.simTok || 0n) + tok; t.solIn += LOTE + PRIO_ENTRADA; t.compras++; t.abierto = true; R.saldo -= LOTE + PRIO_ENTRADA;
     ctx.intentos.push({ ruta: "sim", ms: 0, ok: true }); return { coste: LOTE + PRIO_ENTRADA, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, confMs: 0, det: { dSol: -(LOTE + PRIO_ENTRADA), dTok: tok, slot: null, bt: null, fee: null }, ctx }; }
   const micro = await prioridadMicro(); const r = await porRutas("compra", rec, Math.round(LOTE * 1e9), LOTE, SLIP_ENTRADA, Math.max(PRIO_ENTRADA === 0.0005 ? 0 : PRIO_ENTRADA, prioLamports(micro) / 1e9), ctx);
@@ -248,8 +251,9 @@ async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) re
         delete R.pendientes[rec.token]; const t = R.tokens[rec.token];
         if (hecho.nada) { if (t) t.abierto = false; cierraCuadre(rec, "no había tokens que vender"); continue; }
         t.solOut += hecho.recibido; t.ventas++; t.abierto = false; R.totales.ventas++; R.ultima = `venta ${rec.symbol} ${hecho.recibido.toFixed(4)} SOL`;
+        latencia(o, "venta", true, hecho, { tol: hecho.tol, intento: i });   // [19-oct] antes de cerrar la cuenta (si no, el «total» de la venta llevaba también esa otra transacción)
         const alquiler = await cierraCuenta(rec.token); t.solOut += alquiler;
-        log(`🔴 VENTA REAL ${rec.symbol} · todo · recibido ${hecho.recibido.toFixed(4)} SOL${alquiler > 0 ? ` (+${alquiler.toFixed(4)} del alquiler de la cuenta)` : ""} · ${hecho.ruta || "sim"}${hecho.ms != null ? " " + hecho.ms + " ms" : ""} · ${hecho.sig}`); latencia(o, "venta", true, hecho, { tol: hecho.tol, intento: i }); cierraCuadre(rec); } } }
+        log(`🔴 VENTA REAL ${rec.symbol} · todo · recibido ${hecho.recibido.toFixed(4)} SOL${alquiler > 0 ? ` (+${alquiler.toFixed(4)} del alquiler de la cuenta)` : ""} · ${hecho.ruta || "sim"}${hecho.ms != null ? " " + hecho.ms + " ms" : ""} · ${hecho.sig}`); cierraCuadre(rec); } } }
   finally { q.girando = false; if (!q.items.length) COLAS.delete(token); else gira(token); } }
 function pendiente(rec, e) { R.totales.fallos++; const p = R.pendientes[rec.token] = R.pendientes[rec.token] || { sym: rec.symbol, ronda: 0 }; p.error = (e && e.message || String(e)).slice(0, 140);
   if (p.ronda >= REINTENTOS_S.length) { delete R.pendientes[rec.token]; R.huerfanos[rec.token] = { sym: rec.symbol, motivo: "la venta no sale: véndela desde el panel" }; log(`❌ ${rec.symbol}: la venta no sale ni reintentando · queda en huérfanos (véndela desde el panel) · ${p.error}`); return; }
@@ -276,10 +280,16 @@ export function desarma(motivo) { if (!R.armado) return "ya estaba desarmado"; R
 async function buscaHuerfanos() { if (SIMULADO || !conn) return; const r = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { programId: new web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") }, "confirmed");
   for (const a of r.value || []) { const inf = a.account.data.parsed.info; const amt = BigInt(inf.tokenAmount.amount || "0"); if (amt <= 0n || inf.mint === WSOL) continue;
     if (!(R.tokens[inf.mint]?.abierto) && !R.huerfanos[inf.mint]) R.huerfanos[inf.mint] = { sym: inf.mint.slice(0, 6), motivo: "en la cartera sin operación abierta" }; } }
-export async function vendeAMano(mint) { if (!R.listo) return "no hay cartera"; const rec = { token: mint, symbol: (R.huerfanos[mint] || R.tokens[mint] || {}).sym || mint.slice(0, 6), puntos: [] };
+export async function vendeAMano(mint) { if (!R.listo) return "no hay cartera"; const rec = { token: mint, symbol: (R.huerfanos[mint] || R.tokens[mint] || {}).sym || mint.slice(0, 6), pool: (R.tokens[mint] || {}).pool, puntos: [] };
   try { let h = null, err = null; for (const tol of TOL_VENTA) { try { h = await vende(rec, tol, PRIO_PANICO); break; } catch (e) { err = e; } }
     if (!h) return "no salió: " + (err && err.message || "").slice(0, 100); delete R.huerfanos[mint];
     if (h.nada) return "no había tokens"; log(`🔴 VENTA A MANO ${rec.symbol} · recibido ${h.recibido.toFixed(4)} SOL · ${h.sig}`); return `vendido: ${h.recibido.toFixed(4)} SOL`; } catch (e) { return "error: " + e.message; } }
+// [19-oct] ¿hay órdenes en marcha? (el server espera a que acaben al apagarse, hasta 15 s)
+export function ocupado() { for (const q of COLAS.values()) if (q.girando || q.items.length) return true; return false; }
+// [19-oct] lo que quedó DENTRO de antes de un reinicio: el motor que tenía que venderlo ya no existe, así que se vende al arrancar (si no, se queda atascado)
+function vendeLoDeAntes() { const ab = Object.entries(R.tokens).filter(([, t]) => t.abierto); if (!ab.length || !R.listo) return;
+  log(`🧹 ${ab.length} token${ab.length > 1 ? "s" : ""} dentro de antes del reinicio: se vende${ab.length > 1 ? "n" : ""} ya (${ab.map(([, t]) => t.sym).join(", ")})`);
+  for (const [mint, t] of ab) encola("venta", { token: mint, symbol: t.sym, pool: t.pool, pumpswap: true, puntos: [] }, { reintento: "arranque" }); }
 export function latenciaResumen() { return { ordenes: LAT.n, ok: LAT.ok, fallos: LAT.fallos, colgadas: LAT.colgadas, esperaMed: pct(LAT.espera, .5), envioMed: pct(LAT.envio, .5), envioP90: pct(LAT.envio, .9), confMed: pct(LAT.conf, .5), confP90: pct(LAT.conf, .9), totalMed: pct(LAT.total, .5), totalP90: pct(LAT.total, .9), slotsMed: pct(LAT.slots, .5), slotsP90: pct(LAT.slots, .9) }; }
 export function resumen() { return { listo: R.listo, armado: R.armado, motivo: R.motivo, cartera: R.pub, saldo: R.saldo, lote: LOTE, lotePapel: LOTE_PAPEL, sombra: LOTE !== LOTE_PAPEL, simulado: SIMULADO, dentro: Object.values(R.tokens).filter(t => t.abierto).length, cola: R.cola,
   totales: R.totales, hoy: R.dia, pendientes: Object.values(R.pendientes).map(p => ({ sym: p.sym, error: p.error, ronda: p.ronda })), huerfanos: R.huerfanos, cuadres: R.cuadres.slice(0, 40), latencia: latenciaResumen(),

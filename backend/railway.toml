@@ -2,6 +2,8 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "npm start"
+# [19-oct] node directo: con «npm start» la señal SIGTERM no le llegaba al server y cada despliegue perdía las cámaras abiertas.
+# Los 20 s para apagarse (drainingSeconds) van en la configuración del servicio en Railway.
+startCommand = "node server.js"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
