@@ -119,6 +119,9 @@ async function saldo(forzar) { if (SIMULADO) return R.saldo; if (!conn) return n
 // [19-oct] el saldo del panel y de [SALUD] era el leído ANTES de la última compra (solo se leía para comprar): tras vender, el panel decía 5,057 con la
 //   cartera en 5,126 (Tony). Ahora se vuelve a leer 1 s después de cada compra y de cada venta (1 llamada getBalance, sin esperar a nada)
 function refrescaSaldo() { if (SIMULADO || !conn) return; setTimeout(() => { saldo(true).catch(() => {}); }, 1000); }
+// [19-oct] y antes de comprar ya NO se espera a leerlo (MEM, 08:31Z: un getBalance lento retrasó una compra 10 s y las dos de detrás 3-4 s en la cola,
+//   y llenaron un 18-26 % más caro): se usa el último leído y, si tiene más de 60 s, se pide otro sin esperar. Solo se espera si aún no hay ninguno.
+function saldoYa() { if (SIMULADO || R.saldo == null) return saldo(); if (Date.now() - R.saldoT > 60e3) saldo(true).catch(() => {}); return Promise.resolve(R.saldo); }
 async function saldoToken(mint) { if (SIMULADO) return R.tokens[mint]?.simTok || 0n;
   const r = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new web3.PublicKey(mint) }, "confirmed"); let s = 0n;
   for (const a of r.value || []) s += BigInt(a.account.data.parsed.info.tokenAmount.amount || "0"); return s; }
@@ -204,12 +207,12 @@ async function compra(rec, d = {}) { const t = R.tokens[rec.token] = R.tokens[re
   if (SIMULADO) { const pr = precioDe(rec) * 1.01; const tok = BigInt(Math.floor(LOTE * 0.99 / pr * 1e6)); t.simTok = (t.simTok || 0n) + tok; t.solIn += LOTE + PRIO_ENTRADA; t.compras++; t.abierto = true; R.saldo -= LOTE + PRIO_ENTRADA;
     ctx.intentos.push({ ruta: "sim", ms: 0, ok: true }); return { coste: LOTE + PRIO_ENTRADA, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, vistoMs: 0, confMs: 0, det: { dSol: -(LOTE + PRIO_ENTRADA), dTok: tok, slot: null, bt: null, fee: null }, ctx }; }
   const micro = await prioridadMicro(); const r = await porRutas("compra", rec, Math.round(LOTE * 1e9), LOTE, SLIP_ENTRADA, Math.max(PRIO_ENTRADA === 0.0005 ? 0 : PRIO_ENTRADA, prioLamports(micro) / 1e9), ctx);
-  const det = await detalleTx(r.sig, rec.token); const coste = det && det.dSol != null ? -det.dSol : LOTE; t.solIn += coste; t.compras++; t.abierto = true; R.saldoT = 0; return { ...r, coste, det }; }
+  const det = await detalleTx(r.sig, rec.token); const coste = det && det.dSol != null ? -det.dSol : LOTE; t.solIn += coste; t.compras++; t.abierto = true; return { ...r, coste, det }; }
 async function vende(rec, tol, prio, ctx) { const t = R.tokens[rec.token]; const bal = await saldoToken(rec.token); if (bal <= 0n) return { nada: true }; ctx = ctx || nuevoCtx();
   if (SIMULADO) { const pr = precioDe(rec) * 0.99; const sol = Number(bal) / 1e6 * pr * 0.99 - prio; t.simTok = 0n; R.saldo += sol; ctx.intentos.push({ ruta: "sim", ms: 0, ok: true });
     return { recibido: sol, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, vistoMs: 0, confMs: 0, tol, det: { dSol: sol, dTok: -bal, slot: null, bt: null, fee: null }, ctx }; }
   const micro = await prioridadMicro(); const r = await porRutas("venta", rec, bal.toString(), null, tol, Math.max(prioLamports(micro) / 1e9, prio === PRIO_PANICO ? PRIO_PANICO : 0), ctx);
-  const det = await detalleTx(r.sig, rec.token); R.saldoT = 0; return { ...r, recibido: det && det.dSol != null ? det.dSol : 0, tol, det }; }
+  const det = await detalleTx(r.sig, rec.token); return { ...r, recibido: det && det.dSol != null ? det.dSol : 0, tol, det }; }
 
 // al venderlo todo, se cierra la cuenta del token: así vuelve el alquiler que se pagó al comprar (~0,002 SOL)
 async function cierraCuenta(mint) { if (SIMULADO || !spl || !conn) return 0;
@@ -250,7 +253,7 @@ async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) re
         const abiertos = Object.values(R.tokens).filter(t => t.abierto); const dentro = abiertos.reduce((s, t) => s + Math.max(0, t.solIn - t.solOut), 0);
         if (!(R.tokens[rec.token]?.abierto) && abiertos.length >= MAX_ABIERTAS) { log(`⛔ ${rec.symbol}: no compro, ya hay ${abiertos.length} tokens dentro (máx ${MAX_ABIERTAS})`); continue; }
         if (dentro + LOTE > MAX_EXPUESTO) { log(`⛔ ${rec.symbol}: no compro, habría ${(dentro + LOTE).toFixed(2)} SOL dentro (máx ${MAX_EXPUESTO})`); continue; }
-        const sal = await saldo(); if (sal != null && sal < LOTE + RESERVA) { log(`⛔ ${rec.symbol}: no compro, el saldo (${sal.toFixed(3)} SOL) no deja la reserva de ${RESERVA} SOL`); continue; }
+        const sal = await saldoYa(); if (sal != null && sal < LOTE + RESERVA) { log(`⛔ ${rec.symbol}: no compro, el saldo (${sal.toFixed(3)} SOL) no deja la reserva de ${RESERVA} SOL`); continue; }
         try { const r = await compra(rec, o.datos); fallosSeguidos = 0; R.totales.compras++; R.ultima = `compra ${rec.symbol} ${r.coste.toFixed(4)} SOL`;
           log(`🟢 COMPRA REAL ${rec.symbol} · ${LOTE} SOL · coste real ${r.coste.toFixed(4)} SOL · ${r.ruta || "sim"}${r.ms != null ? " " + r.ms + " ms" : ""} · ${r.sig}`); latencia(o, "compra", true, r); refrescaSaldo(); }
         catch (e) { R.totales.fallos++; fallosSeguidos++; log(`❌ compra real de ${rec.symbol} no salió: ${(e.message || String(e)).slice(0, 140)}${e.colgada ? " (sin confirmar: se mirará el saldo al vender)" : ""}`); latencia(o, "compra", false, null, { err: e.message || String(e), colgada: !!e.colgada, ctx: e.ctx });
