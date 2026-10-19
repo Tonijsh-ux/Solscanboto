@@ -26,7 +26,8 @@
 //   · El CUADRE escala lo REAL al lote de papel (×LOTE_SOL/REAL_LOTE_SOL) para que las dos cuentas se puedan comparar.
 //   · prepara(): el server la llama al ver cada migración; refresca la prioridad y el blockhash si están viejos (2 llamadas a Helius por
 //     migración, no un sondeo continuo), para que la orden de los 4 s no gaste tiempo en eso.
-//   · [19-oct] lo que quedó dentro de antes de un reinicio se vende al arrancar (a los REAL_VENDE_ARRANQUE_S, 20 s; con la piscina guardada en la compra)
+//   · [19-oct] lo que quedó dentro de antes de un reinicio se vende al arrancar (a los REAL_VENDE_ARRANQUE_S, 40 s, tras releer el fichero por si el server
+//     anterior lo vendió y guardó al apagarse; con la piscina guardada en la compra)
 //     y ocupado() para que el server espere a las órdenes en marcha al apagarse.
 //   · [18-oct, noche] SOLANA_PRIVATE_KEY en cualquier formato de cartera (base58 de 64 bytes o semilla de 32, array [..], hex) y SOLANA_DIRECCION
 //     (la dirección PÚBLICA, opcional): si está y la clave no es de esa dirección, la cartera no se carga (la clave de Ethereum de MetaMask, otra cuenta…).
@@ -94,8 +95,9 @@ function leeClave(txt) {
 export async function init(opts = {}) {
   log = opts.log || log; papelDe = opts.papelDe || papelDe;
   try { const g = JSON.parse(fs.readFileSync(FILE, "utf-8")); Object.assign(R.tokens, g.tokens || {}); Object.assign(R.totales, g.totales || {}); R.dia = g.dia || R.dia; R.cuadres = g.cuadres || []; R.huerfanos = g.huerfanos || {}; } catch {}
+  CARGADO_MS = Date.now();
   for (const t of Object.values(R.tokens)) if (t.simTok != null) t.simTok = BigInt(t.simTok);   // (lo guardado en simulado vuelve como texto)
-  const ARRANQUE_S = +(E.REAL_VENDE_ARRANQUE_S || 20);
+  const ARRANQUE_S = +(E.REAL_VENDE_ARRANQUE_S || 40);   // [19-oct] 40 s: el server anterior sigue vivo unos segundos (SIGTERM ~5 s después de arrancar este) y espera hasta 15 s a sus ventas
   if (SIMULADO) { R.listo = true; R.pub = "SIMULADO"; R.saldo = 10; log(`🧪 ÓRDENES REALES EN MODO SIMULADO (REAL_SIMULADO=1): no se toca la cadena · lote REAL ${LOTE} SOL (papel ${LOTE_PAPEL})`); setTimeout(vendeLoDeAntes, ARRANQUE_S * 1000); return; }
   const clave = (E.SOLANA_PRIVATE_KEY || E.WALLET_PRIVATE_KEY || "").trim();
   if (!clave) { log(`🔒 sin SOLANA_PRIVATE_KEY: el server solo hace papel (no puede armarse)`); return; }
@@ -287,7 +289,13 @@ export async function vendeAMano(mint) { if (!R.listo) return "no hay cartera"; 
 // [19-oct] ¿hay órdenes en marcha? (el server espera a que acaben al apagarse, hasta 15 s)
 export function ocupado() { for (const q of COLAS.values()) if (q.girando || q.items.length) return true; return false; }
 // [19-oct] lo que quedó DENTRO de antes de un reinicio: el motor que tenía que venderlo ya no existe, así que se vende al arrancar (si no, se queda atascado)
-function vendeLoDeAntes() { const ab = Object.entries(R.tokens).filter(([, t]) => t.abierto); if (!ab.length || !R.listo) return;
+let CARGADO_MS = 0;
+// [19-oct] el server anterior sigue vivo unos segundos después de arrancar este y al apagarse vende y GUARDA: si el fichero cambió después de leerlo, se vuelve a leer
+//   (este aún no ha operado: arranca desarmado y sin motor con posiciones), para no vender otra vez lo ya vendido ni apuntar un cuadre a medias
+function recargaSiCambio() { try { const st = fs.statSync(FILE); if (!(st.mtimeMs > CARGADO_MS)) return; const g = JSON.parse(fs.readFileSync(FILE, "utf-8"));
+    R.tokens = g.tokens || {}; for (const t of Object.values(R.tokens)) if (t.simTok != null) t.simTok = BigInt(t.simTok); Object.assign(R.totales, g.totales || {}); R.dia = g.dia || R.dia; R.cuadres = g.cuadres || []; R.huerfanos = g.huerfanos || {};
+    CARGADO_MS = Date.now(); log(`ℹ️ sombra real: el server anterior guardó al apagarse → estado recargado (${Object.values(R.tokens).filter(t => t.abierto).length} dentro · ${R.totales.cuadres} cuadres)`); } catch {} }
+function vendeLoDeAntes() { recargaSiCambio(); const ab = Object.entries(R.tokens).filter(([, t]) => t.abierto); if (!ab.length || !R.listo) return;
   log(`🧹 ${ab.length} token${ab.length > 1 ? "s" : ""} dentro de antes del reinicio: se vende${ab.length > 1 ? "n" : ""} ya (${ab.map(([, t]) => t.sym).join(", ")})`);
   for (const [mint, t] of ab) encola("venta", { token: mint, symbol: t.sym, pool: t.pool, pumpswap: true, puntos: [] }, { reintento: "arranque" }); }
 export function latenciaResumen() { return { ordenes: LAT.n, ok: LAT.ok, fallos: LAT.fallos, colgadas: LAT.colgadas, esperaMed: pct(LAT.espera, .5), envioMed: pct(LAT.envio, .5), envioP90: pct(LAT.envio, .9), confMed: pct(LAT.conf, .5), confP90: pct(LAT.conf, .9), totalMed: pct(LAT.total, .5), totalP90: pct(LAT.total, .9), slotsMed: pct(LAT.slots, .5), slotsP90: pct(LAT.slots, .9) }; }
