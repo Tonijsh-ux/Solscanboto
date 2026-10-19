@@ -109,9 +109,10 @@ catch (e) { console.log(`⚠️ el rescate no arranca (${e && e.message}): el se
 //   Ahora una línea de más de LINEA_MAX caracteres sale por la consola en trozos «[PARTE <id> i/n de <ETIQUETA>( ts=<hora original>)] …» y
 //   herramientas/mete_registro_solana.py los vuelve a juntar. En el disco del server (el registro de rescate.js) la línea sigue entera.
 const LINEA_MAX = Math.max(200, +(process.env.LINEA_MAX || 75000)); let PARTE_N = 0;
-function consolaPartes(escribe, txt, ts) { const et = (String(txt).match(/^\s*\[([A-Za-z0-9_]+)\]/) || [])[1] || "LINEA"; const id = Date.now().toString(36) + (PARTE_N++ % 1296).toString(36).padStart(2, "0");
+function trozosDe(txt, ts) { const et = (String(txt).match(/^\s*\[([A-Za-z0-9_]+)\]/) || [])[1] || "LINEA"; const id = Date.now().toString(36) + (PARTE_N++ % 1296).toString(36).padStart(2, "0");
   const T = []; for (let i = 0; i < txt.length;) { let j = Math.min(txt.length, i + LINEA_MAX); if (j < txt.length) { const cc = txt.charCodeAt(j - 1); if (cc >= 0xD800 && cc <= 0xDBFF) j--; } T.push(txt.slice(i, j)); i = j; }   // sin partir un emoji por la mitad
-  for (let i = 0; i < T.length; i++) escribe(`[PARTE ${id} ${i + 1}/${T.length} de ${et}${ts ? " ts=" + ts : ""}] ${T[i]}`); return T.length; }
+  return T.map((t, i) => `[PARTE ${id} ${i + 1}/${T.length} de ${et}${ts ? " ts=" + ts : ""}] ${t}`); }
+function consolaPartes(escribe, txt, ts) { const T = trozosDe(txt, ts); for (const t of T) escribe(t); return T.length; }
 const ORIG = { log: console.log.bind(console), error: console.error.bind(console), warn: console.warn.bind(console) };
 { const orig = ORIG;
   for (const k of ["log", "error", "warn"]) console[k] = (...a) => { let txt = null; try { txt = a.map(x => typeof x === "string" ? x : x instanceof Error ? (x.stack || x.message) : (() => { try { return JSON.stringify(x); } catch { return String(x); } })()).join(" "); } catch {}
@@ -777,15 +778,19 @@ log(RESC.arranqueTxt());
 await REAL.init({ log, papelDe });
 // [19-oct] UNA VEZ: las líneas que Railway cortó (más de 81.920 caracteres: [SOLREC] de los tokens más movidos) se vuelven a sacar por la consola, en
 //   trozos [PARTE … ts=<hora original>], leyéndolas del registro del disco (rescate/registro/AAAA-MM-DD.log[.gz]). Se hace una vez (marca
-//   rescate/reemitidas_v1.txt) desde el 1-oct; REEMITE_DESDE=AAAA-MM-DD lo repite desde ese día. Solo consola: el disco no se toca.
+//   rescate/reemitidas_v2.txt) desde el 1-oct; REEMITE_DESDE=AAAA-MM-DD lo repite desde ese día. Solo consola: el disco no se toca.
+//   DESPACIO (REEMITE_PAUSA_MS 400 entre trozos, REEMITE_PAUSA_LINEA_MS 1500 entre líneas, esperando a que la consola saque cada trozo): la 1ª vez
+//   salieron 132 trozos de 75.000 de golpe y Railway solo guardó los últimos 22.
 async function reemiteLargas() {
-  const base = process.env.RESCATE_DIR || path.join(fs.existsSync("/data") ? "/data" : "/tmp", "rescate"); const dir = path.join(base, "registro"), marca = path.join(base, "reemitidas_v1.txt");
+  const base = process.env.RESCATE_DIR || path.join(fs.existsSync("/data") ? "/data" : "/tmp", "rescate"); const dir = path.join(base, "registro"), marca = path.join(base, "reemitidas_v2.txt");   // v2: la v1 salió de golpe y Railway se quedó solo con el final
+  const PAUSA_TROZO = +(process.env.REEMITE_PAUSA_MS ?? 400), PAUSA_LINEA = +(process.env.REEMITE_PAUSA_LINEA_MS ?? 1500); const duerme = (ms) => ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
+  const escribe = (t) => new Promise(r => { try { if (process.stdout.write(t + "\n")) r(); else process.stdout.once("drain", r); } catch { r(); } });   // espera a que la consola lo haya sacado
   const pedido = String(process.env.REEMITE_DESDE || "").trim(); if (!pedido && fs.existsSync(marca)) return; const d0 = /^\d{4}-\d{2}-\d{2}$/.test(pedido) ? pedido : "2026-10-01"; const CORTE = 81900;
   let L = []; try { L = fs.readdirSync(dir).filter(f => /^\d{4}-\d{2}-\d{2}\.log(\.gz)?$/.test(f) && f.slice(0, 10) >= d0).sort(); } catch { return; }
   let n = 0, trozos = 0, leidas = 0;
   for (const f of L) { try { const st = fs.createReadStream(path.join(dir, f)); const ent = f.endsWith(".gz") ? st.pipe(zlib.createGunzip()) : st; const rl = readline.createInterface({ input: ent, crlfDelay: Infinity });
       for await (const l of rl) { leidas++; if (l.length < CORTE) continue; let x; try { x = JSON.parse(l); } catch { continue; } const m = x && x.message; if (typeof m !== "string" || m.length < CORTE) continue;
-        trozos += consolaPartes(ORIG.log, m, x.timestamp); n++; await new Promise(r => setTimeout(r, 150)); } }
+        const T = trozosDe(m, x.timestamp); for (const t of T) { await escribe(t); await duerme(PAUSA_TROZO); } trozos += T.length; n++; await duerme(PAUSA_LINEA); } }
     catch (e) { log(`⚠️ re-emitir ${f}: ${(e && e.message || "").slice(0, 80)}`); } }
   try { fs.writeFileSync(marca, `${new Date().toISOString()} · ${n} líneas desde ${d0}\n`); } catch {}
   log(`[REEMITE] ${n} líneas largas (las que Railway cortó) vueltas a sacar en ${trozos} trozos desde ${d0} · ${L.length} días del registro, ${leidas} líneas leídas`); }
