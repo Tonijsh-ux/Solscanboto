@@ -266,6 +266,9 @@ const PLAN_ID = PLAN ? "plan:" + PLAN.nombre : "estrategia:" + JSON.stringify(ES
 try { const g = JSON.parse(fs.readFileSync(ESTADO_FILE, "utf-8"));
   if (g.plan === PLAN_ID) Object.assign(P, g);
   else { P.anterior = { plan: g.plan || "el server viejo (⭐⭐)", desde: g.desde, hasta: Date.now(), cerradas: g.cerradas, real: g.real, papel: g.papel }; console.log(`📊 cuentas en papel NUEVAS para «${PLAN ? PLAN.nombre : "ESTRATEGIA"}» · las de antes (${P.anterior.plan}: ${g.cerradas || 0} cerradas, real ${(g.real || 0).toFixed(2)} SOL, con las operaciones falsas del server viejo) quedan aparte`); } } catch {}
+// [19-oct] al arrancar no hay ninguna cámara abierta: un 2º o 3er lote que se quedó «abierto» porque al server de antes lo mataron sin apagar
+//   (SOLFI ≥12, 19-oct 04:39Z, despliegue sin drainingSeconds) ya no se cierra nunca y el contador se quedaba en 1 para siempre
+P.lote2Abiertas = 0; P.lote3Abiertas = 0;
 const guardaP = () => { try { const tmp = ESTADO_FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ ...P, ultimas: P.ultimas.slice(0, 300) })); fs.renameSync(tmp, ESTADO_FILE); } catch (e) { } };   // [12-oct] a .tmp y renombrar: con el disco lleno no se pierden las cuentas
 setInterval(guardaP, 60e3);
 
