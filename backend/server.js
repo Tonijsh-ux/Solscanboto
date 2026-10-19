@@ -149,7 +149,9 @@ const PLAN_DE_SERIE = {"nombre": "reloj 270 14-oct", "reglas": [{"ten": [0, 5], 
 let PLAN = process.env.PLAN === "0" ? null : PLAN_DE_SERIE; try { if (process.env.PLAN_JSON) PLAN = { nombre: "PLAN_JSON", ...JSON.parse(process.env.PLAN_JSON) }; } catch (e) { console.log("⚠️ PLAN_JSON no es un JSON válido: uso el plan de serie"); }
 const MOTORES = new Map();
 // [18-oct] al pedir una orden real se le pasa lo que el server sabe en ese instante: el último slot visto del token (slot_dec de [LATENCIA]), el precio absoluto de migrar y el segundo del token
-const EXTRAS = { encola: (tipo, rec, datos) => { const c = rec && S.camaras.get(rec.token); REAL.encola(tipo, rec, { ...(datos || {}), slot: c ? c.ultSlot ?? null : null, precioIni: c ? c.precioIni : null, tTok: rec && rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length - 1].t : null }); } };
+const EXTRAS = { encola: (tipo, rec, datos) => { const c = rec && (S.camaras.get(rec.token) || CERRADAS.get(rec.token));
+  const pc = () => { const q = c && c.puntos && c.puntos.length ? c.puntos[c.puntos.length - 1] : null; return q ? 1 + q.p / 100 : null; };   // [19-oct] el precio de la CÁMARA (el del motor iba un punto por detrás y en la 1ª compra era siempre 1,0)
+  REAL.encola(tipo, rec, { ...(datos || {}), slot: c ? c.ultSlot ?? null : null, precioIni: c ? c.precioIni : null, tTok: c ? (Date.now() - c.t0) / 1000 : (rec && rec.puntos && rec.puntos.length ? rec.puntos[rec.puntos.length - 1].t : null), pDec: pc(), precioAhora: pc }); } };
 // ═══ [14-oct] EL RELOJ · mando «reloj» en el cfg de una regla (o en ESTRATEGIA): en el primer punto en o después de «reloj» segundos desde la migración se vende
 //   todo y el token se da por muerto, y desde ese segundo no se compra nada más (aunque no hubiera nada dentro). Es el «cortaEn(T)» del laboratorio
 //   (herramientas/solana/nuevo/pruebas/flujo/reloj270.js) por los ganchos POLITICA del motor (veta = no comprar · sale 2 = vender todo y no volver · ajusta = cada

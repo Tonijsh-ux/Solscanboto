@@ -67,7 +67,7 @@ let spl = null, pss = null, BN = null, sdkOnline = null;
 const RUTA_STATS = {};   // ruta → { n, ms, fallos }
 const marcaRuta = (ruta, ms, ok) => { const r = RUTA_STATS[ruta] = RUTA_STATS[ruta] || { n: 0, ms: 0, fallos: 0 }; if (ok) { r.n++; r.ms += ms; } else r.fallos++; };
 // [18-oct] la latencia medida (para /real y [SALUD]): las últimas 1.000 órdenes
-const LAT = { n: 0, ok: 0, fallos: 0, colgadas: 0, espera: [], envio: [], conf: [], total: [], slots: [] };
+const LAT = { n: 0, ok: 0, fallos: 0, colgadas: 0, espera: [], envio: [], conf: [], total: [], slots: [], visto: [] };
 const apuntaLat = (k, v) => { if (v == null || !(v >= 0)) return; const a = LAT[k]; a.push(v); if (a.length > 1000) a.splice(0, a.length - 1000); };
 const pct = (a, q) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
 let web3 = null, bs58 = null, wallet = null, conn = null, log = console.log, papelDe = () => null, fallosSeguidos = 0;
@@ -132,7 +132,7 @@ async function blockhash() { if (Date.now() - bhCache.t < 15000 && bhCache.bh) r
 // [18-oct] el server la llama al ver una migración: la prioridad y el blockhash ya calientes para la orden de los 4 s (si está armado y hay cartera)
 export function prepara() { if (SIMULADO || !conn || !R.armado) return; prioridadMicro().catch(() => {}); blockhash().catch(() => {}); }
 // el contexto de una orden: cuándo la aceptó la cadena, cuándo se confirmó, la prioridad y los intentos por ruta
-const nuevoCtx = () => ({ t0: Date.now(), tEnv: null, tConf: null, micro: null, intentos: [] });
+const nuevoCtx = (precioAhora) => ({ t0: Date.now(), tEnv: null, tVisto: null, pVisto: null, tConf: null, micro: null, intentos: [], precioAhora });   // [19-oct] tVisto/pVisto: cuándo la vio la cadena y el precio en ese momento
 // enviar por Helius Sender (y si no lo acepta, por el RPC normal)
 async function envia(tx, ctx) { const crudo = Buffer.from(tx.serialize());
   if (SENDER !== "no") { try { const r = await fetch(SENDER_URL, { method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(5000), body: JSON.stringify({ jsonrpc: "2.0", id: "1", method: "sendTransaction", params: [crudo.toString("base64"), { encoding: "base64", skipPreflight: true, maxRetries: 0 }] }) });
@@ -162,14 +162,17 @@ async function porRutas(tipo, rec, cantidadRaw, cantidadSol, slipPct, prioSolJup
       else if (ruta === "pumpportal") sig = tipo === "compra" ? await pumpportal("buy", rec.token, cantidadSol, true, slipPct, prioSolJup, ctx) : await pumpportal("sell", rec.token, cantidadRaw, false, slipPct, prioSolJup, ctx);
       else continue;
       const ms = Date.now() - t0; marcaRuta(ruta, ms, true); ctx.intentos.push({ ruta, ms, ok: true });
-      return { sig, ruta, ms, envioMs: ctx.tEnv ? ctx.tEnv - t0 : null, confMs: ctx.tEnv && ctx.tConf ? ctx.tConf - ctx.tEnv : null, ctx }; }
+      return { sig, ruta, ms, envioMs: ctx.tEnv ? ctx.tEnv - t0 : null, vistoMs: ctx.tEnv && ctx.tVisto ? ctx.tVisto - ctx.tEnv : null, confMs: ctx.tEnv && ctx.tConf ? ctx.tConf - ctx.tEnv : null, ctx }; }
     catch (e) { marcaRuta(ruta, 0, false); ultimo = e; ctx.intentos.push({ ruta, ms: Date.now() - t0, ok: false, err: (e.message || "").slice(0, 60) }); e.ctx = ctx; if (e.colgada) throw e; log(`↻ ${rec.symbol}: ${tipo} por ${ruta} no salió (${(e.message || "").slice(0, 90)})${RUTAS.indexOf(ruta) < RUTAS.length - 1 ? " → siguiente ruta" : ""}`); } }
   const e = ultimo || new Error("ninguna ruta"); e.ctx = ctx; throw e; }
 
 // ── las órdenes en la cadena (lo de tu bot viejo: Jupiter, y PumpPortal de respaldo) ──
-async function confirma(sig, ms = 45000, ctx) { const t0 = Date.now();
-  while (Date.now() - t0 < ms) { try { const st = (await conn.getSignatureStatuses([sig])).value[0]; if (st) { if (st.err) throw new Error("la transacción falló en la cadena: " + JSON.stringify(st.err).slice(0, 80)); if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") { if (ctx) ctx.tConf = Date.now(); return true; } } } catch (e) { if (/falló en la cadena/.test(e.message)) throw e; }
-    await espera(1200); }
+async function confirma(sig, ms = 45000, ctx) { const t0 = Date.now();   // [19-oct] mira cada 250 ms los primeros 4 s y luego cada 1,2 s (antes siempre 1,2 s: «conf» medía sobre todo esa espera)
+  while (Date.now() - t0 < ms) { try { const st = (await conn.getSignatureStatuses([sig])).value[0];
+      if (st) { if (st.err) throw new Error("la transacción falló en la cadena: " + JSON.stringify(st.err).slice(0, 80));
+        if (ctx && ctx.tVisto == null) { ctx.tVisto = Date.now(); try { ctx.pVisto = ctx.precioAhora ? ctx.precioAhora() : null; } catch {} }   // la primera vez que aparece (processed o más)
+        if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") { if (ctx) ctx.tConf = Date.now(); return true; } } } catch (e) { if (/falló en la cadena/.test(e.message)) throw e; }
+    await espera(Date.now() - t0 < 4000 ? 250 : 1200); }
   const e = new Error(`sin confirmar en ${Math.round(ms / 1000)} s`); e.colgada = true; throw e; }
 async function firmaYEnvia(bytes, ctx) { const tx = web3.VersionedTransaction.deserialize(bytes); tx.sign([wallet]);
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 }); if (ctx) ctx.tEnv = Date.now(); await confirma(sig, 45000, ctx); return sig; }
@@ -194,14 +197,14 @@ async function detalleTx(sig, mint) { for (let i = 0; i < 6; i++) { try { const 
 const precioDe = (rec) => { const P = rec.puntos || []; const q = P[P.length - 1]; return q ? 1 + q.p / 100 : 1; };   // el precio relativo del último punto (1 = el de migrar)
 const ultimoT = (rec) => { const P = rec.puntos || []; return P.length ? P[P.length - 1].t : null; };
 
-async function compra(rec) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; const ctx = nuevoCtx(); if (rec.pool) t.pool = rec.pool;
+async function compra(rec, d = {}) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; const ctx = nuevoCtx(d.precioAhora); if (rec.pool) t.pool = rec.pool;
   if (SIMULADO) { const pr = precioDe(rec) * 1.01; const tok = BigInt(Math.floor(LOTE * 0.99 / pr * 1e6)); t.simTok = (t.simTok || 0n) + tok; t.solIn += LOTE + PRIO_ENTRADA; t.compras++; t.abierto = true; R.saldo -= LOTE + PRIO_ENTRADA;
-    ctx.intentos.push({ ruta: "sim", ms: 0, ok: true }); return { coste: LOTE + PRIO_ENTRADA, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, confMs: 0, det: { dSol: -(LOTE + PRIO_ENTRADA), dTok: tok, slot: null, bt: null, fee: null }, ctx }; }
+    ctx.intentos.push({ ruta: "sim", ms: 0, ok: true }); return { coste: LOTE + PRIO_ENTRADA, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, vistoMs: 0, confMs: 0, det: { dSol: -(LOTE + PRIO_ENTRADA), dTok: tok, slot: null, bt: null, fee: null }, ctx }; }
   const micro = await prioridadMicro(); const r = await porRutas("compra", rec, Math.round(LOTE * 1e9), LOTE, SLIP_ENTRADA, Math.max(PRIO_ENTRADA === 0.0005 ? 0 : PRIO_ENTRADA, prioLamports(micro) / 1e9), ctx);
   const det = await detalleTx(r.sig, rec.token); const coste = det && det.dSol != null ? -det.dSol : LOTE; t.solIn += coste; t.compras++; t.abierto = true; R.saldoT = 0; return { ...r, coste, det }; }
 async function vende(rec, tol, prio, ctx) { const t = R.tokens[rec.token]; const bal = await saldoToken(rec.token); if (bal <= 0n) return { nada: true }; ctx = ctx || nuevoCtx();
   if (SIMULADO) { const pr = precioDe(rec) * 0.99; const sol = Number(bal) / 1e6 * pr * 0.99 - prio; t.simTok = 0n; R.saldo += sol; ctx.intentos.push({ ruta: "sim", ms: 0, ok: true });
-    return { recibido: sol, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, confMs: 0, tol, det: { dSol: sol, dTok: -bal, slot: null, bt: null, fee: null }, ctx }; }
+    return { recibido: sol, sig: "sim", ruta: "sim", ms: 0, envioMs: 0, vistoMs: 0, confMs: 0, tol, det: { dSol: sol, dTok: -bal, slot: null, bt: null, fee: null }, ctx }; }
   const micro = await prioridadMicro(); const r = await porRutas("venta", rec, bal.toString(), null, tol, Math.max(prioLamports(micro) / 1e9, prio === PRIO_PANICO ? PRIO_PANICO : 0), ctx);
   const det = await detalleTx(r.sig, rec.token); R.saldoT = 0; return { ...r, recibido: det && det.dSol != null ? det.dSol : 0, tol, det }; }
 
@@ -218,10 +221,12 @@ async function cierraCuenta(mint) { if (SIMULADO || !spl || !conn) return 0;
 function latencia(o, tipo, ok, r, extra = {}) {
   const rec = o.rec, d = o.datos || {}; const ahora = Date.now(); const det = (r && r.det) || {}; const ctx = (r && r.ctx) || extra.ctx || {};
   const esp = (o.inicio || ahora) - o.puesta, total = ahora - o.puesta; const slots = det.slot != null && d.slot != null ? det.slot - d.slot : null;
-  LAT.n++; if (ok) { LAT.ok++; apuntaLat("espera", esp); apuntaLat("envio", r && r.envioMs); apuntaLat("conf", r && r.confMs); apuntaLat("total", total); apuntaLat("slots", slots); } else if (extra.colgada) LAT.colgadas++; else LAT.fallos++;
+  const slotsRed = det.slot != null && d.slotAhora != null ? det.slot - d.slotAhora : null;   // [19-oct] slots desde el de la red al decidir (más justo que desde el último visto del token)
+  const vistoTotal = ctx.tVisto ? ctx.tVisto - o.puesta : null; let pAhora = null; try { pAhora = d.precioAhora ? d.precioAhora() : null; } catch {} if (pAhora == null) pAhora = precioDe(rec);
+  LAT.n++; if (ok) { LAT.ok++; apuntaLat("espera", esp); apuntaLat("envio", r && r.envioMs); apuntaLat("conf", r && r.confMs); apuntaLat("total", total); apuntaLat("slots", slotsRed ?? slots); apuntaLat("visto", vistoTotal); } else if (extra.colgada) LAT.colgadas++; else LAT.fallos++;
   const f = (x, n = 0) => x == null || Number.isNaN(+x) ? "-" : (+x).toFixed(n);
   const intentos = (ctx.intentos || []).map(i => `${i.ruta}:${i.ok ? "ok" : "fallo"}/${i.ms}ms`).join("|") || "-";
-  log(`[LATENCIA] tipo=${tipo} sym=${rec.symbol} mint=${rec.token} ok=${ok ? 1 : 0}${extra.colgada ? " colgada=1" : ""} ruta=${(r && r.ruta) || "-"} lote=${LOTE} t_dec=${o.puesta} t_tok=${f(d.tTok, 1)} slot_dec=${d.slot ?? "-"} espera=${esp} envio=${f(r && r.envioMs)} conf=${f(r && r.confMs)} total=${total} slot_fill=${det.slot ?? "-"} slots=${slots ?? "-"} bt=${det.bt ?? "-"} sol=${det.dSol != null ? (+det.dSol).toFixed(6) : "-"} tok=${det.dTok != null ? String(det.dTok) : "-"} fee=${det.fee != null ? (+det.fee).toFixed(6) : "-"} prio=${ctx.micro ?? "-"} p_dec=${f(d.pDec, 4)} p_ahora=${precioDe(rec).toFixed(4)} precioIni=${d.precioIni != null ? (+d.precioIni).toExponential(4) : "-"} intentos=${intentos}${extra.tol != null ? ` tol=${extra.tol}` : ""}${extra.intento != null ? ` intento=${extra.intento}` : ""}${d.reintento != null ? ` reintento=${d.reintento}` : ""}${extra.err ? ` err=${String(extra.err).replace(/\s+/g, "_").slice(0, 120)}` : ""}`); }
+  log(`[LATENCIA] tipo=${tipo} sym=${rec.symbol} mint=${rec.token} ok=${ok ? 1 : 0}${extra.colgada ? " colgada=1" : ""} ruta=${(r && r.ruta) || "-"} lote=${LOTE} t_dec=${o.puesta} t_tok=${f(d.tTok, 1)} slot_dec=${d.slot ?? "-"} espera=${esp} envio=${f(r && r.envioMs)} visto=${f(r && r.vistoMs)} conf=${f(r && r.confMs)} total=${total} decide_a_visto=${f(vistoTotal)} slot_fill=${det.slot ?? "-"} slots=${slots ?? "-"} slot_red=${d.slotAhora ?? "-"} slots_red=${slotsRed ?? "-"} bt=${det.bt ?? "-"} sol=${det.dSol != null ? (+det.dSol).toFixed(6) : "-"} tok=${det.dTok != null ? String(det.dTok) : "-"} fee=${det.fee != null ? (+det.fee).toFixed(6) : "-"} prio=${ctx.micro ?? "-"} p_dec=${f(d.pDec, 4)} p_visto=${ctx.pVisto != null ? (+ctx.pVisto).toFixed(4) : "-"} p_ahora=${pAhora != null ? (+pAhora).toFixed(4) : "-"} precioIni=${d.precioIni != null ? (+d.precioIni).toExponential(4) : "-"} intentos=${intentos}${extra.tol != null ? ` tol=${extra.tol}` : ""}${extra.intento != null ? ` intento=${extra.intento}` : ""}${d.reintento != null ? ` reintento=${d.reintento}` : ""}${extra.err ? ` err=${String(extra.err).replace(/\s+/g, "_").slice(0, 120)}` : ""}`); }
 
 // ── la cola: el motor pide, aquí se hace en orden · [18-oct] UNA COLA POR TOKEN (dentro de un token, en orden; entre tokens, a la vez) ──
 const COLAS = new Map();   // token → { items: [], girando: false }
@@ -232,7 +237,9 @@ export function encola(tipo, rec, datos = {}) {
   if (tipo === "compra") { if (!R.armado) return; if (nCola() >= 20) return;
     if (SOLO_PUMPSWAP && rec.pumpswap === false) { if (!avisadosNoPS.has(rec.token)) { avisadosNoPS.add(rec.token); log(`⛔ ${rec.symbol}: su piscina no es de PumpSwap · en real no se opera (en papel sí)`); } return; } }
   else { const t = R.tokens[rec.token]; if (!(t && t.abierto) && !(q0 && q0.items.some(x => x.tipo === "compra"))) return; if (q0 && q0.items.some(x => x.tipo === "venta")) return; }
-  const q = colaDe(rec.token); q.items.push({ tipo, rec, datos: { ...datos, pDec: precioDe(rec), tTok: datos.tTok ?? ultimoT(rec) }, puesta: Date.now() }); R.cola = nCola(); gira(rec.token);
+  const it = { tipo, rec, datos: { ...datos, pDec: datos.pDec ?? precioDe(rec), tTok: datos.tTok ?? ultimoT(rec) }, puesta: Date.now() };
+  if (!SIMULADO && conn) conn.getSlot("processed").then(sl => { it.datos.slotAhora = sl; }).catch(() => {});   // [19-oct] el slot de la red al decidir (no el último visto del token)
+  const q = colaDe(rec.token); q.items.push(it); R.cola = nCola(); gira(rec.token);
 }
 async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) return; q.girando = true;
   try { while (q.items.length) { const o = q.items.shift(); R.cola = nCola(); const rec = o.rec; o.inicio = Date.now();
@@ -241,14 +248,14 @@ async function gira(token) { const q = COLAS.get(token); if (!q || q.girando) re
         if (!(R.tokens[rec.token]?.abierto) && abiertos.length >= MAX_ABIERTAS) { log(`⛔ ${rec.symbol}: no compro, ya hay ${abiertos.length} tokens dentro (máx ${MAX_ABIERTAS})`); continue; }
         if (dentro + LOTE > MAX_EXPUESTO) { log(`⛔ ${rec.symbol}: no compro, habría ${(dentro + LOTE).toFixed(2)} SOL dentro (máx ${MAX_EXPUESTO})`); continue; }
         const sal = await saldo(); if (sal != null && sal < LOTE + RESERVA) { log(`⛔ ${rec.symbol}: no compro, el saldo (${sal.toFixed(3)} SOL) no deja la reserva de ${RESERVA} SOL`); continue; }
-        try { const r = await compra(rec); fallosSeguidos = 0; R.totales.compras++; R.ultima = `compra ${rec.symbol} ${r.coste.toFixed(4)} SOL`;
+        try { const r = await compra(rec, o.datos); fallosSeguidos = 0; R.totales.compras++; R.ultima = `compra ${rec.symbol} ${r.coste.toFixed(4)} SOL`;
           log(`🟢 COMPRA REAL ${rec.symbol} · ${LOTE} SOL · coste real ${r.coste.toFixed(4)} SOL · ${r.ruta || "sim"}${r.ms != null ? " " + r.ms + " ms" : ""} · ${r.sig}`); latencia(o, "compra", true, r); }
         catch (e) { R.totales.fallos++; fallosSeguidos++; log(`❌ compra real de ${rec.symbol} no salió: ${(e.message || String(e)).slice(0, 140)}${e.colgada ? " (sin confirmar: se mirará el saldo al vender)" : ""}`); latencia(o, "compra", false, null, { err: e.message || String(e), colgada: !!e.colgada, ctx: e.ctx });
           if (e.colgada) { const t = R.tokens[rec.token] = R.tokens[rec.token] || { sym: rec.symbol, solIn: 0, solOut: 0, compras: 0, ventas: 0, abierto: false, t0: Date.now() }; t.abierto = true; t.solIn += LOTE; }
           if (fallosSeguidos >= FALLOS_SEGUIDOS) desarma(`${fallosSeguidos} compras fallidas seguidas`); }
       } else {
         let hecho = null, err = null, i = 0;
-        for (i = 0; i < TOL_VENTA.length && !hecho; i++) { const ctx = nuevoCtx(); try { hecho = await vende(rec, TOL_VENTA[i], i >= 2 ? PRIO_PANICO : PRIO_SALIDA, ctx); } catch (e) { err = e; latencia(o, "venta", false, null, { err: e.message || String(e), colgada: !!e.colgada, ctx: e.ctx || ctx, tol: TOL_VENTA[i], intento: i + 1 }); if (e.colgada) break; await espera(800); } }
+        for (i = 0; i < TOL_VENTA.length && !hecho; i++) { const ctx = nuevoCtx(o.datos && o.datos.precioAhora); try { hecho = await vende(rec, TOL_VENTA[i], i >= 2 ? PRIO_PANICO : PRIO_SALIDA, ctx); } catch (e) { err = e; latencia(o, "venta", false, null, { err: e.message || String(e), colgada: !!e.colgada, ctx: e.ctx || ctx, tol: TOL_VENTA[i], intento: i + 1 }); if (e.colgada) break; await espera(800); } }
         if (!hecho) { pendiente(rec, err); continue; }
         delete R.pendientes[rec.token]; const t = R.tokens[rec.token];
         if (hecho.nada) { if (t) t.abierto = false; cierraCuadre(rec, "no había tokens que vender"); continue; }
@@ -298,7 +305,7 @@ function recargaSiCambio() { try { const st = fs.statSync(FILE); if (!(st.mtimeM
 function vendeLoDeAntes() { recargaSiCambio(); const ab = Object.entries(R.tokens).filter(([, t]) => t.abierto); if (!ab.length || !R.listo) return;
   log(`🧹 ${ab.length} token${ab.length > 1 ? "s" : ""} dentro de antes del reinicio: se vende${ab.length > 1 ? "n" : ""} ya (${ab.map(([, t]) => t.sym).join(", ")})`);
   for (const [mint, t] of ab) encola("venta", { token: mint, symbol: t.sym, pool: t.pool, pumpswap: true, puntos: [] }, { reintento: "arranque" }); }
-export function latenciaResumen() { return { ordenes: LAT.n, ok: LAT.ok, fallos: LAT.fallos, colgadas: LAT.colgadas, esperaMed: pct(LAT.espera, .5), envioMed: pct(LAT.envio, .5), envioP90: pct(LAT.envio, .9), confMed: pct(LAT.conf, .5), confP90: pct(LAT.conf, .9), totalMed: pct(LAT.total, .5), totalP90: pct(LAT.total, .9), slotsMed: pct(LAT.slots, .5), slotsP90: pct(LAT.slots, .9) }; }
+export function latenciaResumen() { return { ordenes: LAT.n, ok: LAT.ok, fallos: LAT.fallos, colgadas: LAT.colgadas, esperaMed: pct(LAT.espera, .5), envioMed: pct(LAT.envio, .5), envioP90: pct(LAT.envio, .9), confMed: pct(LAT.conf, .5), confP90: pct(LAT.conf, .9), totalMed: pct(LAT.total, .5), totalP90: pct(LAT.total, .9), vistoMed: pct(LAT.visto, .5), vistoP90: pct(LAT.visto, .9), slotsMed: pct(LAT.slots, .5), slotsP90: pct(LAT.slots, .9) }; }
 export function resumen() { return { listo: R.listo, armado: R.armado, motivo: R.motivo, cartera: R.pub, saldo: R.saldo, lote: LOTE, lotePapel: LOTE_PAPEL, sombra: LOTE !== LOTE_PAPEL, simulado: SIMULADO, dentro: Object.values(R.tokens).filter(t => t.abierto).length, cola: R.cola,
   totales: R.totales, hoy: R.dia, pendientes: Object.values(R.pendientes).map(p => ({ sym: p.sym, error: p.error, ronda: p.ronda })), huerfanos: R.huerfanos, cuadres: R.cuadres.slice(0, 40), latencia: latenciaResumen(),
   rutas: Object.fromEntries(Object.entries(RUTA_STATS).map(([k, v]) => [k, { ordenes: v.n, msMedio: v.n ? Math.round(v.ms / v.n) : null, fallos: v.fallos }])), envio: { RUTAS, SENDER, PROPINA, PRIO_NIVEL, PRIO_MAX },
