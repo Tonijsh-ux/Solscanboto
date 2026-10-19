@@ -86,6 +86,10 @@ function decodifica(tx, mint, sitio, modo) {
   const dTok = tokPre != null && tokPost != null ? tokPost - tokPre : null, dSol = solPre != null && solPost != null ? solPost - solPre : null;
   let lado = 0; if (dTok != null && Math.abs(dTok) > 1e-9) lado = dTok < 0 ? 1 : -1;   // el sitio suelta tokens = compra; recibe tokens = venta
   else if (dSol != null && Math.abs(dSol) > 1e-9) lado = dSol > 0 ? 1 : -1;
+  // [19-oct] en la curva, soltar tokens Y SOL a la vez no es una compra: es la retirada al migrar (~85 SOL y 206,9 M de tokens a la piscina).
+  // Venía como compra (lado 1) cuando su firma no era la de la migración que vio el server: 7-10 % de las curvas, ~85 SOL de más en
+  // sol_comprado (y en el churn, mayor_compra, top1…). FRANCEDAY (19-oct): 171,8 SOL «comprados» en vez de 85,9.
+  if (modo !== "pool" && dTok != null && dSol != null && dTok < -1e-9 && dSol < -1e-6) lado = 2;
   return { sig: tx.transaction?.signatures?.[0] || null, slot: tx.slot, idx: tx.transactionIndex, bt: tx.blockTime, w, lado, sol: dSol != null ? +Math.abs(dSol).toFixed(6) : null, tok: dTok != null ? +Math.abs(dTok).toFixed(2) : null, rt: tokPost != null ? +tokPost.toFixed(2) : null, rs: solPost != null ? +solPost.toFixed(6) : null, fee: m.fee != null ? m.fee / 1e9 : null, nk: ks.length };
 }
 // la cuenta de la curva de bonos: en las primeras operaciones, el dueño (que no es quien firma) con más tokens del mint
