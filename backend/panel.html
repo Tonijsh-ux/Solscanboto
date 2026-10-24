@@ -150,7 +150,7 @@ let D = null, TOK = [], filtro = 'todas'; const abiertos = new Set(), curvas = n
 
 async function carga() {
   try {
-    const [d, t, m] = await Promise.all([fetch('/datos').then(r => r.json()), fetch('/tokens').then(r => r.json()), fetch('/mapa').then(r => r.json())]);
+    const [d, t, m] = await Promise.all([fetch('/datos').then(r => r.json()), fetch('/tokens').then(r => r.json()), fetch('/mapa').then(r => r.ok ? r.json() : null).catch(() => null)]);   // [24-oct] si falla el mapa, el resto del panel sale igual
     D = d; TOK = Array.isArray(t) ? t : []; pintaTodo(); pintaMapa(m);
   } catch (e) { $('sub').textContent = 'sin conexión con el server: reintento en 15 s'; }
 }
