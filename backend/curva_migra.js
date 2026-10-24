@@ -34,19 +34,20 @@ export function sitioCurva(txs, mint) { const cuenta = new Map(); for (const tx 
 
 // ── los rasgos que mira el veto, de las filas de la curva (lo mismo que NUEVO/fam2/carteras_curva.py y la 🏭 de malos.py) ──
 export const FAB = { vela: 0.40, segMin: 6, segMax: 900, churn: 9.7 };
-export function rasgos(filas, creacionBt, migBt) {
+export function rasgos(filas, creacionBt, migBt, creador) {
   const rows = filas.filter(r => r.lado === 1 || r.lado === -1).sort((a, b) => (a.slot - b.slot) || ((a.idx || 0) - (b.idx || 0)));
   if (!rows.length) return null;
-  const compras = new Map(); let solc = 0, solv = 0, ncompras = 0, nventas = 0;
-  for (const r of rows) { const s = +r.sol || 0; if (r.lado === 1) { compras.set(r.w, (compras.get(r.w) || 0) + 1); solc += s; ncompras++; } else { solv += s; nventas++; } }
+  const compras = new Map(), vendedoras = new Set(); let solc = 0, solv = 0, ncompras = 0, nventas = 0, creadorSol = 0;
+  for (const r of rows) { const s = +r.sol || 0; if (r.lado === 1) { compras.set(r.w, (compras.get(r.w) || 0) + 1); solc += s; ncompras++; if (creador && r.w === creador) creadorSol += s; } else { solv += s; nventas++; if ((+r.tok || 0) > 0) vendedoras.add(r.w); } }
   let recompran = 0; for (const n of compras.values()) if (n >= 2) recompran++;
   const s0 = rows[0].slot; let b0 = 0; for (const r of rows) { if (r.slot !== s0) break; if (r.lado === 1) b0 += +r.sol || 0; }
   const cre = creacionBt != null ? creacionBt : Math.min(...rows.map(r => r.bt).filter(x => x != null));
   const seg = migBt && cre != null && isFinite(cre) ? migBt - cre : null;
   const vela = b0 / 85, churn = ((solc - b0) + solv) / Math.max(85 - b0, 1);
   const fab = vela >= FAB.vela && seg != null && seg >= FAB.segMin && seg <= FAB.segMax && churn >= FAB.churn;
+  // [25-oct] para F1 (propia/techo.py): vendedores = carteras que vendieron tokens en la curva (como rasgosCurva del rescate: tokV > 0); creadorSol = SOL que compró el creador (null si no se sabe quién es)
   return { compradores: compras.size, compras: ncompras, ventas: nventas, recompran: compras.size ? recompran / compras.size : 0, solc: +solc.toFixed(3), solv: +solv.toFixed(3),
-    b0: +b0.toFixed(3), vela: +vela.toFixed(4), seg, churn: +churn.toFixed(3), fab };
+    b0: +b0.toFixed(3), vela: +vela.toFixed(4), seg, churn: +churn.toFixed(3), fab, vendedores: vendedoras.size, creadorSol: creador ? +creadorSol.toFixed(4) : null };
 }
 
 // ── el lector: una cola pequeña (como mucho LECTORES a la vez), páginas de POR_PAGINA transacciones, tope de transacciones y de tiempo ──
@@ -71,7 +72,7 @@ export function crea(op = {}) {
     }
     throw new Error(`sin respuesta de Helius (${String(ultErr).slice(0, 100)})`);
   }
-  // { tMig (s), seg (s desde la creación, del nacimiento; null si no se sabe), tope (el nacimiento llegó al tope de firmas), firma (la de la migración) }
+  // { tMig (s), seg (s desde la creación, del nacimiento; null si no se sabe), tope (el nacimiento llegó al tope de firmas), firma (la de la migración), creador (la cartera que creó el token, del nacimiento) }
   async function leeYa(mint, d) {
     const t0 = Date.now(), hasta = t0 + MAX_MS; const tMig = Math.round(d.tMig);
     const desde = (d.seg != null && !d.tope) ? tMig - d.seg - 600 : tMig - 3 * 86400;
@@ -88,7 +89,7 @@ export function crea(op = {}) {
       if (Date.now() > hasta - 1500) { cortada = true; break; }
     }
     for (const x of filas) if ((d.firma && x.sig === d.firma) || (x.lado === -1 && x.sol > 20 && x.rs != null && x.rs < 1)) x.lado = 2;   // 2 = la migración (igual que el rescate)
-    const ras = rasgos(filas, creacionBt, tMig);
+    const ras = rasgos(filas, creacionBt, tMig, d.creador || null);
     if (!ras) return { estado: "sin compras", n, creditos, ms: Date.now() - t0, sitio };
     return { estado: "ok", rasgos: ras, n, creditos, ms: Date.now() - t0, cortada, sitio, creacionBt };
   }

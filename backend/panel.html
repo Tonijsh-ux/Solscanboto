@@ -166,10 +166,10 @@ function pintaTodo() {
   $('aviso').hidden = !avisos.length; $('aviso').textContent = avisos.join(' · ');
   $('desde').textContent = 'desde ' + fecha(p.desde) + ' · lote ' + String(d.lote).replace('.', ',');
   // [23-oct] «hoy + cazador»: el número grande es TODO lo que hace el server en papel, de verdad (1er lote + 2º lote + 3er lote + cazador); debajo, cada parte
-  const v1 = p.verdad != null ? p.verdad : (p.real || 0), vv = v1 + (p.lote2 || 0) + (p.lote3 || 0) + (p.caza || 0); $('real').textContent = sol(vv) + ' SOL'; $('real').className = 'big m ' + (vv >= 0 ? 'pos' : 'neg');
+  const v1 = p.verdad != null ? p.verdad : (p.real || 0), vv = v1 + (p.lote2 || 0) + (p.lote3 || 0) + (p.caza || 0) + (p.f1 || 0); $('real').textContent = sol(vv) + ' SOL'; $('real').className = 'big m ' + (vv >= 0 ? 'pos' : 'neg');
   const parte = (nom, v, n) => `${nom} ${sol(v || 0, 2)} (${n || 0})`;
   $('real2').textContent = [(u ? '≈ ' + (vv >= 0 ? '+' : '−') + Math.abs(vv * u).toFixed(0) + ' $' : ''), parte('1er lote', v1, p.verdadN),
-    p.lote2Sol ? parte('2º lote', p.lote2, p.lote2N) : '', p.lote3Sol ? parte('3er lote', p.lote3, p.lote3N) : '', p.cazaSol ? `cazador ${sol(p.caza || 0, 2)} (${p.cazaN || 0} mini-lotes en ${p.cazaTokens || 0} tokens)` : '',
+    p.lote2Sol ? parte('2º lote', p.lote2, p.lote2N) : '', p.f1Sol ? parte('F1 + escalera', p.f1, p.f1N) + ' en ' + (p.f1Tokens || 0) + ' tokens' : '', p.lote3Sol ? parte('3er lote', p.lote3, p.lote3N) : '', p.cazaSol ? `cazador ${sol(p.caza || 0, 2)} (${p.cazaN || 0} mini-lotes en ${p.cazaTokens || 0} tokens)` : '',
     'de verdad: comisión de PumpSwap, precio real, 1 s tarde y prioridad'].filter(Boolean).join(' · ');
   $('grafico').innerHTML = grafico(d.serie || []);
   $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; { const pv = p.porVeto || {}; $('k-vet').textContent = Math.max(0, (p.vetadas ?? 0) - (pv.ballena || 0) - (pv.pocos || 0));   // [23-oct] sin las ballenas de siempre (Tony)
@@ -199,8 +199,8 @@ function grafico(serie) {
   const fin = pts[pts.length - 1][1], xf = x(t1), yf = y(fin), col = fin >= 0 ? 'var(--verde)' : 'var(--rojo)';
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Real acumulado en SOL, con una línea cada ${String(paso).replace('.', ',')} SOL">${rejilla}<polyline fill="none" stroke="${col}" stroke-width="2.5" stroke-linejoin="round" points="${pts.map(p => x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1)).join(' ')}"></polyline><circle cx="${xf.toFixed(1)}" cy="${yf.toFixed(1)}" r="4" fill="${col}"></circle></svg><div class="gr">SOL · ${hora(t0)} → ${hora(t1)} · una línea cada ${String(paso).replace('.', ',')} SOL</div>`;
 }
-const otros = (x) => !!(x.l2 || x.l3 || x.caza);   // [23-oct] el 2º lote, el 3er lote y el cazador (también en los que el 1er lote no compró)
-const resDe = (x) => (x.l1 ? x.l1.pnl : x.ops.reduce((s, o) => s + o.real, 0)) + ((x.l2 || {}).pnl || 0) + ((x.l3 || {}).pnl || 0) + ((x.caza || {}).pnl || 0);
+const otros = (x) => !!(x.l2 || x.f1 || x.l3 || x.caza);   // [23-oct] el 2º lote, el 3er lote y el cazador (también en los que el 1er lote no compró)
+const resDe = (x) => (x.l1 ? x.l1.pnl : x.ops.reduce((s, o) => s + o.real, 0)) + ((x.l2 || {}).pnl || 0) + ((x.f1 || {}).pnl || 0) + ((x.l3 || {}).pnl || 0) + ((x.caza || {}).pnl || 0);
 function claseDe(x) {
   if (x.ballena) return 'sin'; if (x.abierta) return 'abierta'; if (x.veto && !otros(x)) return 'veto'; if (!x.ops.length && !otros(x)) return 'sin';
   return resDe(x) > 0 ? 'ganada' : 'perdida';
@@ -231,6 +231,7 @@ function fila(x) {
   for (const o of x.ops) { tags.push(`<span class="tag e">entró ${hora(o.entraT)} · ${pct(o.entraPct ?? 0)}</span>`, `<span class="tag s">salió ${hora(o.saleT)} · ${pct(o.salePct)} · ${esc(o.motivo)}</span>`); }
   if (x.abierta) { tags.push(`<span class="tag e">entró ${hora(x.abierta.entraT)} · ${x.abierta.lotes} lotes</span>`, `<span class="tag">sigue dentro · va ${pct(x.abierta.va)}</span>`); resTxt = pct(x.abierta.va); resCl = x.abierta.va >= 0 ? 'pos' : 'neg'; }
   if (x.l2) tags.push(`<span class="tag ${x.l2.pnl >= 0 ? 'd' : 's'}">2º lote · ${sol(x.l2.pnl, 3)} SOL</span>`);
+  if (x.f1) tags.push(`<span class="tag ${x.f1.pnl >= 0 ? 'd' : 's'}">F1 · ${sol(x.f1.pnl, 3)} SOL (${x.f1.n})</span>`);
   if (x.l3) tags.push(`<span class="tag ${x.l3.pnl >= 0 ? 'd' : 's'}">3er lote · ${x.l3.n} · ${sol(x.l3.pnl, 3)} SOL</span>`);
   if (x.caza) tags.push(`<span class="tag ${x.caza.pnl >= 0 ? 'd' : 's'}">🎯 cazador · ${x.caza.n} mini-lotes · ${sol(x.caza.pnl, 3)} SOL</span>`);
   if (c === 'ganada' || c === 'perdida') { const r = resDe(x); resTxt = sol(r, 3) + ' SOL'; resCl = r >= 0 ? 'pos' : 'neg'; }
