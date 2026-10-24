@@ -94,6 +94,7 @@ svg { display: block; max-width: 100%; height: auto; }
 <div class="barrita"><i id="barra" style="width:0%"></i></div>
 <div class="fila"><span>Real de hoy (cartera)</span><span class="m" id="hoy">—</span></div>
 <div class="fila"><span>Tope de pérdida del día</span><span class="m" id="tope">—</span></div>
+<div class="fila" id="f-l2" hidden><span>2º lote de verdad</span><span class="m" id="l2real">—</span></div>
 <div class="ordenes">
 <label for="clave" class="gr" style="flex-basis:100%">Clave del panel</label>
 <input id="clave" type="password" autocomplete="current-password" placeholder="clave">
@@ -173,9 +174,11 @@ function pintaTodo() {
   $('grafico').innerHTML = grafico(d.serie || []);
   $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; { const pv = p.porVeto || {}; $('k-vet').textContent = Math.max(0, (p.vetadas ?? 0) - (pv.ballena || 0) - (pv.pocos || 0));   // [23-oct] sin las ballenas de siempre (Tony)
     $('k-vet2').textContent = 'vetadas sin las ballenas' + (pv.bundle ? ` · 📦 ${pv.bundle} bundles` : '') + (pv.cae ? ` · 📉 ${pv.cae} ya caían` : '') + (pv.nosube ? ` · 📈 ${pv.nosube} no subían` : ''); } $('k-err').textContent = (d.salud || {}).errores ?? 0;
-  const top = r.topes || {}; const maxE = top.MAX_EXPUESTO || 1; $('dentro').textContent = (p.expuesto || 0).toFixed(2).replace('.', ',') + ' / ' + String(maxE).replace('.', ',') + ' SOL';
-  $('barra').style.width = Math.min(100, 100 * (p.expuesto || 0) / maxE).toFixed(0) + '%';
-  $('hoy').textContent = r.listo ? sol((r.hoy || {}).real || 0, 4) + ' SOL' : 'sin cartera'; $('tope').textContent = top.PERDIDA_DIA ? '−' + String(top.PERDIDA_DIA).replace('.', ',') + ' SOL · se desarma solo' : '—';
+  const top = r.topes || {}; const l2 = r.lote2 || {}; const es2 = !!l2.modo;   // [24-oct] la cartera copia el 2º lote: lo de dentro es lo de verdad, y los topes van en proporción a la cartera
+  const maxE = (es2 ? top.expuestoAhora : top.MAX_EXPUESTO) || 1, dentroV = es2 ? (l2.dentroSol || 0) : (p.expuesto || 0); $('dentro').textContent = dentroV.toFixed(2).replace('.', ',') + ' / ' + (+maxE).toFixed(2).replace('.', ',') + ' SOL';
+  $('barra').style.width = Math.min(100, 100 * dentroV / maxE).toFixed(0) + '%';
+  $('f-l2').hidden = !es2; if (es2) { const T = l2.totales; $('l2real').textContent = (l2.fijo > 0 ? 'lote fijo ' + l2.fijo : 'próxima compra ' + (+l2.ahora).toFixed(3).replace('.', ',') + ' SOL (cartera/' + l2.div + ')') + (T ? ' · ' + T.n + ' cerrados ' + sol(T.real || 0, 3) + ' SOL' : ''); }
+  $('hoy').textContent = r.listo ? sol((r.hoy || {}).real || 0, 4) + ' SOL' : 'sin cartera'; { const tp = top.perdidaDiaAhora ?? top.PERDIDA_DIA; $('tope').textContent = tp ? '−' + (+tp).toFixed(3).replace('.', ',') + ' SOL' + (es2 && top.PERDIDA_FRAC ? ' (' + Math.round(100 * top.PERDIDA_FRAC) + ' %)' : '') + ' · se desarma' : '—'; }
   $('cartera-estado').textContent = !r.listo ? 'sin clave de cartera: solo papel' : (r.saldo != null ? 'saldo ' + (+r.saldo).toFixed(3).replace('.', ',') + ' SOL' : '');
   $('b-armar').disabled = !r.listo || r.armado; $('b-desarmar').disabled = !r.listo || !r.armado;
   const ab = TOK.filter(x => x.abierta); $('n-abiertas').textContent = ab.length + ' · ' + (p.expuesto || 0).toFixed(2).replace('.', ',') + ' SOL';
