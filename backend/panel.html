@@ -166,10 +166,11 @@ function pintaTodo() {
   $('aviso').hidden = !avisos.length; $('aviso').textContent = avisos.join(' · ');
   $('desde').textContent = 'desde ' + fecha(p.desde) + ' · lote ' + String(d.lote).replace('.', ',');
   // [23-oct] «hoy + cazador»: el número grande es TODO lo que hace el server en papel, de verdad (1er lote + 2º lote + 3er lote + cazador); debajo, cada parte
-  const v1 = p.verdad != null ? p.verdad : (p.real || 0), vv = v1 + (p.lote2 || 0) + (p.lote3 || 0) + (p.caza || 0) + (p.f1 || 0); $('real').textContent = sol(vv) + ' SOL'; $('real').className = 'big m ' + (vv >= 0 ? 'pos' : 'neg');
+  // [25-oct] F1 apagada (F1_SOL=0): lo que hizo queda a la vista debajo, pero ya no suma en el número grande
+  const v1 = p.verdad != null ? p.verdad : (p.real || 0), vv = v1 + (p.lote2 || 0) + (p.lote3 || 0) + (p.caza || 0) + (p.f1Sol ? (p.f1 || 0) : 0); $('real').textContent = sol(vv) + ' SOL'; $('real').className = 'big m ' + (vv >= 0 ? 'pos' : 'neg');
   const parte = (nom, v, n) => `${nom} ${sol(v || 0, 2)} (${n || 0})`;
   $('real2').textContent = [(u ? '≈ ' + (vv >= 0 ? '+' : '−') + Math.abs(vv * u).toFixed(0) + ' $' : ''), parte('1er lote', v1, p.verdadN),
-    p.lote2Sol ? parte('2º lote', p.lote2, p.lote2N) : '', p.f1Sol ? parte('F1 + escalera', p.f1, p.f1N) + ' en ' + (p.f1Tokens || 0) + ' tokens' : '', p.lote3Sol ? parte('3er lote', p.lote3, p.lote3N) : '', p.cazaSol ? `cazador ${sol(p.caza || 0, 2)} (${p.cazaN || 0} mini-lotes en ${p.cazaTokens || 0} tokens)` : '',
+    p.lote2Sol ? parte('2º lote', p.lote2, p.lote2N) : '', p.f1Sol ? parte('F1 + escalera', p.f1, p.f1N) + ' en ' + (p.f1Tokens || 0) + ' tokens' : (p.f1N ? `F1 apagada: ${sol(p.f1 || 0, 2)} en ${p.f1N} lotes (no suma)` : ''), p.lote3Sol ? parte('3er lote', p.lote3, p.lote3N) : '', p.cazaSol ? `cazador ${sol(p.caza || 0, 2)} (${p.cazaN || 0} mini-lotes en ${p.cazaTokens || 0} tokens)` : '',
     'de verdad: comisión de PumpSwap, precio real, 1 s tarde y prioridad'].filter(Boolean).join(' · ');
   $('grafico').innerHTML = grafico(d.serie || []);
   $('k-ops').textContent = p.cerradas ?? 0; $('k-gan').textContent = p.cerradas ? Math.round(100 * p.ganadas / p.cerradas) + ' %' : '—'; { const pv = p.porVeto || {}; $('k-vet').textContent = Math.max(0, (p.vetadas ?? 0) - (pv.ballena || 0) - (pv.pocos || 0));   // [23-oct] sin las ballenas de siempre (Tony)
