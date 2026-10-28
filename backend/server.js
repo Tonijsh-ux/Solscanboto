@@ -538,6 +538,11 @@ const TX_VERSION = 1;
 //   si Helius no admitiera accountExclude, se vuelve a suscribir sin él (y se apunta en el registro).
 const RUIDO_PROGRAMAS = ["5k8WVXF1GeZgHZWS2NJ6S3trf5u69rLJaqT4wogm1vJX", "9KGuApSJZmxHaFzk7pYM6W3feZvowVT1q6thnEGsTfzv", "D6EZCrb1yWM5zUenB1R54U7gKRkKB1WEai9snKEk2EmX", "3QytR2P4PTveP3SAnFjY7vgnXmCq9n3LDVDpxSC6Rctn"];
 let quitaRuido = process.env.QUITA_RUIDO !== "0";
+// [28-oct] y solo las transacciones que tocan su piscina de PumpSwap (accountRequired): sin eso, una «migración» de un token que no es de pump
+//   (acciones tokenizadas y parecidos: su piscina canónica no existe, así que no hay cuentas que vigilar) mandaba TODAS las transacciones del token
+//   durante toda la cámara (28-oct: el 74 % de los MB del WebSocket, ~40 k créditos por hora en las ráfagas). Con la piscina, solo llega el 1er swap
+//   en ella, que es lo que se buscaba. REQUIERE_PISCINA=0 lo apaga; si Helius lo rechaza, se vuelve a suscribir sin él (y queda en el registro).
+let requierePiscina = process.env.REQUIERE_PISCINA !== "0";
 const MIGF = { helius: 0, pumpportal: 0, adelanto: [], soloHelius: 0, soloPP: 0 };   // quién llegó primero y por cuánto
 const llegadas = new Map();   // mint → { fuente, t }
 function apuntaLlegada(mint, fuente) { const a = llegadas.get(mint); const ahora = Date.now();
@@ -564,18 +569,19 @@ function suscribe(H, c) { if (!H.ok || H.ws.readyState !== WebSocket.OPEN) retur
     for (const cual of ["base", "quote"]) { const id = ++H.nId; H.pend.set(id, { mint: c.mint, cual, tipo: "cuenta" });
       H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [c.vaults[cual], { encoding: "jsonParsed", commitment: "processed" }] })); }
   } else {          // sin piscina aún: las transacciones del mint, solo hasta el 1er swap
-    const id = ++H.nId; const excl = quitaRuido; H.pend.set(id, { mint: c.mint, cual: "tx", tipo: "tx", excl });   // [28-oct] versión 1 y sin el ruido
-    H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.mint], ...(excl ? { accountExclude: RUIDO_PROGRAMAS } : {}), failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: TX_VERSION }] })); } }
+    const id = ++H.nId; const excl = quitaRuido; const req = requierePiscina && c.pool ? c.pool : null; H.pend.set(id, { mint: c.mint, cual: "tx", tipo: "tx", excl, req });   // [28-oct] versión 1, sin el ruido y solo con su piscina
+    H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.mint], ...(req ? { accountRequired: [req] } : {}), ...(excl ? { accountExclude: RUIDO_PROGRAMAS } : {}), failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: TX_VERSION }] })); } }
 function desuscribe(H, c) { const L = H.subs.get(c.mint); if (!L) return; H.subs.delete(c.mint);
   for (const { id, tipo } of L) { H.porSub.delete(id); if (H.ok && H.ws.readyState === WebSocket.OPEN) H.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++H.nId, method: tipo === "cuenta" ? "accountUnsubscribe" : "transactionUnsubscribe", params: [id] })); } }
 
 function mensajeHelius(H, m) {
   if (m.id && m.id === H.pendMig) { H.pendMig = null; if (m.error) log(`⚠️ Helius no deja escuchar las migraciones (${m.error.message || JSON.stringify(m.error)}): solo PumpPortal`); else { H.subMig = m.result; log(`📡 escuchando las migraciones directamente en la cadena (Helius) · PumpPortal de respaldo`); } return; }
   if (m.method === "transactionNotification" && H.subMig != null && m.params?.subscription === H.subMig) { migracionDirecta(m.params.result); return; }
-  if (m.id && H.pend.has(m.id)) { const { mint, cual, tipo, excl } = H.pend.get(m.id); H.pend.delete(m.id);
+  if (m.id && H.pend.has(m.id)) { const { mint, cual, tipo, excl, req } = H.pend.get(m.id); H.pend.delete(m.id);
     if (m.error) { S.errores++; log(`⚠️ Helius rechazó la suscripción de ${corto(mint)} (${cual}): ${m.error.message || JSON.stringify(m.error)}`);
-      if (excl && quitaRuido) { quitaRuido = false; log(`↩️ Helius no admite quitar el ruido (accountExclude): sigo sin quitarlo`); }   // [28-oct] y se vuelve a suscribir sin él
-      if (excl) { const c = S.camaras.get(mint); if (c && !c.fin && !c.vaults && !H.subs.has(mint)) suscribe(H, c); }
+      if (req && requierePiscina) { requierePiscina = false; log(`↩️ Helius no admite pedir la piscina (accountRequired): sigo sin pedirla`); }   // [28-oct] primero sin la piscina
+      else if (excl && quitaRuido) { quitaRuido = false; log(`↩️ Helius no admite quitar el ruido (accountExclude): sigo sin quitarlo`); }   // [28-oct] y se vuelve a suscribir sin él
+      if (excl || req) { const c = S.camaras.get(mint); if (c && !c.fin && !c.vaults && !H.subs.has(mint)) suscribe(H, c); }
       return; }
     const L = H.subs.get(mint) || []; L.push({ id: m.result, cual, tipo }); H.subs.set(mint, L); H.porSub.set(m.result, { mint, cual }); return; }
   if (m.method === "accountNotification") {   // un saldo de una de las dos cuentas de la piscina
