@@ -516,7 +516,7 @@ async function vaultsPorDueno(pool, mint) { const una = async (m) => { const r =
 // la transacción de la migración: la piscina y el precio inicial (con reintentos, porque PumpPortal avisa en cuanto la ve)
 async function leeMigracion(firma, mint, poolConocida = null) {   // [20-oct] poolConocida: la canónica de PumpSwap (solo sus reservas)
   for (let i = 0; i < 6; i++) {
-    try { const tx = await rpc("getTransaction", [firma, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]);
+    try { const tx = await rpc("getTransaction", [firma, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: TX_VERSION }]);
       if (tx) { const r = reservasDe(tx.meta?.postTokenBalances, mint, poolConocida); if (r) { r.vaults = vaultsDe(tx, mint, r.pool); return r; } return null; } } catch (e) { if (i === 5) throw e; }
     await new Promise(r => setTimeout(r, 1500));
   }
@@ -529,6 +529,15 @@ async function leeMigracion(firma, mint, poolConocida = null) {   // [20-oct] po
 // PumpPortal sigue de respaldo: la que llegue primero abre la cámara, y se apunta cuánto se adelantó una a la otra.
 const MIG_PROGRAM = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
 const MIG_DIRECTA = process.env.MIG_DIRECTA !== "0";
+// [28-oct] Solana ya tiene transacciones de «versión 1». Pidiendo versión 0, Helius las manda VACÍAS (solo firma y bloque) y getTransaction da error:
+//   el grabador del 27-oct vio así ~1 de cada 3 compras/ventas, y el nacimiento se quedaba sin creador cuando la 1ª transacción del token era de versión 1
+//   («el creador ?»: 20 % el 20-21 oct → 63 % el 27). Con versión 1 llegan todas con contenido (99,4 % en vivo en el grabador v3); las de versión 0 y legacy, igual que antes.
+const TX_VERSION = 1;
+// [28-oct] los 4 programas de «ruido» (bots que tocan la piscina y no compran: ~62 % de los avisos y ~70 % de los bytes por transacciones del mint en el
+//   grabador; quitarlos pierde ~0,5 % de las compras/ventas en vivo). Solo en la suscripción por transacciones del mint. QUITA_RUIDO=0 los deja entrar;
+//   si Helius no admitiera accountExclude, se vuelve a suscribir sin él (y se apunta en el registro).
+const RUIDO_PROGRAMAS = ["5k8WVXF1GeZgHZWS2NJ6S3trf5u69rLJaqT4wogm1vJX", "9KGuApSJZmxHaFzk7pYM6W3feZvowVT1q6thnEGsTfzv", "D6EZCrb1yWM5zUenB1R54U7gKRkKB1WEai9snKEk2EmX", "3QytR2P4PTveP3SAnFjY7vgnXmCq9n3LDVDpxSC6Rctn"];
+let quitaRuido = process.env.QUITA_RUIDO !== "0";
 const MIGF = { helius: 0, pumpportal: 0, adelanto: [], soloHelius: 0, soloPP: 0 };   // quién llegó primero y por cuánto
 const llegadas = new Map();   // mint → { fuente, t }
 function apuntaLlegada(mint, fuente) { const a = llegadas.get(mint); const ahora = Date.now();
@@ -540,7 +549,7 @@ function heliusNueva() {
   const abre = () => {
     const ws = new WebSocket(HELIUS_WS); H.ws = ws;
     ws.on("open", () => { H.ok = true; log(`🔌 Helius: conexión ${S.hel.indexOf(H) + 1} abierta`);
-      if (MIG_DIRECTA && S.hel.indexOf(H) === 0) { const id = ++H.nId; H.pendMig = id; ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [MIG_PROGRAM], failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] })); } for (const c of S.camaras.values()) if (c.hel === H && !c.fin) { H.subs.delete(c.mint); suscribe(H, c); } });   // al reconectar, las cámaras vivas se vuelven a suscribir
+      if (MIG_DIRECTA && S.hel.indexOf(H) === 0) { const id = ++H.nId; H.pendMig = id; ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [MIG_PROGRAM], failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: TX_VERSION }] })); } for (const c of S.camaras.values()) if (c.hel === H && !c.fin) { H.subs.delete(c.mint); suscribe(H, c); } });   // al reconectar, las cámaras vivas se vuelven a suscribir
     ws.on("message", (raw) => { S.bytes += raw.length; let m; try { m = JSON.parse(raw); } catch { return; }
       { const tipo = m.method === "accountNotification" ? "cuentas" : m.method === "transactionNotification" ? (H.subMig != null && m.params?.subscription === H.subMig ? "migraciones" : "tx") : "otros"; S.wsPor[tipo] = (S.wsPor[tipo] || 0) + raw.length; }   // [12-oct] para saber en qué se van los créditos (Helius cobra 2 por cada 0,1 MB)
       mensajeHelius(H, m); });
@@ -555,16 +564,19 @@ function suscribe(H, c) { if (!H.ok || H.ws.readyState !== WebSocket.OPEN) retur
     for (const cual of ["base", "quote"]) { const id = ++H.nId; H.pend.set(id, { mint: c.mint, cual, tipo: "cuenta" });
       H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [c.vaults[cual], { encoding: "jsonParsed", commitment: "processed" }] })); }
   } else {          // sin piscina aún: las transacciones del mint, solo hasta el 1er swap
-    const id = ++H.nId; H.pend.set(id, { mint: c.mint, cual: "tx", tipo: "tx" });
-    H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.mint], failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: 0 }] })); } }
+    const id = ++H.nId; const excl = quitaRuido; H.pend.set(id, { mint: c.mint, cual: "tx", tipo: "tx", excl });   // [28-oct] versión 1 y sin el ruido
+    H.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method: "transactionSubscribe", params: [{ accountInclude: [c.mint], ...(excl ? { accountExclude: RUIDO_PROGRAMAS } : {}), failed: false, vote: false }, { commitment: "processed", encoding: "jsonParsed", transactionDetails: "accounts", maxSupportedTransactionVersion: TX_VERSION }] })); } }
 function desuscribe(H, c) { const L = H.subs.get(c.mint); if (!L) return; H.subs.delete(c.mint);
   for (const { id, tipo } of L) { H.porSub.delete(id); if (H.ok && H.ws.readyState === WebSocket.OPEN) H.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++H.nId, method: tipo === "cuenta" ? "accountUnsubscribe" : "transactionUnsubscribe", params: [id] })); } }
 
 function mensajeHelius(H, m) {
   if (m.id && m.id === H.pendMig) { H.pendMig = null; if (m.error) log(`⚠️ Helius no deja escuchar las migraciones (${m.error.message || JSON.stringify(m.error)}): solo PumpPortal`); else { H.subMig = m.result; log(`📡 escuchando las migraciones directamente en la cadena (Helius) · PumpPortal de respaldo`); } return; }
   if (m.method === "transactionNotification" && H.subMig != null && m.params?.subscription === H.subMig) { migracionDirecta(m.params.result); return; }
-  if (m.id && H.pend.has(m.id)) { const { mint, cual, tipo } = H.pend.get(m.id); H.pend.delete(m.id);
-    if (m.error) { S.errores++; log(`⚠️ Helius rechazó la suscripción de ${corto(mint)} (${cual}): ${m.error.message || JSON.stringify(m.error)}`); return; }
+  if (m.id && H.pend.has(m.id)) { const { mint, cual, tipo, excl } = H.pend.get(m.id); H.pend.delete(m.id);
+    if (m.error) { S.errores++; log(`⚠️ Helius rechazó la suscripción de ${corto(mint)} (${cual}): ${m.error.message || JSON.stringify(m.error)}`);
+      if (excl && quitaRuido) { quitaRuido = false; log(`↩️ Helius no admite quitar el ruido (accountExclude): sigo sin quitarlo`); }   // [28-oct] y se vuelve a suscribir sin él
+      if (excl) { const c = S.camaras.get(mint); if (c && !c.fin && !c.vaults && !H.subs.has(mint)) suscribe(H, c); }
+      return; }
     const L = H.subs.get(mint) || []; L.push({ id: m.result, cual, tipo }); H.subs.set(mint, L); H.porSub.set(m.result, { mint, cual }); return; }
   if (m.method === "accountNotification") {   // un saldo de una de las dos cuentas de la piscina
     const q = H.porSub.get(m.params?.subscription); if (!q) return; const c = S.camaras.get(q.mint); if (!c || c.fin) return; const sl = m.params?.result?.context?.slot; if (sl > 0) c.ultSlot = sl;
@@ -798,7 +810,7 @@ async function nacimientoHelius(c) {
     if ((!viejo || !viejo.blockTime) && NAC_REINTENTO_MS > 0) { await new Promise(r => setTimeout(r, NAC_REINTENTO_MS)); await firmas(); n.reintento = 1; S.nacReintentos = (S.nacReintentos || 0) + 1; if (viejo && viejo.blockTime) S.nacReintentosOk = (S.nacReintentosOk || 0) + 1; }
     if (n.txsCurva >= 5000) n.txsCurvaTope = true;   // [11-oct] txsCurva = transacciones que mencionan el mint antes de migrar ≈ swaps en la curva de bonos (+ crear, metadatos); tope 5.000
     if (viejo && viejo.blockTime) { n.seg = Math.max(0, Math.round(c.t0 / 1000 - viejo.blockTime)); c.creado = viejo.blockTime * 1000; }
-    if (viejo && viejo.signature) { const tx = await rpc("getTransaction", [viejo.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]);
+    if (viejo && viejo.signature) { const tx = await rpc("getTransaction", [viejo.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: TX_VERSION }]);   // [28-oct] versión 1: con 0, si la 1ª transacción era de versión 1, «el creador ?»
       const k0 = tx?.transaction?.message?.accountKeys?.[0]; const firmante = typeof k0 === "string" ? k0 : k0?.pubkey; if (firmante) c.creador = firmante; } } catch {}
   // el creador repetido (en lo que lleva encendido el grabador)
   if (c.creador) { const L = S.creadores.get(c.creador) || []; L.push(c.sym); S.creadores.set(c.creador, L); n.creadorTokens = L.length;

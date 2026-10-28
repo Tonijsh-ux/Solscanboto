@@ -213,7 +213,7 @@ async function pumpportal(accion, mint, cantidad, enSol, slipPct, prioSol, ctx) 
     body: JSON.stringify({ publicKey: R.pub, action: accion, mint, denominatedInSol: enSol ? "true" : "false", amount: cantidad, slippage: slipPct, priorityFee: prioSol, pool: "auto" }) });
   if (!r.ok) throw new Error(`PumpPortal ${r.status}: ${(await r.text().catch(() => "")).slice(0, 120)}`); return firmaYEnvia(new Uint8Array(await r.arrayBuffer()), ctx); }
 // lo que se movió de verdad en la transacción: SOL y tokens de la cartera, el slot, la hora de bloque y la comisión base
-async function detalleTx(sig, mint) { for (let i = 0; i < 6; i++) { try { const tx = await conn.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+async function detalleTx(sig, mint) { for (let i = 0; i < 6; i++) { try { const tx = await conn.getParsedTransaction(sig, { maxSupportedTransactionVersion: 1, commitment: "confirmed" });   // [28-oct] versión 1 (las órdenes de PumpPortal y Jupiter son de versión 0 o legacy: para ellas no cambia nada)
       if (tx?.meta) { const keys = tx.transaction.message.accountKeys; const k = keys.findIndex(x => (x.pubkey ? x.pubkey.toString() : String(x)) === R.pub);
         const dSol = k >= 0 ? (tx.meta.postBalances[k] - tx.meta.preBalances[k]) / 1e9 : null;
         const tok = (L) => { let s = 0n; for (const b of L || []) if (b.mint === mint && b.owner === R.pub) s += BigInt(b.uiTokenAmount?.amount || "0"); return s; };

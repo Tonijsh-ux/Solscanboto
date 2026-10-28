@@ -123,7 +123,7 @@ async function historialSeguido(job, carpeta, mint, direccion, desde, hasta, fas
 
 // ── la migración exacta (bloque y hora en la cadena): el ancla de las ventanas (nuestro t0 es la hora del aviso) ──
 async function migracionDe(job, t) {
-  if (t.firma) { try { const tx = await rpc(job, "getTransaction", [t.firma, { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 0 }], "extras", () => 1); if (tx && tx.blockTime) return { bt: tx.blockTime, slot: tx.slot, deFirma: true }; } catch (e) { if (e instanceof Corte) throw e; } }
+  if (t.firma) { try { const tx = await rpc(job, "getTransaction", [t.firma, { encoding: "json", commitment: "finalized", maxSupportedTransactionVersion: 1 /* [28-oct] versión 1, como el resto del rescate */ }], "extras", () => 1); if (tx && tx.blockTime) return { bt: tx.blockTime, slot: tx.slot, deFirma: true }; } catch (e) { if (e instanceof Corte) throw e; } }
   return { bt: Math.round(t.t0 / 1000), slot: null, deFirma: false };
 }
 // [16-oct] lo que tardó el aviso: solo si nuestro t0 es el de verdad (en los atrasados es aproximado: va al minuto)
